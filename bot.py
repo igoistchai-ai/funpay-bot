@@ -24,13 +24,15 @@ import sqlite3
 import time
 from pathlib import Path
 from contextlib import asynccontextmanager
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -41,7 +43,7 @@ DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
 PORT = int(os.getenv("PORT", "8000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip() or None
-APP_VERSION = "3.3.1"
+APP_VERSION = "3.3.2"
 ADMIN_TELEGRAM_ID = 8357023784
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 START_TIME = time.monotonic()
@@ -1298,22 +1300,67 @@ async def send_chat_message(chat_id: int, payload: MessageBody, _: bool = Depend
 @app.post("/api/funpay/chats/{chat_id}/send-image")
 async def send_chat_image(
     chat_id: int,
-    photo: UploadFile = File(...),
-    last_message_id: int | None = Form(default=None),
-    interlocutor_id: int | None = Form(default=None),
+    request: Request,
     _: bool = Depends(require_session),
 ) -> dict[str, Any]:
-    """Upload and send a photo in the selected personal FunPay chat."""
+    """Upload and send a photo without requiring python-multipart at app startup.
+
+    The standard-library MIME parser handles browser FormData requests. This avoids
+    FastAPI's import-time dependency check crashing the whole service when Render
+    has not installed python-multipart yet.
+    """
     _client, _account = need_funpay()
-    content_type = (photo.content_type or "").lower().split(";", 1)[0].strip()
+    request_content_type = request.headers.get("content-type", "")
+    if not request_content_type.lower().startswith("multipart/form-data;"):
+        raise HTTPException(status_code=415, detail="Ожидалась загрузка фотографии в формате multipart/form-data.")
+
+    # Browser file is limited to 8 MiB; leave a small allowance for multipart headers.
+    max_request_bytes = 8 * 1024 * 1024 + 128 * 1024
+    body_chunks: list[bytes] = []
+    body_size = 0
+    async for chunk in request.stream():
+        body_size += len(chunk)
+        if body_size > max_request_bytes:
+            raise HTTPException(status_code=413, detail="Изображение слишком большое. Максимум 8 МБ.")
+        body_chunks.append(chunk)
+    body = b"".join(body_chunks)
+    mime_message = BytesParser(policy=email_policy).parsebytes(
+        (f"Content-Type: {request_content_type}\r\nMIME-Version: 1.0\r\n\r\n").encode("latin-1") + body
+    )
+    if not mime_message.is_multipart():
+        raise HTTPException(status_code=400, detail="Не удалось прочитать форму загрузки фотографии.")
+
+    image_data: bytes | None = None
+    content_type = ""
+    filename = "photo"
+    last_message_id: int | None = None
+    interlocutor_id: int | None = None
+    for part in mime_message.iter_parts():
+        field_name = part.get_param("name", header="content-disposition")
+        field_filename = part.get_filename()
+        field_data = part.get_payload(decode=True) or b""
+        if field_name == "photo" and field_filename is not None:
+            image_data = field_data
+            content_type = (part.get_content_type() or "").lower().strip()
+            filename = Path(field_filename).name[:120] or "photo"
+        elif field_name in {"last_message_id", "interlocutor_id"}:
+            try:
+                parsed = int(field_data.decode("utf-8", errors="ignore").strip())
+            except (TypeError, ValueError):
+                parsed = None
+            if field_name == "last_message_id":
+                last_message_id = parsed
+            else:
+                interlocutor_id = parsed
+
+    if image_data is None:
+        raise HTTPException(status_code=422, detail="Выберите фотографию.")
     if content_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
         raise HTTPException(status_code=415, detail="Разрешены изображения JPG, PNG, WEBP и GIF.")
-    image_data = await photo.read(8 * 1024 * 1024 + 1)
     if not image_data:
         raise HTTPException(status_code=422, detail="Выберите фотографию.")
     if len(image_data) > 8 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Изображение слишком большое. Максимум 8 МБ.")
-    filename = Path(photo.filename or "photo").name[:120] or "photo"
     try:
         async with FP_LOCK:
             client, _acct = need_funpay()
