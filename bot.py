@@ -83,7 +83,28 @@ log = logging.getLogger("tasks")
 # 2. Конфиг
 # ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.getenv("DB_PATH", os.path.join(BASE_DIR, "bot.sqlite3"))
+
+
+def resolve_db_path() -> str:
+    """Выбирает путь к БД: DB_PATH из окружения, иначе рядом с bot.py, иначе /tmp.
+
+    Создаёт папку, если её нет, и пропускает путь, куда нет прав на запись.
+    """
+    env_path = os.getenv("DB_PATH", "").strip()
+    candidates = [p for p in (env_path, os.path.join(BASE_DIR, "bot.sqlite3"), os.path.join("/tmp", "bot.sqlite3")) if p]
+    for path in candidates:
+        folder = os.path.dirname(os.path.abspath(path))
+        try:
+            os.makedirs(folder, exist_ok=True)
+            if os.access(folder, os.W_OK):
+                return path
+            log.warning("Нет прав на запись в папку %s", folder)
+        except OSError as exc:
+            log.warning("Путь БД недоступен %s: %s", path, exc)
+    raise SystemExit("Не удалось найти папку для базы данных.")
+
+
+DB_PATH = resolve_db_path()
 START_PHOTO_URL = os.getenv("START_PHOTO_URL", "").strip()
 APP_VERSION = "1.0.0"
 START_TIME = time.monotonic()
@@ -3571,126 +3592,4 @@ async def remove(task_id: int) -> Response:
 
 @api.get("/stats", response_model=Stats)
 async def stats() -> Stats:
-    """Агрегированная статистика."""
-    return Stats(**(await task_stats()))
-
-
-@api.post("/tasks/bulk", response_model=list[BulkResult])
-async def bulk_tasks(items: list[BulkItem] = Body(...)) -> list[BulkResult]:
-    """Пакетные операции create / patch / delete, результат по каждому элементу."""
-    if not items or len(items) > 100:
-        raise HTTPException(422, "Допустимо от 1 до 100 операций за запрос")
-    results: list[BulkResult] = []
-    for idx, item in enumerate(items):
-        try:
-            if item.op == "create":
-                task = await create_task(TaskCreate(**item.data))
-                await WS.broadcast("task.created", task.model_dump())
-                results.append(BulkResult(index=idx, ok=True, op=item.op, id=task.id, task=task))
-
-            elif item.op == "patch":
-                if item.id is None:
-                    raise ValueError("Не указан id")
-                changes = TaskPatch(**item.data).model_dump(exclude_unset=True)
-                changes = {k: v for k, v in changes.items() if v is not None or k == "telegram_id"}
-                task = await update_task(item.id, changes)
-                if task is None:
-                    raise LookupError("Задача не найдена")
-                await WS.broadcast("task.updated", task.model_dump())
-                results.append(BulkResult(index=idx, ok=True, op=item.op, id=task.id, task=task))
-
-            else:
-                if item.id is None:
-                    raise ValueError("Не указан id")
-                removed = await delete_task(item.id)
-                if removed is None:
-                    raise LookupError("Задача не найдена")
-                await WS.broadcast("task.deleted", {"id": removed.id, "telegram_id": removed.telegram_id})
-                await notify_owner(removed.telegram_id, f"🗑 Задача #{removed.id} удалена из дашборда.")
-                results.append(BulkResult(index=idx, ok=True, op=item.op, id=removed.id))
-
-        # ValidationError является подклассом ValueError
-        except (ValueError, TypeError, LookupError) as exc:
-            results.append(BulkResult(index=idx, ok=False, op=item.op, id=item.id, error=str(exc)))
-    return results
-
-
-@api.get("/export")
-async def export(fmt: Literal["json", "csv"] = Query("json", alias="format")) -> StreamingResponse:
-    """Экспорт всех задач в JSON или CSV (CSV с BOM для Excel)."""
-    tasks, _ = await query_tasks(sort="id", order="asc", limit=100000)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    filename = f"tasks-{stamp}.{fmt}"
-    disposition = {"Content-Disposition": f'attachment; filename="{filename}"'}
-
-    if fmt == "json":
-        data = json.dumps([t.model_dump() for t in tasks], ensure_ascii=False, indent=2)
-        return StreamingResponse(
-            iter([data]),
-            media_type="application/json; charset=utf-8",
-            headers=disposition,
-        )
-
-    buf = io.StringIO()
-    writer = csv.DictWriter(
-        buf,
-        fieldnames=["id", "telegram_id", "title", "body", "status", "priority", "created_at", "updated_at"],
-    )
-    writer.writeheader()
-    for t in tasks:
-        writer.writerow(t.model_dump())
-    return StreamingResponse(
-        iter(["﻿" + buf.getvalue()]),
-        media_type="text/csv; charset=utf-8",
-        headers=disposition,
-    )
-
-
-app.include_router(api)
-
-
-# ---------------------------------------------------------------------------
-# 9. WebSocket, webhook и страница
-# ---------------------------------------------------------------------------
-@app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket) -> None:
-    """Живые события задач. Клиент может слать 'ping' для keep-alive."""
-    await WS.connect(ws)
-    try:
-        await ws.send_text(json.dumps({"event": "hello", "data": {"clients": WS.count}, "ts": now_iso()}))
-        while True:
-            message = await ws.receive_text()
-            if message == "ping":
-                await ws.send_text(json.dumps({"event": "pong", "data": {}, "ts": now_iso()}))
-    except (WebSocketDisconnect, RuntimeError):
-        pass
-    finally:
-        await WS.disconnect(ws)
-
-
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request) -> dict[str, bool]:
-    """Приём апдейтов Telegram в режиме webhook."""
-    if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        raise HTTPException(403, "Неверный секрет вебхука")
-    data = await request.json()
-    update = Update.de_json(data, TG_APP.bot)
-    await TG_APP.process_update(update)
-    return {"ok": True}
-
-
-@app.get("/", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
-    """Фронтенд дашборда (встроен в этот файл)."""
-    return HTMLResponse(HTML_PAGE, headers={"Cache-Control": "no-store"})
-
-
-# ---------------------------------------------------------------------------
-# 10. Точка входа
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-
-    # Webhook (если задан RENDER_EXTERNAL_URL) настраивается в lifespan.
-    host = "0.0.0.0" if RENDER_URL else os.getenv("HOST", "127.0.0.1")
-    uvicorn.run(app, host=host, port=PORT, log_level="info", proxy_headers=True, forwarded_allow_ips="*")
+    """Агрегированная стати
