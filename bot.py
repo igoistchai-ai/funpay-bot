@@ -523,17 +523,34 @@ class MessageBody(BaseModel):
 
 @app.post("/api/login")
 async def login(payload: LoginBody, request: Request) -> dict[str, Any]:
-    if not DASHBOARD_PASSWORD:
-        raise HTTPException(status_code=503, detail="Добавьте переменную DASHBOARD_PASSWORD в настройки Render.")
     host = request.client.host if request.client else "unknown"
     now = time.time()
     attempts = [t for t in LOGIN_ATTEMPTS.get(host, []) if now - t < 300]
     if len(attempts) >= 8:
         raise HTTPException(status_code=429, detail="Слишком много попыток. Подождите пять минут.")
-    if not hmac.compare_digest(payload.password, DASHBOARD_PASSWORD):
+
+    # A FREE/paid license key is an alternative to the admin dashboard password.
+    # Keys are checked against the same persistent database used by the Telegram bot.
+    supplied = payload.password.strip()
+    password_ok = bool(DASHBOARD_PASSWORD) and hmac.compare_digest(supplied, DASHBOARD_PASSWORD)
+    license_ok = False
+    if not password_ok:
+        try:
+            init_license_db()
+            with sqlite3.connect(LICENSE_DB_PATH) as db:
+                row = db.execute(
+                    "SELECT expires_at FROM license_keys WHERE license_key = ? COLLATE NOCASE",
+                    (supplied,),
+                ).fetchone()
+            license_ok = bool(row and (row[0] is None or int(row[0]) > int(now)))
+        except sqlite3.Error:
+            log.exception("License lookup failed during login")
+            license_ok = False
+
+    if not (password_ok or license_ok):
         attempts.append(now)
         LOGIN_ATTEMPTS[host] = attempts
-        raise HTTPException(status_code=401, detail="Неверный пароль панели.")
+        raise HTTPException(status_code=401, detail="Неверный пароль панели или ключ. Проверьте ключ и срок его действия.")
     LOGIN_ATTEMPTS.pop(host, None)
     token = secrets.token_urlsafe(32)
     SESSIONS[token] = now + SESSION_TTL_SECONDS
@@ -849,8 +866,8 @@ body:before{content:'';position:fixed;inset:-22%;z-index:-1;pointer-events:none;
     <div class="login-brand"><div class="login-symbol" id="login-mark"></div><div><h1 class="login-title">FunPay Auto Lister</h1><div class="brand-sub">CONTROL PANEL · V2</div></div></div>
     <div class="eyebrow">ПАНЕЛЬ УПРАВЛЕНИЯ</div><div style="font:800 26px/1.22 Manrope,sans-serif;letter-spacing:-.04em">С возвращением</div>
     <div class="login-sub">Введите пароль панели, чтобы управлять офферами, чатами и заказами FunPay.</div>
-    <form id="login-form"><div class="login-field"><label for="login-password">Пароль панели</label><input id="login-password" type="password" autocomplete="current-password" placeholder="Введите пароль" required></div><button class="btn btn-primary" type="submit">Войти в панель <span aria-hidden="true">→</span></button><div class="login-error" id="login-error"></div></form>
-    <div class="login-note">Пароль панели задаётся через переменную <span class="mono">DASHBOARD_PASSWORD</span> в настройках Render.</div>
+    <form id="login-form"><div class="login-field"><label for="login-password">Пароль панели или лицензионный ключ</label><input id="login-password" type="password" autocomplete="current-password" placeholder="Введите пароль" required></div><button class="btn btn-primary" type="submit">Войти в панель <span aria-hidden="true">→</span></button><div class="login-error" id="login-error"></div></form>
+    <div class="login-note">Вставьте ключ, полученный в Telegram, либо пароль администратора <span class="mono">DASHBOARD_PASSWORD</span>.</div>
   </div>
 </div>
 <div class="scrim" id="scrim"></div>
