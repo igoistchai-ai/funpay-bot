@@ -1,0 +1,5 @@
+python-telegram-bot>=21,<23
+fastapi>=0.110
+uvicorn[standard]>=0.29
+aiosqlite>=0.20
+python-dotenv>=1.0
