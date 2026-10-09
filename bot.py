@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -41,7 +41,7 @@ DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
 PORT = int(os.getenv("PORT", "8000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip() or None
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.3.1"
 ADMIN_TELEGRAM_ID = 8357023784
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 START_TIME = time.monotonic()
@@ -100,8 +100,13 @@ def init_license_db() -> None:
             author TEXT NOT NULL DEFAULT 'Вы',
             timestamp TEXT NOT NULL,
             created_at INTEGER NOT NULL,
+            image_link TEXT,
             UNIQUE(chat_id, message_id)
         )""")
+        # Safe in-place migration for databases created by earlier builds.
+        columns = {row[1] for row in db.execute("PRAGMA table_info(sent_chat_messages)").fetchall()}
+        if "image_link" not in columns:
+            db.execute("ALTER TABLE sent_chat_messages ADD COLUMN image_link TEXT")
         db.commit()
 
 
@@ -185,19 +190,27 @@ def create_admin_license(duration: str, telegram_user_id: int | None = None) -> 
             "created_at": now, "expires_at": expires, "active": expires is None or expires > now}
 
 
-def save_sent_chat_message(chat_id: int | str, message_id: str | int | None, text: str, author: str = "Вы") -> dict[str, Any]:
+def save_sent_chat_message(
+    chat_id: int | str,
+    message_id: str | int | None,
+    text: str,
+    author: str = "Вы",
+    image_link: str | None = None,
+) -> dict[str, Any]:
     init_license_db()
     now = int(time.time())
     stable_id = str(message_id) if message_id is not None else f"local-{now}-{secrets.token_hex(5)}"
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    stored_text = text or ("[Изображение]" if image_link else "")
     with sqlite3.connect(LICENSE_DB_PATH) as db:
         db.execute(
-            "INSERT OR IGNORE INTO sent_chat_messages(chat_id,message_id,text,author,timestamp,created_at) VALUES(?,?,?,?,?,?)",
-            (str(chat_id), stable_id, text, author or "Вы", stamp, now),
+            "INSERT OR IGNORE INTO sent_chat_messages(chat_id,message_id,text,author,timestamp,created_at,image_link) VALUES(?,?,?,?,?,?,?)",
+            (str(chat_id), stable_id, stored_text, author or "Вы", stamp, now, image_link),
         )
         db.commit()
-    return {"id": stable_id, "chat_id": str(chat_id), "text": text, "author": author or "Вы",
-            "author_id": None, "is_incoming": False, "image_link": None, "timestamp": stamp}
+    return {"id": stable_id, "chat_id": str(chat_id), "text": stored_text, "author": author or "Вы",
+            "author_id": None, "is_incoming": False, "image_link": image_link, "timestamp": stamp,
+            "local_confirmed": True}
 
 
 def format_expiry(expires_at: int | None) -> str:
@@ -721,6 +734,8 @@ class LotEditBody(BaseModel):
 
 class MessageBody(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
+    last_message_id: int | None = Field(default=None, ge=0)
+    interlocutor_id: int | None = Field(default=None, ge=0)
 
 
 class AdminLicenseCreateBody(BaseModel):
@@ -871,15 +886,25 @@ async def search_funpay_catalog(q: str = "", _: bool = Depends(require_session))
     global FP_CATEGORIES_CACHE, FP_CATEGORIES_CACHE_AT
     _client, account = need_funpay()
     query = " ".join(q.casefold().split())[:80]
-    if time.time() - FP_CATEGORIES_CACHE_AT > 60 or not FP_CATEGORIES_CACHE:
+    # Double-check the cache after acquiring FP_LOCK. Without this second check,
+    # every keystroke on the first search could queue another full catalog request.
+    cache_stale = (time.time() - FP_CATEGORIES_CACHE_AT > 60) or not FP_CATEGORIES_CACHE
+    if cache_stale:
         try:
             async with FP_LOCK:
-                raw = await account.get_categories()
-            FP_CATEGORIES_CACHE = [clean_model(item) for item in raw]
-            FP_CATEGORIES_CACHE_AT = time.time()
+                cache_stale = (time.time() - FP_CATEGORIES_CACHE_AT > 60) or not FP_CATEGORIES_CACHE
+                if cache_stale:
+                    raw = await account.get_categories()
+                    parsed = [clean_model(item) for item in raw]
+                    if parsed:
+                        FP_CATEGORIES_CACHE = parsed
+                        FP_CATEGORIES_CACHE_AT = time.time()
         except Exception as exc:
             log.warning("FunPay catalog search failed: %s", type(exc).__name__)
-            raise HTTPException(status_code=502, detail="Не удалось запросить каталог FunPay.") from exc
+            # Continue with a previous snapshot if available instead of failing every
+            # query during a short FunPay hiccup. Never pretend an empty cache is live data.
+            if not FP_CATEGORIES_CACHE:
+                raise HTTPException(status_code=502, detail="Не удалось запросить каталог FunPay. Проверьте подключение аккаунта в настройках.") from exc
 
     def rank(name: str) -> float:
         normalized = " ".join(str(name or "").casefold().split())
@@ -1092,7 +1117,7 @@ async def chat_history(chat_id: int, _: bool = Depends(require_session)) -> list
         with sqlite3.connect(LICENSE_DB_PATH) as db:
             db.row_factory = sqlite3.Row
             saved = db.execute(
-                "SELECT message_id,text,author,timestamp,created_at FROM sent_chat_messages WHERE chat_id=? ORDER BY created_at ASC LIMIT 500",
+                "SELECT message_id,text,author,timestamp,created_at,image_link FROM sent_chat_messages WHERE chat_id=? ORDER BY created_at ASC LIMIT 500",
                 (str(chat_id),),
             ).fetchall()
         remote_ids = {str(m.get("id")) for m in remote if isinstance(m, dict) and m.get("id") is not None}
@@ -1103,7 +1128,7 @@ async def chat_history(chat_id: int, _: bool = Depends(require_session)) -> list
             if mid in remote_ids:
                 continue
             remote.append({"id": mid, "chat_id": str(chat_id), "text": row["text"], "author": row["author"] or "Вы",
-                           "author_id": None, "is_incoming": False, "image_link": None, "timestamp": row["timestamp"],
+                           "author_id": None, "is_incoming": False, "image_link": row["image_link"], "timestamp": row["timestamp"],
                            "local_confirmed": True})
         return remote
     except Exception as exc:
@@ -1111,9 +1136,139 @@ async def chat_history(chat_id: int, _: bool = Depends(require_session)) -> list
         raise HTTPException(status_code=502, detail="Не удалось открыть историю этого чата.") from exc
 
 
+def _chat_message_payload(objects: Any, chat_id: int, after_id: int | None = None, expected_text: str | None = None, expect_image: bool = False) -> dict[str, Any] | None:
+    """Extract a newly-created message from a FunPay runner response, not a stale chat row."""
+    candidates: list[dict[str, Any]] = []
+    for obj in objects or []:
+        if not isinstance(obj, dict) or obj.get("type") != "chat_node":
+            continue
+        data = obj.get("data") or {}
+        node = data.get("node") or {}
+        found_chat_id = node.get("id") if isinstance(node, dict) else node
+        if found_chat_id is not None and str(found_chat_id) != str(chat_id) and str(obj.get("id")) != str(chat_id):
+            continue
+        for raw in data.get("messages") or []:
+            if not isinstance(raw, dict) or raw.get("id") is None:
+                continue
+            try:
+                mid_number = int(raw.get("id"))
+            except (TypeError, ValueError):
+                mid_number = None
+            if after_id is not None and mid_number is not None and mid_number <= after_id:
+                continue
+            # Do not mistake a buyer's reply that happens to have identical text for our own send.
+            author_id = raw.get("author")
+            own_id = getattr(FP_CLIENT, "id", None)
+            if author_id is not None and own_id is not None and str(author_id) != str(own_id):
+                continue
+            raw_html = str(raw.get("html") or "")
+            soup = BeautifulSoup(raw_html, "html.parser") if raw_html else None
+            text_node = soup.select_one(".chat-msg-text") if soup else None
+            raw_text = text_node.get_text(" ", strip=True) if text_node else str(raw.get("text") or "").strip()
+            image_node = soup.select_one("a.chat-img-link img, img") if soup else None
+            if expected_text is not None and " ".join(raw_text.split()) != " ".join(expected_text.split()):
+                continue
+            if expect_image and not image_node:
+                continue
+            candidates.append({"id": str(raw.get("id")), "text": raw_text, "image_link": image_node.get("src") if image_node else None,
+                               "raw_html": raw_html, "id_num": mid_number})
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item["id_num"] is not None, item["id_num"] or -1))
+    return candidates[-1]
+
+
+async def _runner_send_request(client: Any, objects: list[dict[str, Any]], request: dict[str, Any]) -> list[dict[str, Any]]:
+    """Call runner directly so API-level send errors are not discarded by the thin client wrapper."""
+    await client.ensure_initialized()
+    payload = {
+        "objects": json.dumps(objects, ensure_ascii=False),
+        "request": json.dumps(request, ensure_ascii=False),
+        "csrf_token": client.csrf_token,
+    }
+    response = await client.post(
+        "runner/", data=payload,
+        headers={
+            "accept": "*/*",
+            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "x-requested-with": "XMLHttpRequest",
+        },
+        raise_not_200=True,
+    )
+    try:
+        result = response.json()
+    except Exception as exc:
+        raise RuntimeError("FunPay runner вернул не JSON") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("FunPay runner вернул неожиданный ответ")
+    response_info = result.get("response") or {}
+    if isinstance(response_info, dict) and response_info.get("error"):
+        error_text = str(response_info.get("error"))[:240]
+        raise RuntimeError(f"FunPay отклонил сообщение: {error_text}")
+    if result.get("error"):
+        raise RuntimeError(str(result.get("msg") or result.get("error"))[:240])
+    returned = result.get("objects") or []
+    return returned if isinstance(returned, list) else []
+
+
+async def _send_runner_message(chat_id: int, text: str = "", image_id: int | None = None, interlocutor_id: int | None = None,
+                               after_id: int | None = None) -> dict[str, Any] | None:
+    """Send with FunPay's runner protocol and require a newly-created message as confirmation."""
+    client, account = need_funpay()
+    chat_node_id: int | str = int(chat_id) if str(chat_id).isdigit() else str(chat_id)
+    message_content = "" if image_id is not None else text
+    data: dict[str, Any] = {"node": chat_node_id, "content": message_content}
+    if image_id is not None:
+        data["image_id"] = int(image_id)
+    if interlocutor_id is not None:
+        # Keep the exact key used by FunPay's currently published Python client.
+        # FunPay's runner endpoint historically expects a leading space here.
+        data[" interlocutor_id"] = int(interlocutor_id)
+    objects = await _runner_send_request(
+        client,
+        [{"type": "chat_node", "id": chat_node_id, "tag": "00000000",
+          "data": {"node": chat_node_id, "last_message": "", "content": message_content}}],
+        request={"action": "message_send", "data": data},
+    )
+    confirmed = _chat_message_payload(objects, chat_id, after_id=after_id, expected_text=text if image_id is None else None,
+                                      expect_image=image_id is not None)
+    if confirmed:
+        confirmed.pop("id_num", None)
+        confirmed.pop("raw_html", None)
+        return confirmed
+    # Some responses omit the new message. Check only messages newer than the last visible ID to
+    # avoid falsely confirming a previously-sent duplicate with the same text.
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(0.35)
+        history = await account.get_chat_history(chat_id, last_message_id=after_id)
+        normalized = [clean_model(item) for item in history or []]
+        matches: list[dict[str, Any]] = []
+        for item in normalized:
+            if not isinstance(item, dict) or item.get("id") is None:
+                continue
+            try:
+                mid_num = int(item["id"])
+            except (TypeError, ValueError):
+                mid_num = None
+            if after_id is not None and mid_num is not None and mid_num <= after_id:
+                continue
+            if image_id is not None:
+                if not item.get("image_link"):
+                    continue
+            elif str(item.get("text") or "").strip() != text or bool(item.get("is_incoming")):
+                continue
+            matches.append(item)
+        if matches:
+            matches.sort(key=lambda x: int(x.get("id") or 0) if str(x.get("id", "")).isdigit() else -1)
+            return {"id": str(matches[-1].get("id")), "text": matches[-1].get("text") or "",
+                    "image_link": matches[-1].get("image_link")}
+    return None
+
+
 @app.post("/api/funpay/chats/{chat_id}/send")
 async def send_chat_message(chat_id: int, payload: MessageBody, _: bool = Depends(require_session)) -> dict[str, Any]:
-    _client, account = need_funpay()
+    _client, _account = need_funpay()
     message_text = payload.text.strip()
     if not message_text:
         raise HTTPException(status_code=422, detail="Введите текст сообщения.")
@@ -1121,35 +1276,80 @@ async def send_chat_message(chat_id: int, payload: MessageBody, _: bool = Depend
         raise HTTPException(status_code=422, detail="Сообщение слишком длинное.")
     try:
         async with FP_LOCK:
-            chat_items = await account.get_chats()
-            target = next((item for item in chat_items if str(getattr(item, "id", None) if not isinstance(item, dict) else item.get("id")) == str(chat_id)), None)
-            interlocutor_id = getattr(target, "interlocutor_id", None) if target is not None and not isinstance(target, dict) else (target.get("interlocutor_id") if isinstance(target, dict) else None)
-            result = await account.send_message(chat_id, message_text, interlocutor_id=int(interlocutor_id) if interlocutor_id is not None else None)
-            result_data = clean_model(result)
-            message_id = result_data.get("message_id", result_data.get("id")) if isinstance(result_data, dict) else None
-            # A transport response alone is insufficient; the API's parsed message id is the send confirmation.
-            if message_id is None:
-                try:
-                    history = await account.get_chat_history(chat_id)
-                    for candidate in reversed(history or []):
-                        item = clean_model(candidate)
-                        if isinstance(item, dict) and str(item.get("text") or "").strip() == message_text and not item.get("is_incoming", False):
-                            message_id = item.get("id")
-                            break
-                except Exception:
-                    pass
-        if message_id is None:
-            raise HTTPException(status_code=502, detail="FunPay не подтвердил сообщение. Оно не отмечено как отправленное — проверьте чат и попробуйте ещё раз.")
+            confirmed = await _send_runner_message(chat_id, message_text, interlocutor_id=payload.interlocutor_id,
+                                                   after_id=payload.last_message_id)
+        if not confirmed or not confirmed.get("id"):
+            raise HTTPException(status_code=502, detail="FunPay не вернул новое сообщение после отправки. Проверьте чат в FunPay перед повторной отправкой, чтобы не создать дубликат.")
         profile = FP_PROFILE or {}
         author = str((profile.get("profile") or {}).get("username") or "Вы")
-        saved_message = save_sent_chat_message(chat_id, message_id, message_text, author)
-        return {"ok": True, "message_id": str(message_id), "chat_id": str(chat_id), "text": message_text,
-                "author": author, "is_incoming": False, "timestamp": saved_message["timestamp"], "message": saved_message}
+        saved = save_sent_chat_message(chat_id, confirmed["id"], message_text, author, confirmed.get("image_link"))
+        return {"ok": True, "message_id": str(confirmed["id"]), "chat_id": str(chat_id), "text": message_text,
+                "author": author, "is_incoming": False, "timestamp": saved["timestamp"], "message": saved}
     except HTTPException:
         raise
     except Exception as exc:
         log.warning("Message send failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="FunPay не подтвердил отправку. Проверьте соединение и откройте чат повторно.") from exc
+        detail = str(exc).replace(FP_CLIENT.golden_key if FP_CLIENT else "__never__", "[redacted]")[:300]
+        if not detail or ("failed:" in detail.lower() and "http" in detail.lower()):
+            detail = f"Ошибка FunPay ({type(exc).__name__}). Проверьте сессию и состояние чата."
+        raise HTTPException(status_code=502, detail=f"Не удалось отправить сообщение: {detail}") from exc
+
+
+@app.post("/api/funpay/chats/{chat_id}/send-image")
+async def send_chat_image(
+    chat_id: int,
+    photo: UploadFile = File(...),
+    last_message_id: int | None = Form(default=None),
+    interlocutor_id: int | None = Form(default=None),
+    _: bool = Depends(require_session),
+) -> dict[str, Any]:
+    """Upload and send a photo in the selected personal FunPay chat."""
+    _client, _account = need_funpay()
+    content_type = (photo.content_type or "").lower().split(";", 1)[0].strip()
+    if content_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+        raise HTTPException(status_code=415, detail="Разрешены изображения JPG, PNG, WEBP и GIF.")
+    image_data = await photo.read(8 * 1024 * 1024 + 1)
+    if not image_data:
+        raise HTTPException(status_code=422, detail="Выберите фотографию.")
+    if len(image_data) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Изображение слишком большое. Максимум 8 МБ.")
+    filename = Path(photo.filename or "photo").name[:120] or "photo"
+    try:
+        async with FP_LOCK:
+            client, _acct = need_funpay()
+            await client.ensure_initialized()
+            await client._throttle()
+            upload_resp = await client._client.post(
+                "file/addChatImage",
+                data={"file_id": "0"},
+                files={"file": (filename, image_data, content_type)},
+                headers={"accept": "*/*", "x-requested-with": "XMLHttpRequest"},
+            )
+            if upload_resp.status_code != 200:
+                raise RuntimeError(f"FunPay вернул HTTP {upload_resp.status_code} при загрузке фото.")
+            try:
+                upload_payload = upload_resp.json()
+            except Exception as exc:
+                raise RuntimeError("FunPay вернул некорректный ответ при загрузке фото.") from exc
+            image_id = upload_payload.get("fileId")
+            if not image_id:
+                raise RuntimeError(str(upload_payload.get("msg") or "FunPay не выдал ID загруженного фото.")[:200])
+            confirmed = await _send_runner_message(chat_id, image_id=int(image_id), interlocutor_id=interlocutor_id,
+                                                    after_id=last_message_id)
+        if not confirmed or not confirmed.get("id"):
+            raise HTTPException(status_code=502, detail="Фото загружено, но отправка не подтверждена FunPay. Проверьте чат перед повторной отправкой.")
+        profile = FP_PROFILE or {}
+        author = str((profile.get("profile") or {}).get("username") or "Вы")
+        saved = save_sent_chat_message(chat_id, confirmed["id"], "[Изображение]", author, confirmed.get("image_link"))
+        return {"ok": True, "message_id": str(confirmed["id"]), "chat_id": str(chat_id), "text": "[Изображение]",
+                "author": author, "is_incoming": False, "timestamp": saved["timestamp"], "image_link": confirmed.get("image_link"),
+                "message": saved}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.warning("Photo send failed: %s", type(exc).__name__)
+        detail = str(exc).replace(FP_CLIENT.golden_key if FP_CLIENT else "__never__", "[redacted]")[:300]
+        raise HTTPException(status_code=502, detail=f"Не удалось отправить фото: {detail or type(exc).__name__}") from exc
 
 @app.get("/api/funpay/orders")
 async def orders(limit: int = 50, _: bool = Depends(require_session)) -> list[dict[str, Any]]:
@@ -1234,6 +1434,7 @@ button,.nav-item,.chat-item,.quick-card{ -webkit-tap-highlight-color:transparent
 @keyframes timer-pulse{50%{opacity:.45;box-shadow:0 0 2px #4cd6a040}}
 .catalog-search-panel{margin:0 0 17px;padding:18px;border:1px solid #9672ff38;border-radius:17px;background:linear-gradient(115deg,#211b36e8,#13131ee8 58%,#142034cc);box-shadow:0 12px 35px #0002;position:relative;overflow:visible}
 .catalog-search-top{display:flex;align-items:center;gap:12px;margin-bottom:12px}.catalog-search-symbol{display:grid;place-items:center;width:38px;height:38px;flex:none;border-radius:13px;background:linear-gradient(145deg,#a18aff,#5c6fe2);box-shadow:0 6px 22px #8c72ff45}.catalog-search-symbol svg{width:18px;height:18px;stroke:white;fill:none;stroke-width:1.8}.catalog-search-title{font:800 14px Manrope,sans-serif}.catalog-search-sub{font-size:10px;color:var(--muted);margin-top:4px}.catalog-search-wrap{position:relative}.catalog-search-input{height:47px;width:100%;padding:0 15px 0 43px;border-radius:13px;border:1px solid #a48cff40;background:#0d0d18cc;font-size:13px;box-shadow:inset 0 1px 0 #ffffff08;transition:border-color .2s,box-shadow .2s}.catalog-search-input:focus{border-color:#a48cff9c;box-shadow:0 0 0 3px #9672ff1d}.catalog-search-wrap:before{content:'⌕';position:absolute;left:15px;top:7px;font-size:25px;line-height:30px;color:#b7a4ff;pointer-events:none}.catalog-results{display:grid;gap:6px;margin-top:10px;max-height:260px;overflow:auto}.catalog-result{display:flex;align-items:center;gap:11px;width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:11px;background:#ffffff05;text-align:left;transition:background .15s,border-color .15s,transform .15s}.catalog-result:hover{background:#9672ff13;border-color:#9672ff55;transform:translateX(2px)}.catalog-result-ico{width:31px;height:31px;display:grid;place-items:center;border-radius:10px;background:#9672ff1c;color:#b7a4ff;font-size:12px;font-weight:800;flex:none}.catalog-result-main{min-width:0;flex:1}.catalog-result-name{font-size:12px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.catalog-result-path{font-size:10px;color:var(--muted);margin-top:4px}.catalog-result-arrow{color:#a893ff;font-size:18px}
+.chat-composer{align-items:center}.chat-composer input[type=file][hidden]{display:none!important}.chat-photo-btn{width:40px;min-width:40px;height:40px;padding:0;border-radius:11px;font-size:23px;line-height:1;color:#cbbcff;border-color:#9b83ff44;background:#8b5cf614}.chat-photo-btn:disabled{opacity:.35}.message-image-wrap{margin-top:7px;max-width:min(350px,100%)}.chat-message-image{display:block;max-width:100%;max-height:280px;object-fit:contain;border-radius:10px;border:1px solid #ffffff16;background:#0c0c14}.message-text:empty{display:none}.chat-message-image:hover{filter:brightness(1.04)}
 .admin-key-table code{font-size:10px;white-space:nowrap}.license-status{display:inline-flex;padding:5px 8px;border-radius:8px;font-size:10px;font-weight:800}.license-status.active{color:#85e4bd;background:#4cd6a014;border:1px solid #4cd6a031}.license-status.expired{color:#ff9aaa;background:#ff718812;border:1px solid #ff71882c}
 @media(max-width:860px){.license-timer{padding:7px 8px;font-size:9px}.catalog-search-panel{padding:14px}}
 @media(max-width:600px){.license-timer{max-width:100px;overflow:hidden;text-overflow:ellipsis}.license-timer:before{display:none}.topbar{gap:7px;padding:0 10px}.live-label{display:none}.user-chip{padding-left:7px}.user-caption{display:none}.user-name{max-width:72px}.top-actions{gap:5px}.icon-btn{width:32px;height:32px}.catalog-search-title{font-size:12px}.catalog-search-sub{font-size:9px}}
@@ -1317,7 +1518,7 @@ input:focus,textarea:focus,select:focus{border-color:#9878ffb3!important;box-sha
       <button class="nav-item hidden" data-page="admin" id="admin-nav"><svg viewBox="0 0 24 24"><path d="M12 3 20 6v5c0 5-3.3 8-8 10-4.7-2-8-5-8-10V6z"/><path d="m8.5 12 2.3 2.3 4.7-5"/></svg><span class="label">Admin</span><span class="badge">ROOT</span></button>
       <button class="nav-item" data-page="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="m19.4 15 .1.1 1.1 1.8-1.8 3.1-2.1-.5a8 8 0 0 1-1.7 1l-.6 2h-3.6l-.6-2a8 8 0 0 1-1.7-1l-2.1.5-1.8-3.1 1.1-1.8a8 8 0 0 1 0-2l-1.1-1.8 1.8-3.1 2.1.5a8 8 0 0 1 1.7-1l.6-2h3.6l.6 2a8 8 0 0 1 1.7 1l2.1-.5 1.8 3.1-1.1 1.8a8 8 0 0 1 0 2Z" transform="translate(-1 -1) scale(1.08)"/></svg><span class="label">Settings</span></button>
     </nav></div>
-    <div class="sidebar-bottom"><div class="connection-card"><div class="connection-top"><span class="status-dot off" id="side-dot"></span><span id="side-status">FunPay не подключён</span></div><div class="connection-sub" id="side-account">Откройте настройки аккаунта</div></div><div class="side-footer">FUNPAY AUTO LISTER <span id="version">· 3.2.0</span></div></div>
+    <div class="sidebar-bottom"><div class="connection-card"><div class="connection-top"><span class="status-dot off" id="side-dot"></span><span id="side-status">FunPay не подключён</span></div><div class="connection-sub" id="side-account">Откройте настройки аккаунта</div></div><div class="side-footer">FUNPAY AUTO LISTER <span id="version">· 3.3.0</span></div></div>
   </aside>
   <header class="topbar"><button class="icon-btn mobile-menu" id="menu-toggle" aria-label="Открыть меню"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button><div class="crumb"><span>Workspace</span><span>/</span><strong id="crumb-label">Dashboard</strong></div><div class="top-spacer"></div><div class="live-label"><span class="status-dot" id="top-dot"></span><span id="top-status">Нет подключения</span></div><div class="license-timer" id="license-timer" title="Оставшееся время ключа">Ключ · проверка</div><div class="top-actions"><button class="icon-btn" id="sound-btn" title="Звуки уведомлений" aria-label="Звуки уведомлений"><svg viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15 9a4 4 0 0 1 0 6M17.5 6.5a7.5 7.5 0 0 1 0 11"/></svg></button><button class="icon-btn" id="refresh-btn" title="Обновить данные" aria-label="Обновить"><svg viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.5 9A7 7 0 0 1 18 6l2 6M4 12l2 6a7 7 0 0 0 12.5-3"/></svg></button><div class="user-chip"><div class="user-avatar" id="user-avatar">FP</div><div><div class="user-name" id="user-name">Панель</div><div class="user-caption">Личный кабинет</div></div></div></div></header>
   <main class="main" id="main">
@@ -1337,7 +1538,7 @@ input:focus,textarea:focus,select:focus{border-color:#9878ffb3!important;box-sha
     </section>
     <section class="page hidden" data-view="search" id="page-search"><div class="page-head"><div><div class="eyebrow">MARKETPLACE EXPLORER</div><h1 class="h1">Поиск офферов</h1><div class="page-desc">Найдите предложения по игре и ключевым словам.</div></div></div><section class="panel"><div class="toolbar"><div class="field-inline"><label for="search-game">Игра</label><select id="search-game"><option value="">Выберите категорию</option></select></div><div class="field-inline"><label for="search-subcategory">Раздел</label><select id="search-subcategory"><option value="">Выберите раздел</option></select></div><input id="search-query" placeholder="Название, сервер или предмет" maxlength="180"><button class="btn btn-primary" id="search-run">Найти офферы</button><span class="toolbar-spacer"></span><button class="btn" id="search-clear">Сбросить</button></div><div id="search-table"><div class="empty-state"><svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><strong>Задайте параметры поиска</strong><p>Выберите игру и раздел — результаты появятся здесь.</p></div></div></section></section>
     <section class="page hidden" data-view="listings" id="page-listings"><div class="page-head"><div><div class="eyebrow">YOUR INVENTORY</div><h1 class="h1">Мои офферы</h1><div class="page-desc">Просмотр, редактирование и поднятие ваших предложений.</div></div><div class="actions"><button class="btn" id="raise-selected">Поднять выбранные</button><button class="btn btn-primary" data-go="lister">Новый оффер</button></div></div><section class="panel"><div class="toolbar"><div class="field-inline"><label for="lots-game">Игра</label><select id="lots-game"><option value="">Выберите категорию</option></select></div><div class="field-inline"><label for="lots-subcategory">Раздел</label><select id="lots-subcategory"><option value="">Выберите раздел</option></select></div><span class="toolbar-spacer"></span><button class="btn btn-small" id="lots-refresh">Обновить</button></div><div id="my-lots-table"><div class="empty-state"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/><path d="M3 4h18v16H3z"/></svg><strong>Выберите категорию</strong><p>Список собственных офферов загрузится после выбора раздела.</p></div></div></section></section>
-    <section class="page hidden" data-view="chats" id="page-chats"><div class="page-head"><div><div class="eyebrow">CUSTOMER SUPPORT</div><h1 class="h1">Messages</h1><div class="page-desc">Чаты FunPay и история сообщений.</div></div><button class="btn" id="chats-refresh">Обновить чаты</button></div><section class="panel chat-layout"><aside class="chat-sidebar"><div class="toolbar"><input id="chat-filter" placeholder="Найти чат" style="min-width:0;width:100%"></div><div class="chat-list" id="chat-list"><div class="empty-state"><strong>Нет данных</strong><p>Подключите FunPay и загрузите чаты.</p></div></div></aside><section class="chat-main"><div class="chat-main-head" id="chat-main-head"><div class="panel-title">Выберите чат</div><div class="panel-sub">История сообщений отобразится здесь.</div></div><div class="chat-messages" id="chat-messages"><div class="empty-state"><svg viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-6.5A7.5 7.5 0 1 1 20 11.5Z"/></svg><strong>Нет выбранного чата</strong><p>Выберите собеседника слева.</p></div></div><form class="chat-composer" id="chat-send-form"><input id="chat-message" placeholder="Напишите сообщение..." autocomplete="off" disabled><button class="btn btn-primary" id="chat-send" type="submit" disabled>Отправить</button></form></section></section></section>
+    <section class="page hidden" data-view="chats" id="page-chats"><div class="page-head"><div><div class="eyebrow">CUSTOMER SUPPORT</div><h1 class="h1">Messages</h1><div class="page-desc">Чаты FunPay и история сообщений.</div></div><button class="btn" id="chats-refresh">Обновить чаты</button></div><section class="panel chat-layout"><aside class="chat-sidebar"><div class="toolbar"><input id="chat-filter" placeholder="Найти чат" style="min-width:0;width:100%"></div><div class="chat-list" id="chat-list"><div class="empty-state"><strong>Нет данных</strong><p>Подключите FunPay и загрузите чаты.</p></div></div></aside><section class="chat-main"><div class="chat-main-head" id="chat-main-head"><div class="panel-title">Выберите чат</div><div class="panel-sub">История сообщений отобразится здесь.</div></div><div class="chat-messages" id="chat-messages"><div class="empty-state"><svg viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-6.5A7.5 7.5 0 1 1 20 11.5Z"/></svg><strong>Нет выбранного чата</strong><p>Выберите собеседника слева.</p></div></div><form class="chat-composer" id="chat-send-form"><input id="chat-photo" class="hidden-file" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden><button class="btn chat-photo-btn" id="chat-photo-btn" type="button" title="Отправить фото" aria-label="Отправить фото" disabled>＋</button><input id="chat-message" placeholder="Напишите сообщение..." autocomplete="off" disabled><button class="btn btn-primary" id="chat-send" type="submit" disabled>Отправить</button></form></section></section></section>
     <section class="page hidden" data-view="orders" id="page-orders"><div class="page-head"><div><div class="eyebrow">SALES MONITOR</div><h1 class="h1">Заказы</h1><div class="page-desc">Текущие продажи в вашем аккаунте FunPay.</div></div><button class="btn" id="orders-refresh">Обновить заказы</button></div><section class="panel" id="orders-table"><div class="empty-state"><svg viewBox="0 0 24 24"><path d="M7 3h10l3 4v14H4V7zM4 7h16M8 12h8M8 16h6"/></svg><strong>Заказы ещё не загружены</strong><p>Подключите FunPay или нажмите «Обновить заказы».</p></div></section></section>
     <section class="page hidden" data-view="settings" id="page-settings"><div class="page-head"><div><div class="eyebrow">ACCOUNT CONFIGURATION</div><h1 class="h1">Настройки</h1><div class="page-desc">Подключение FunPay и параметры интерфейса.</div></div></div><div class="settings-grid"><section class="panel settings-card"><h3>Аккаунт FunPay</h3><p>Подключите действующую сессию FunPay. В интерфейс вставляется cookie <span class="mono">golden_key</span> и User-Agent того же браузера, где вы вошли в FunPay.</p><form id="fp-connect-form"><div class="field settings-field"><label for="fp-golden-key">golden_key</label><input type="password" id="fp-golden-key" autocomplete="off" placeholder="Значение cookie golden_key" required></div><div class="field settings-field"><label for="fp-user-agent">User-Agent</label><textarea id="fp-user-agent" style="min-height:76px" placeholder="Mozilla/5.0 ... Chrome/... Safari/..."></textarea><div class="field-hint">Используйте User-Agent из того же браузера. После успешного подключения поле ключа очищается.</div></div><div class="settings-foot"><button class="btn btn-primary" id="fp-connect-btn" type="submit">Подключить аккаунт</button><button class="btn btn-danger" id="fp-disconnect" type="button">Отключить</button><span class="pill" id="fp-connection-pill">Не подключён</span></div><div id="fp-connect-result" style="margin-top:13px"></div></form></section><section class="panel settings-card"><h3>Интерфейс</h3><p>Параметры сохраняются в этом браузере.</p><div class="toggle-row"><div><div class="toggle-label">Звуки интерфейса</div><div class="toggle-help">Тихий сигнал на действия и уведомления.</div></div><label class="switch"><input type="checkbox" id="sound-toggle"><span></span></label></div><div class="toggle-row"><div><div class="toggle-label">Автообновление данных</div><div class="toggle-help">Периодическая проверка чатов и статистики.</div></div><label class="switch"><input type="checkbox" id="auto-refresh-toggle" checked><span></span></label></div><div class="toggle-row"><div><div class="toggle-label">Выход из панели</div><div class="toggle-help">Завершить текущую веб-сессию.</div></div><button class="btn btn-small" id="logout-btn">Выйти</button></div><div class="security-note" style="margin-top:18px">Безопасность: <span class="mono">golden_key</span>, введённый здесь, хранится только в памяти процесса. После перезапуска подключитесь снова либо задайте защищённую переменную <span class="mono">FUNPAY_GOLDEN_KEY</span> в Render для автоматического подключения. Пароль панели <span class="mono">DASHBOARD_PASSWORD</span> необязателен для входа по ключу/Telegram.</div></section></div></section>
 <section class="page hidden" data-view="admin" id="page-admin"><div class="page-head"><div><div class="eyebrow">RESTRICTED / TELEGRAM ADMIN</div><h1 class="h1">Панель администратора</h1><div class="page-desc">История всех выданных ключей. Записи не удаляются после окончания срока.</div></div><div class="actions"><button class="btn" id="admin-refresh">Обновить журнал</button><span class="pill" id="admin-license-total">— ключей</span></div></div><section class="panel admin-create-panel"><div class="panel-head"><div><div class="panel-title">Создать лицензионный ключ</div><div class="panel-sub">Выберите срок — готовый ключ появится сразу после сохранения.</div></div><span class="pill good">ADMIN</span></div><form id="admin-create-form" class="panel-body"><div class="field-grid"><div class="field"><label for="admin-duration">Срок действия</label><select id="admin-duration"><option value="1h">1 час</option><option value="6h">6 часов</option><option value="12h">12 часов</option><option value="24h" selected>1 день</option><option value="36h">1,5 дня</option><option value="3d">3 дня</option><option value="7d">7 дней</option><option value="30d">30 дней</option><option value="forever">Навсегда</option></select></div><div class="field"><label for="admin-user-id">Telegram ID для журнала (необязательно)</label><input id="admin-user-id" type="number" min="1" step="1" placeholder="Только пометка в журнале"><div class="field-hint">ID фиксируется для учёта; сам ключ пока не ограничивается конкретным аккаунтом.</div></div></div><div class="settings-foot" style="margin-top:16px"><button class="btn btn-primary" id="admin-create-btn" type="submit">＋ Сгенерировать ключ</button><span class="field-hint">Ключ сохранится в журнале, включая после истечения срока.</span></div><div id="admin-created-key" style="margin-top:12px"></div></form></section><section class="panel"><div class="panel-head"><div><div class="panel-title">Журнал лицензий</div><div class="panel-sub">FREE PLAN и покупки через Telegram Stars · сортировка от новых к старым</div></div><input id="admin-key-filter" style="max-width:230px;height:35px;padding:0 10px;border:1px solid var(--line);border-radius:10px;background:#0d0d16;font-size:11px" placeholder="Фильтр по ключу / Telegram ID"></div><div id="admin-license-list"><div class="empty-state"><strong>Загрузка журнала…</strong></div></div></section><div class="notice" style="margin-top:14px">Доступ администратора определяется подписанными данными Telegram Mini App и фиксированным Telegram ID в коде. Не открывайте WebApp через обычную браузерную ссылку, если ожидаете автоматический вход администратора.</div></section>
@@ -1349,7 +1550,7 @@ input:focus,textarea:focus,select:focus{border-color:#9878ffb3!important;box-sha
 <script>
 (()=>{'use strict';
 const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
-const state={session:sessionStorage.getItem('fpal.session')||'',page:'dashboard',mode:'sell',connected:false,profile:null,categories:[],subcats:new Map(),chats:[],activeChat:null,orders:[],selectedLots:new Set(),editingLot:null,chatTimer:null,isAdmin:false,catalogResults:[],licenseRemaining:null};
+const state={session:sessionStorage.getItem('fpal.session')||'',page:'dashboard',mode:'sell',connected:false,profile:null,categories:[],subcats:new Map(),chats:[],activeChat:null,activeMessages:new Map(),chatPollHandle:null,chatPollInFlight:false,orders:[],selectedLots:new Set(),editingLot:null,chatTimer:null,isAdmin:false,catalogResults:[],licenseRemaining:null};
 let soundEnabled=localStorage.getItem('fpal.sound')!=='off';let autoRefresh=localStorage.getItem('fpal.refresh')!=='off';let audioCtx=null;let firstGestureDone=false;
 const ICONS={brand:'<svg viewBox="0 0 24 24"><path d="M12 2.5 20 7v10l-8 4.5L4 17V7z"/><path d="m4 7 8 5 8-5M12 12v9.5M8 4.7l8 4.5v5.6l-8 4.5"/></svg>',wallet:'<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="15" rx="2"/><path d="M3 8h18M16 14h2"/><path d="M6 5V3h12v2"/></svg>',listing:'<svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h10M4 19h16"/><circle cx="19" cy="12" r="2"/></svg>',message:'<svg viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-6.5A7.5 7.5 0 1 1 20 11.5Z"/><path d="M8 10h8M8 13.5h5"/></svg>',order:'<svg viewBox="0 0 24 24"><path d="M7 3h10l3 4v14H4V7zM4 7h16M8 12h8M8 16h6"/></svg>',search:'<svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg>',layers:'<svg viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/></svg>'};
 $('#brand-mark').innerHTML=ICONS.brand;$('#login-mark').innerHTML=ICONS.brand;$$('[data-ico]').forEach(el=>el.innerHTML=ICONS[el.dataset.ico]||ICONS.listing);
@@ -1363,9 +1564,9 @@ function avatarMarkup(seed,label,cls='chat-avatar'){return `<span class="${cls}"
 function sound(kind='click'){if(!soundEnabled)return;try{audioCtx=audioCtx||new(window.AudioContext||window.webkitAudioContext)();if(audioCtx.state==='suspended')audioCtx.resume();const osc=audioCtx.createOscillator(),gain=audioCtx.createGain();osc.type='sine';const freqs=kind==='ok'?[660,880]:kind==='error'?[220,165]:[420,560];osc.frequency.setValueAtTime(freqs[0],audioCtx.currentTime);osc.frequency.linearRampToValueAtTime(freqs[1],audioCtx.currentTime+.075);gain.gain.setValueAtTime(.0001,audioCtx.currentTime);gain.gain.exponentialRampToValueAtTime(.045,audioCtx.currentTime+.012);gain.gain.exponentialRampToValueAtTime(.0001,audioCtx.currentTime+.14);osc.connect(gain);gain.connect(audioCtx.destination);osc.start();osc.stop(audioCtx.currentTime+.15)}catch{}}
 function toast(message,type='info',ms=4000){const el=document.createElement('div');el.className='toast '+(type==='ok'?'ok':type==='error'?'error':type==='warn'?'warn':'');const span=document.createElement('span');span.textContent=message;const close=document.createElement('button');close.type='button';close.textContent='×';close.addEventListener('click',()=>el.remove());el.append(span,close);$('#toasts').append(el);sound(type==='error'?'error':type==='ok'?'ok':'click');setTimeout(()=>el.remove(),ms)}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-async function api(path,opts={}){const headers={'Accept':'application/json',...(opts.headers||{})};if(state.session)headers['X-Dashboard-Session']=state.session;if(opts.body!==undefined){headers['Content-Type']='application/json';opts={...opts,body:JSON.stringify(opts.body)}}let res;try{res=await fetch(path,{...opts,headers})}catch{throw new Error('Не удалось связаться с сервером')}let payload=null;const text=await res.text();try{payload=text?JSON.parse(text):null}catch{payload=text}if(res.status===401&&path!='/api/login'){logoutLocal();throw new Error('Сессия истекла. Войдите снова.')}if(!res.ok){throw new Error(typeof payload?.detail==='string'?payload.detail:`Ошибка ${res.status}`)}return {data:payload,res}}
-function setPage(page){const valid=['dashboard','lister','search','listings','chats','orders','settings','admin'];if(!valid.includes(page)||(page==='admin'&&!state.isAdmin))page='dashboard';state.page=page;$$('[data-view]').forEach(el=>el.classList.toggle('hidden',el.dataset.view!==page));$$('.nav-item').forEach(el=>el.classList.toggle('active',el.dataset.page===page));$('#crumb-label').textContent=({dashboard:'Dashboard',lister:'Auto Lister',search:'Offer Search',listings:'My Offers',chats:'Messages',orders:'Orders',settings:'Settings',admin:'Admin'})[page];$('#sidebar').classList.remove('open');$('#scrim').classList.remove('show');if(page==='settings')refreshConnectionStatus();if(page==='chats'&&state.connected)loadChats();if(page==='orders'&&state.connected)loadOrders();if(page==='listings'&&state.categories.length)populateAllCategorySelects();if(page==='lister'){refreshConnectionStatus().then(()=>{if(state.connected){loadCategories();if($('#catalog-search')?.value.trim())runCatalogSearch()}else{state.categories=[];populateAllCategorySelects();renderDashboardChats();renderCatalogIdleMessage()}})}if(page==='search'&&state.categories.length)populateAllCategorySelects();if(page==='admin')loadAdminLicenses();}
-function logoutLocal(){state.session='';state.connected=false;sessionStorage.removeItem('fpal.session');$('#app').classList.add('hidden');$('#login-view').classList.remove('hidden');$('#login-password').value='';$('#login-error').textContent='';}
+async function api(path,opts={}){const headers={'Accept':'application/json',...(opts.headers||{})};if(state.session)headers['X-Dashboard-Session']=state.session;if(opts.body!==undefined){if(opts.body instanceof FormData){opts={...opts,body:opts.body};delete headers['Content-Type']}else{headers['Content-Type']='application/json';opts={...opts,body:JSON.stringify(opts.body)}}}let res;try{res=await fetch(path,{...opts,headers})}catch(err){if(err&&err.name==='AbortError')throw err;throw new Error('Не удалось связаться с сервером. Проверьте соединение или перезапустите страницу.')}let payload=null;const text=await res.text();try{payload=text?JSON.parse(text):null}catch{payload=text}if(res.status===401&&path!='/api/login'){logoutLocal();throw new Error('Сессия истекла. Войдите снова.')}if(!res.ok){throw new Error(typeof payload?.detail==='string'?payload.detail:`Ошибка ${res.status}`)}return {data:payload,res}}
+function setPage(page){const valid=['dashboard','lister','search','listings','chats','orders','settings','admin'];if(!valid.includes(page)||(page==='admin'&&!state.isAdmin))page='dashboard';state.page=page;$$('[data-view]').forEach(el=>el.classList.toggle('hidden',el.dataset.view!==page));$$('.nav-item').forEach(el=>el.classList.toggle('active',el.dataset.page===page));$('#crumb-label').textContent=({dashboard:'Dashboard',lister:'Auto Lister',search:'Offer Search',listings:'My Offers',chats:'Messages',orders:'Orders',settings:'Settings',admin:'Admin'})[page];$('#sidebar').classList.remove('open');$('#scrim').classList.remove('show');if(page!=='chats'&&state.chatPollHandle){clearInterval(state.chatPollHandle);state.chatPollHandle=null}if(page==='settings')refreshConnectionStatus();if(page==='chats'&&state.connected){loadChats();syncActiveChatPolling()}if(page==='orders'&&state.connected)loadOrders();if(page==='listings'&&state.categories.length)populateAllCategorySelects();if(page==='lister'){refreshConnectionStatus().then(()=>{if(state.connected){loadCategories();if($('#catalog-search')?.value.trim())runCatalogSearch()}else{state.categories=[];populateAllCategorySelects();renderDashboardChats();renderCatalogIdleMessage()}})}if(page==='search'&&state.categories.length)populateAllCategorySelects();if(page==='admin')loadAdminLicenses();}
+function logoutLocal(){if(state.chatPollHandle){clearInterval(state.chatPollHandle);state.chatPollHandle=null}state.session='';state.connected=false;state.activeChat=null;state.activeMessages=new Map();state.chatPollInFlight=false;sessionStorage.removeItem('fpal.session');$('#app').classList.add('hidden');$('#login-view').classList.remove('hidden');$('#login-password').value='';$('#login-error').textContent='';}
 async function performLogin(){const btn=$('#login-form button[type=submit]');$('#login-error').textContent='';btn.disabled=true;btn.textContent='Проверка доступа…';try{const tg=window.Telegram&&window.Telegram.WebApp;const {data}=await api('/api/login',{method:'POST',body:{password:$('#login-password').value.trim(),init_data:tg?.initData||''}});state.session=data.token;state.isAdmin=!!data.is_admin;sessionStorage.setItem('fpal.session',state.session);$('#login-view').classList.add('hidden');$('#app').classList.remove('hidden');$('#login-password').value='';await bootApp();sound('ok')}catch(err){$('#login-error').textContent=err.message;sound('error')}finally{btn.disabled=false;btn.innerHTML='Войти в панель <span aria-hidden="true">→</span>'}}
 $('#login-form').addEventListener('submit',async e=>{e.preventDefault();await performLogin()});
 function logout(){if(state.session)api('/api/logout',{method:'POST'}).catch(()=>{});logoutLocal();toast('Вы вышли из панели','info')}
@@ -1403,16 +1604,24 @@ async function raiseSelected(){const ids=[...state.selectedLots];if(!ids.length)
 async function loadChats(){if(!state.connected){renderDashboardChats();return}$('#chat-list').innerHTML='<div class="empty-state"><strong>Загрузка чатов…</strong></div>';try{const {data}=await api('/api/funpay/chats');state.chats=data;const unread=data.reduce((n,c)=>n+Number(c.unread_count||0),0);$('#chats-badge').textContent=unread||'0';$('#stat-chats').textContent=data.length;$('#stat-unread').textContent='Непрочитанных: '+unread;renderChats();renderDashboardChats()}catch(e){$('#chat-list').innerHTML=`<div class="empty-state"><strong>Ошибка загрузки</strong><p>${esc(e.message)}</p></div>`;toast(e.message,'error')}}
 function renderChats(){const filter=$('#chat-filter').value.toLowerCase();const chats=state.chats.filter(c=>(c.name+' '+(c.last_message_text||'')).toLowerCase().includes(filter));if(!chats.length){$('#chat-list').innerHTML='<div class="empty-state"><strong>Чаты не найдены</strong><p>Попробуйте изменить запрос.</p></div>';return}$('#chat-list').innerHTML=chats.map(c=>`<button class="chat-item ${String(state.activeChat?.id)===String(c.id)?'active':''}" data-chat-id="${esc(c.id)}">${avatarMarkup(c.interlocutor_id||c.id,c.name||'FP')}<span class="chat-meta"><span class="chat-name"><span>${esc(c.name||'Пользователь')}</span>${Number(c.unread_count)>0?`<span class="unread">${esc(c.unread_count)}</span>`:''}</span><span class="chat-preview">${esc(c.last_message_text||'Нет сообщений')}</span></span></button>`).join('')}
 let chatHistoryRequest=0;
-function renderChatHistory(messages, keepText=''){const list=Array.isArray(messages)?messages.slice():[];if(keepText&&!list.some(m=>!m.is_incoming&&String(m.text||'')===keepText)){list.push({id:'optimistic-'+hashSeed(keepText),text:keepText,author:'Вы',is_incoming:false,timestamp:'Только что',local_pending:true})}if(!list.length){$('#chat-messages').innerHTML='<div class="empty-state"><strong>История пока пуста</strong><p>Подтверждённые сообщения появятся здесь.</p></div>';return}$('#chat-messages').innerHTML=list.map(m=>`<div class="message ${m.is_incoming?'':'outgoing'} ${m.local_pending?'pending':''}">${esc(m.text|| (m.image_link?'Изображение':'Сообщение без текста'))}${m.image_link?`<div style="margin-top:6px"><a href="${esc(m.image_link)}" target="_blank" rel="noopener noreferrer">Открыть изображение</a></div>`:''}<div class="message-meta">${esc(m.author|| (m.is_incoming?'Собеседник':'Вы'))}${m.timestamp?' · '+esc(m.timestamp):''}${m.local_pending?' · подтверждение истории…':''}</div></div>`).join('');$('#chat-messages').scrollTop=$('#chat-messages').scrollHeight}
-async function openChat(id){const c=state.chats.find(x=>String(x.id)===String(id));if(!c)return;state.activeChat=c;renderChats();const requestId=++chatHistoryRequest;$('#chat-main-head').innerHTML=`<div class="panel-title">${esc(c.name||'Пользователь')}</div><div class="panel-sub">Чат FunPay · #${esc(c.id)}</div>`;$('#chat-messages').innerHTML='<div class="empty-state"><strong>Загрузка истории…</strong></div>';$('#chat-message').disabled=false;$('#chat-send').disabled=false;try{const {data}=await api('/api/funpay/chats/'+encodeURIComponent(id));if(requestId!==chatHistoryRequest||String(state.activeChat?.id)!==String(id))return;renderChatHistory(data)}catch(e){if(requestId===chatHistoryRequest)$('#chat-messages').innerHTML=`<div class="empty-state"><strong>Не удалось загрузить</strong><p>${esc(e.message)}</p></div>`}}
-$('#chat-send-form').addEventListener('submit',async e=>{e.preventDefault();const text=$('#chat-message').value.trim();if(!state.activeChat||!text)return;const chatId=state.activeChat.id;const btn=$('#chat-send');btn.disabled=true;const input=$('#chat-message');input.disabled=true;const bubble=document.createElement('div');bubble.className='message outgoing pending';bubble.textContent=text;const meta=document.createElement('div');meta.className='message-meta';meta.textContent='Отправка…';bubble.append(meta);$('#chat-messages').append(bubble);$('#chat-messages').scrollTop=$('#chat-messages').scrollHeight;try{const {data}=await api(`/api/funpay/chats/${encodeURIComponent(chatId)}/send`,{method:'POST',body:{text}});if(data?.ok!==true||!data.message_id)throw new Error('FunPay не подтвердил отправку сообщения');input.value='';meta.textContent='Отправлено · '+(data.timestamp||'подтверждено FunPay');bubble.classList.remove('pending');toast('Сообщение подтверждено FunPay','ok',1800);const c=state.chats.find(x=>String(x.id)===String(chatId));if(c){c.last_message_text=text;c.last_message_author='Вы';c.last_message_date=data.timestamp||new Date().toISOString()}renderChats();renderDashboardChats();/* Update history in the background; never wipe the confirmed bubble on a transient empty response. */setTimeout(async()=>{if(String(state.activeChat?.id)!==String(chatId))return;try{const {data:history}=await api('/api/funpay/chats/'+encodeURIComponent(chatId));if(String(state.activeChat?.id)===String(chatId)){const hasText=(history||[]).some(m=>!m.is_incoming&&String(m.text||'')===text);if(hasText)renderChatHistory(history);else renderChatHistory(history,text)}}catch{/* Keep the already-confirmed message on screen until the next refresh. */}},350)}catch(err){bubble.classList.add('send-failed');meta.textContent='Не отправлено · '+err.message;toast(err.message,'error')}finally{btn.disabled=false;input.disabled=false;input.focus()}});
-async function loadOrders(){if(!state.connected){toast('Подключите FunPay.','warn');return}$('#orders-table').innerHTML='<div class="empty-state"><strong>Загрузка заказов…</strong></div>';try{const {data}=await api('/api/funpay/orders?limit=100');state.orders=data;$('#stat-orders').textContent=data.length;if(!data.length){$('#orders-table').innerHTML='<div class="empty-state"><svg viewBox="0 0 24 24"><path d="M7 3h10l3 4v14H4V7zM4 7h16"/></svg><strong>Активных заказов нет</strong><p>Когда появятся продажи, они будут отображаться в этом разделе.</p></div>';return}$('#orders-table').innerHTML=`<div class="toolbar"><span class="pill">${data.length} заказов</span></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>Заказ</th><th>Покупатель</th><th>Статус</th><th>Дата</th><th>Сумма</th></tr></thead><tbody>${data.map(o=>`<tr><td class="mono">#${esc(o.id)}</td><td><div class="cell-main">${esc(o.description||'Заказ FunPay')}</div><div class="cell-sub">${esc([o.game,o.server].filter(Boolean).join(' · '))}</div></td><td>${esc(o.buyer_username||'—')}</td><td><span class="pill ${o.status==='paid'?'good':''}">${esc(o.status||'—')}</span></td><td>${esc(o.date||'—')}</td><td class="price">${Number(o.price||0).toLocaleString('ru-RU',{maximumFractionDigits:2})} ${esc(o.currency||'RUB')}</td></tr>`).join('')}</tbody></table></div>`}catch(e){$('#orders-table').innerHTML=`<div class="empty-state"><strong>Не удалось загрузить заказы</strong><p>${esc(e.message)}</p></div>`;toast(e.message,'error')}}
+function messageSortValue(message){const id=String(message?.id??'');if(message?.local_pending||id.startsWith('pending-')||id.startsWith('pending-photo-')||id.startsWith('optimistic-'))return Number.MAX_SAFE_INTEGER;if(/^\d+$/.test(id))return Number(id);const stamp=Date.parse(message?.timestamp||'');return Number.isFinite(stamp)?stamp:0}
+function chatMessageNode(message,key){const node=document.createElement('div');node.className='message '+(message.is_incoming?'':'outgoing')+(message.local_pending?' pending':'');node.dataset.messageId=String(key);const txt=document.createElement('div');txt.className='message-text';txt.textContent=message.text||(!message.image_link?'Сообщение без текста':'');node.appendChild(txt);if(message.image_link){const wrap=document.createElement('div');wrap.className='message-image-wrap';const a=document.createElement('a');a.href=message.image_link;a.target='_blank';a.rel='noopener noreferrer';const img=document.createElement('img');img.className='chat-message-image';img.src=message.image_link;img.alt='Фото из чата';img.loading='lazy';img.onerror=()=>{img.style.display='none'};a.appendChild(img);wrap.appendChild(a);node.appendChild(wrap)}const meta=document.createElement('div');meta.className='message-meta';meta.textContent=(message.author||(message.is_incoming?'Собеседник':'Вы'))+(message.timestamp?' · '+message.timestamp:'')+(message.local_pending?' · отправка…':'');node.appendChild(meta);return node}
+function renderChatHistory(messages, keepText='', reset=false){const container=$('#chat-messages');if(reset){state.activeMessages=new Map();container.replaceChildren()}for(const raw of (Array.isArray(messages)?messages:[])){if(!raw||typeof raw!=='object')continue;const item={...raw};const id=item.id??('fallback-'+hashSeed(JSON.stringify(item)));const key=String(id);item.id=key;const existing=state.activeMessages.get(key);if(existing?.local_preview&&!item.image_link)item.image_link=existing.image_link;if(existing?.local_preview&&raw.image_link&&raw.image_link!==existing.image_link){try{URL.revokeObjectURL(existing.image_link)}catch{}}state.activeMessages.set(key,item)}if(keepText&&!Array.from(state.activeMessages.values()).some(m=>!m.is_incoming&&String(m.text||'')===keepText)){const key='optimistic-'+hashSeed(keepText);state.activeMessages.set(key,{id:key,text:keepText,author:'Вы',is_incoming:false,timestamp:'Только что',local_pending:true})}if(!state.activeMessages.size){container.innerHTML='<div class="empty-state"><strong>История пока пуста</strong><p>Новые сообщения появятся здесь автоматически.</p></div>';return}container.querySelector('.empty-state')?.remove();const ordered=Array.from(state.activeMessages.entries()).sort((a,b)=>messageSortValue(a[1])-messageSortValue(b[1]));for(const [key,message] of ordered){let node=container.querySelector(`[data-message-id="${CSS.escape(key)}"]`);if(!node){node=chatMessageNode(message,key);const before=Array.from(container.querySelectorAll('.message')).find(el=>messageSortValue(state.activeMessages.get(el.dataset.messageId))>messageSortValue(message));if(before)container.insertBefore(node,before);else container.appendChild(node)}else{node.classList.toggle('pending',!!message.local_pending);const txt=node.querySelector('.message-text');const newText=message.text||(!message.image_link?'Сообщение без текста':'');if(txt&&txt.textContent!==newText)txt.textContent=newText;const meta=node.querySelector('.message-meta');if(meta)meta.textContent=(message.author||(message.is_incoming?'Собеседник':'Вы'))+(message.timestamp?' · '+message.timestamp:'')+(message.local_pending?' · отправка…':'');const existingImg=node.querySelector('.chat-message-image');if(message.image_link&&(!existingImg||existingImg.src!==message.image_link)){if(existingImg){existingImg.src=message.image_link;const a=existingImg.closest('a');if(a)a.href=message.image_link}else{const wrap=document.createElement('div');wrap.className='message-image-wrap';const a=document.createElement('a');a.href=message.image_link;a.target='_blank';a.rel='noopener noreferrer';const img=document.createElement('img');img.className='chat-message-image';img.src=message.image_link;img.alt='Фото из чата';img.loading='lazy';a.appendChild(img);wrap.appendChild(a);node.insertBefore(wrap,node.querySelector('.message-meta'))}}}}const nearBottom=container.scrollHeight-container.scrollTop-container.clientHeight<120;if(nearBottom)container.scrollTop=container.scrollHeight}
+function lastKnownMessageId(){const ids=Array.from(state.activeMessages.keys()).filter(id=>/^\d+$/.test(String(id))).map(Number);return ids.length?Math.max(...ids):null}
+async function openChat(id){const c=state.chats.find(x=>String(x.id)===String(id));if(!c)return;state.activeChat=c;renderChats();const requestId=++chatHistoryRequest;$('#chat-main-head').innerHTML=`<div class="panel-title">${esc(c.name||'Пользователь')}</div><div class="panel-sub">Чат FunPay · #${esc(c.id)} · автообновление</div>`;$('#chat-messages').innerHTML='<div class="empty-state"><strong>Открываем историю</strong></div>';$('#chat-message').disabled=false;$('#chat-send').disabled=false;$('#chat-photo-btn').disabled=false;try{const {data}=await api('/api/funpay/chats/'+encodeURIComponent(id));if(requestId!==chatHistoryRequest||String(state.activeChat?.id)!==String(id))return;renderChatHistory(data,'',true);syncActiveChatPolling()}catch(e){if(requestId===chatHistoryRequest)$('#chat-messages').innerHTML=`<div class="empty-state"><strong>Не удалось загрузить</strong><p>${esc(e.message)}</p></div>`}}
+
+async function pollActiveChat(){if(state.chatPollInFlight||!state.session||!state.connected||state.page!=='chats'||!state.activeChat||document.hidden)return;state.chatPollInFlight=true;const chatId=String(state.activeChat.id);try{const {data}=await api('/api/funpay/chats/'+encodeURIComponent(chatId));if(String(state.activeChat?.id)===chatId)renderChatHistory(data)}catch(err){if(err.name!=='AbortError'&&!String(err.message).includes('Сессия'))console.debug('Chat background sync:',err.message)}finally{state.chatPollInFlight=false}}
+function syncActiveChatPolling(){if(state.chatPollHandle){clearInterval(state.chatPollHandle);state.chatPollHandle=null}if(state.page==='chats'&&state.connected&&state.activeChat){state.chatPollHandle=setInterval(pollActiveChat,1000)}}
+$('#chat-send-form').addEventListener('submit',async e=>{e.preventDefault();const text=$('#chat-message').value.trim();if(!state.activeChat||!text)return;const chatId=String(state.activeChat.id);const btn=$('#chat-send');const input=$('#chat-message');const pendingId='pending-'+Date.now()+'-'+Math.random().toString(36).slice(2,7);btn.disabled=true;input.disabled=true;const pending={id:pendingId,text,author:'Вы',is_incoming:false,timestamp:'Отправка…',local_pending:true};renderChatHistory([pending]);try{const {data}=await api(`/api/funpay/chats/${encodeURIComponent(chatId)}/send`,{method:'POST',body:{text,last_message_id:lastKnownMessageId(),interlocutor_id:state.activeChat?.interlocutor_id??null}});state.activeMessages.delete(pendingId);document.querySelector(`[data-message-id="${CSS.escape(pendingId)}"]`)?.remove();if(String(state.activeChat?.id)===chatId)renderChatHistory([data.message||{id:data.message_id,text,author:data.author||'Вы',is_incoming:false,timestamp:data.timestamp}]);input.value='';toast('Сообщение подтверждено FunPay','ok',1800);const c=state.chats.find(x=>String(x.id)===chatId);if(c){c.last_message_text=text;c.last_message_author='Вы';c.last_message_date=data.timestamp||new Date().toISOString()}renderChats();renderDashboardChats()}catch(err){state.activeMessages.delete(pendingId);document.querySelector(`[data-message-id="${CSS.escape(pendingId)}"]`)?.remove();toast(err.message,'error',6000)}finally{btn.disabled=false;input.disabled=false;input.focus()}});
+$('#chat-photo-btn').addEventListener('click',()=>$('#chat-photo').click());
+$('#chat-photo').addEventListener('change',async()=>{const file=$('#chat-photo').files?.[0];$('#chat-photo').value='';if(!file||!state.activeChat)return;const chatId=String(state.activeChat.id);const previewUrl=URL.createObjectURL(file);const pendingId='pending-photo-'+Date.now();const pending={id:pendingId,text:'',author:'Вы',is_incoming:false,image_link:previewUrl,local_preview:true,local_pending:true,timestamp:'Отправка фото…'};renderChatHistory([pending]);$('#chat-photo-btn').disabled=true;try{const form=new FormData();form.append('photo',file,file.name);const last=lastKnownMessageId();if(last!==null)form.append('last_message_id',String(last));if(state.activeChat?.interlocutor_id)form.append('interlocutor_id',String(state.activeChat.interlocutor_id));const {data}=await api(`/api/funpay/chats/${encodeURIComponent(chatId)}/send-image`,{method:'POST',body:form});state.activeMessages.delete(pendingId);document.querySelector(`[data-message-id="${CSS.escape(pendingId)}"]`)?.remove();const saved={...(data.message||{}),id:data.message_id,text:'',image_link:data.image_link||previewUrl,local_preview:!data.image_link,author:data.author||'Вы',is_incoming:false,timestamp:data.timestamp||'Только что'};renderChatHistory([saved]);if(data.image_link)URL.revokeObjectURL(previewUrl);toast('Фото отправлено','ok',1800)}catch(err){state.activeMessages.delete(pendingId);document.querySelector(`[data-message-id="${CSS.escape(pendingId)}"]`)?.remove();URL.revokeObjectURL(previewUrl);toast(err.message,'error',6000)}finally{$('#chat-photo-btn').disabled=false}});
+
 $('#fp-connect-form').addEventListener('submit',async e=>{e.preventDefault();const btn=$('#fp-connect-btn');btn.disabled=true;btn.textContent='Подключение…';$('#fp-connect-result').innerHTML='';try{const {data}=await api('/api/funpay/connect',{method:'POST',body:{golden_key:$('#fp-golden-key').value.trim(),user_agent:($('#fp-user-agent').value.trim()||defaultUserAgent)}});$('#fp-golden-key').value='';state.profile=data.profile||null;updateConnection(true,data.profile?.username||'');localStorage.setItem('fpal.user-agent',$('#fp-user-agent').value.trim()||defaultUserAgent);$('#fp-connect-result').innerHTML='<div class="notice">Аккаунт подключён. Сессионный ключ не сохраняется в файлы, но остаётся в памяти процесса до отключения или перезапуска.</div>';await loadCategories();await loadDashboardData();toast('FunPay подключён','ok')}catch(err){$('#fp-connect-result').innerHTML=`<div class="notice" style="border-color:#ff71884a;color:#ff9aa9">${esc(err.message)}</div>`;toast(err.message,'error')}finally{btn.disabled=false;btn.textContent='Подключить аккаунт'}});
 $('#fp-disconnect').addEventListener('click',async()=>{try{await api('/api/funpay/disconnect',{method:'POST'});state.categories=[];state.subcats.clear();state.chats=[];state.orders=[];updateConnection(false);populateAllCategorySelects();$('#stat-balance').textContent='—';$('#stat-offers').textContent='—';$('#stat-chats').textContent='—';$('#stat-orders').textContent='—';toast('Аккаунт отключён','ok')}catch(e){toast(e.message,'error')}});
 $$('[data-page]').forEach(btn=>btn.addEventListener('click',()=>setPage(btn.dataset.page)));document.addEventListener('click',e=>{const go=e.target.closest('[data-go]');if(go){setPage(go.dataset.go);return}const ce=e.target.closest('[data-chat-id]');if(ce){if(state.page!=='chats')setPage('chats');openChat(ce.dataset.chatId);return}const edit=e.target.closest('[data-lot-edit]');if(edit)openEdit(edit.dataset.lotEdit);const del=e.target.closest('[data-lot-delete]');if(del)deleteMyLot(del.dataset.lotDelete)});
 
-let catalogSearchTimer=null;let catalogSearchAbort=null;
-async function runCatalogSearch(){const input=$('#catalog-search');const target=$('#catalog-results');if(!input||!target)return;const q=input.value.trim();if(!state.connected){target.innerHTML='<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">!</span><span class="catalog-result-main"><span class="catalog-result-name">Сначала подключите FunPay</span><span class="catalog-result-path">Откройте Настройки и подключите сессию</span></span></div>';return}if(catalogSearchAbort)catalogSearchAbort.abort();catalogSearchAbort=new AbortController();target.innerHTML='<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">···</span><span class="catalog-result-main"><span class="catalog-result-name">Ищем в каталоге FunPay…</span><span class="catalog-result-path">Реальные категории и разделы</span></span></div>';try{const {data}=await api('/api/funpay/catalog/search?q='+encodeURIComponent(q),{signal:catalogSearchAbort.signal});state.catalogResults=data||[];if(!state.catalogResults.length){target.innerHTML='<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">⌕</span><span class="catalog-result-main"><span class="catalog-result-name">Ничего не найдено</span><span class="catalog-result-path">Попробуйте другое слово или одну букву</span></span></div>';return}target.innerHTML=state.catalogResults.map((x,i)=>`<button type="button" class="catalog-result" data-catalog-index="${i}"><span class="catalog-result-ico">${x.type==='category'?'G':'↳'}</span><span class="catalog-result-main"><span class="catalog-result-name">${esc(x.name)}</span><span class="catalog-result-path">${x.type==='category'?'Категория':esc(x.category_name)+' · раздел'}</span></span><span class="catalog-result-arrow">›</span></button>`).join('')}catch(e){if(e.name==='AbortError')return;target.innerHTML=`<div class="catalog-result"><span class="catalog-result-ico">!</span><span class="catalog-result-main"><span class="catalog-result-name">Поиск недоступен</span><span class="catalog-result-path">${esc(e.message)}</span></span></div>`}}
+let catalogSearchTimer=null;let catalogSearchAbort=null;let catalogSearchVersion=0;
+async function runCatalogSearch(){const input=$('#catalog-search');const target=$('#catalog-results');if(!input||!target)return;const q=input.value.trim();if(!state.connected){target.innerHTML='<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">!</span><span class="catalog-result-main"><span class="catalog-result-name">Сначала подключите FunPay</span><span class="catalog-result-path">Откройте Настройки и подключите сессию</span></span></div>';return}if(catalogSearchAbort)catalogSearchAbort.abort();const controller=new AbortController();catalogSearchAbort=controller;const version=++catalogSearchVersion;target.innerHTML='<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">⌕</span><span class="catalog-result-main"><span class="catalog-result-name">Поиск в каталоге FunPay</span><span class="catalog-result-path">Подбираем совпадения…</span></span></div>';try{const {data}=await api('/api/funpay/catalog/search?q='+encodeURIComponent(q),{signal:controller.signal});if(version!==catalogSearchVersion||controller.signal.aborted)return;state.catalogResults=Array.isArray(data)?data:[];if(!state.catalogResults.length){target.innerHTML='<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">⌕</span><span class="catalog-result-main"><span class="catalog-result-name">Ничего не найдено</span><span class="catalog-result-path">Попробуйте другое слово или одну букву</span></span></div>';return}target.innerHTML=state.catalogResults.map((x,i)=>`<button type="button" class="catalog-result" data-catalog-index="${i}"><span class="catalog-result-ico">${x.type==='category'?'G':'↳'}</span><span class="catalog-result-main"><span class="catalog-result-name">${esc(x.name)}</span><span class="catalog-result-path">${x.type==='category'?'Категория':esc(x.category_name)+' · раздел'}</span></span><span class="catalog-result-arrow">›</span></button>`).join('')}catch(e){if(e.name==='AbortError'||controller.signal.aborted||version!==catalogSearchVersion)return;target.innerHTML=`<div class="catalog-result"><span class="catalog-result-ico">!</span><span class="catalog-result-main"><span class="catalog-result-name">Поиск недоступен</span><span class="catalog-result-path">${esc(e.message)}. Проверьте подключение FunPay в настройках.</span></span></div>`}finally{if(version===catalogSearchVersion)delete target.dataset.busy}}
 $('#catalog-search')?.addEventListener('input',()=>{clearTimeout(catalogSearchTimer);catalogSearchTimer=setTimeout(runCatalogSearch,170)});
 $('#catalog-results')?.addEventListener('click',async e=>{const button=e.target.closest('[data-catalog-index]');if(!button)return;const item=state.catalogResults[Number(button.dataset.catalogIndex)];if(!item)return;$('#game-select').value=String(item.category_id);await fillSubcategories('#game-select','#subcategory-select');if(item.subcategory_id!==null&&item.subcategory_id!==undefined){$('#subcategory-select').value=String(item.subcategory_id)}persistCategory();updatePreview();$('#catalog-search').value=item.type==='subcategory'?`${item.category_name} / ${item.name}`:item.name;$('#catalog-results').innerHTML=`<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">✓</span><span class="catalog-result-main"><span class="catalog-result-name">${esc(item.name)} выбрано</span><span class="catalog-result-path">Категория запомнена для следующих запусков</span></span></div>`;toast('Категория выбрана','ok',1800)});
 $('#game-select').addEventListener('change',()=>{localStorage.setItem('fpal.category.game',$('#game-select').value);localStorage.removeItem('fpal.category.sub');fillSubcategories('#game-select','#subcategory-select').then(()=>{persistCategory();updatePreview()})});$('#search-game').addEventListener('change',()=>fillSubcategories('#search-game','#search-subcategory'));$('#lots-game').addEventListener('change',()=>fillSubcategories('#lots-game','#lots-subcategory').then(loadMyLots));$('#subcategory-select').addEventListener('change',()=>{persistCategory();updatePreview()});['#lot-title','#lot-description','#lot-price','#lot-amount'].forEach(id=>$(id).addEventListener('input',updatePreview));
@@ -1420,7 +1629,7 @@ $$('[data-mode]').forEach(btn=>btn.addEventListener('click',()=>{state.mode=btn.
 function setSound(value){soundEnabled=value;localStorage.setItem('fpal.sound',value?'on':'off');$('#sound-toggle').checked=value;$('#sound-btn').style.color=value?'#c5b4ff':'#77778b';if(value)sound('ok')}$('#sound-toggle').addEventListener('change',e=>setSound(e.target.checked));$('#sound-btn').addEventListener('click',()=>setSound(!soundEnabled));$('#auto-refresh-toggle').addEventListener('change',e=>{autoRefresh=e.target.checked;localStorage.setItem('fpal.refresh',autoRefresh?'on':'off');toast(autoRefresh?'Автообновление включено':'Автообновление выключено','info')});
 $('#my-lots-table').addEventListener('click',e=>{const all=e.target.closest('#lot-check-all');if(all)$$('.lot-check').forEach(ch=>{ch.checked=all.checked;const id=Number(ch.dataset.id);all.checked?state.selectedLots.add(id):state.selectedLots.delete(id)})});
 async function refreshTick(){if(!state.session||!autoRefresh||document.hidden)return;try{if(state.connected){const {data}=await api('/api/funpay/chats');const oldUnread=state.chats.reduce((n,c)=>n+Number(c.unread_count||0),0);state.chats=data;const unread=data.reduce((n,c)=>n+Number(c.unread_count||0),0);$('#chats-badge').textContent=unread||'0';if(unread>oldUnread){toast('Появилось новое непрочитанное сообщение','info');}if(state.page==='chats')renderChats();renderDashboardChats();}}catch{}}
-setInterval(refreshTick,45000);$('#sidebar').addEventListener('click',e=>{const b=e.target.closest('.nav-item');if(b)sound('click')});
+setInterval(refreshTick,5000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pollActiveChat()});$('#sidebar').addEventListener('click',e=>{const b=e.target.closest('.nav-item');if(b)sound('click')});
 document.addEventListener('keydown',e=>{const tag=document.activeElement?.tagName;if(e.key==='Escape'){$('#sidebar').classList.remove('open');$('#scrim').classList.remove('show');closeEdit()}if(e.key.toLowerCase()==='f'&&!e.ctrlKey&&!e.metaKey&&!e.altKey&&!['INPUT','TEXTAREA','SELECT'].includes(tag)){e.preventDefault();toggleFs()}});
 // Telegram Mini App fullscreen first; browser fullscreen is only a fallback outside Telegram.
 const fsBtn=$('#fs');const tgApp=window.Telegram&&window.Telegram.WebApp;
