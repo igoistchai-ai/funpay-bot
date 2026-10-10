@@ -1,54 +1,92 @@
-"""FunPay Auto Lister Bot — single-file FastAPI + Telegram Web App.
+"""FunPay Lister v5 — single-file FastAPI service + Telegram bot.
 
-Environment:
-  TELEGRAM_BOT_TOKEN  optional; enables the Telegram bot
-  DASHBOARD_PASSWORD  optional fallback password for the web dashboard
-  RENDER_EXTERNAL_URL Render public URL; enables Telegram webhook + WebApp button
-  PORT                HTTP port (Render sets this automatically)
-
-FunPay access is connected from Settings using the account's golden_key cookie and
-browser User-Agent. The values stay in process memory only and are never logged.
+Deploy as one file (bot.py) on Render. See the deployment notes that ship with it.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import binascii
+import collections
 import difflib
 import hashlib
-import html
 import hmac
+import html
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import time
-from pathlib import Path
-from contextlib import asynccontextmanager
+import urllib.request
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, parse_qsl, urljoin, urlparse
 
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-load_dotenv()
+try:  # optional: .env files for local runs
+    from dotenv import load_dotenv
 
+    load_dotenv()
+except Exception:  # pragma: no cover
+    pass
+
+try:  # encryption of stored FunPay keys
+    from cryptography.fernet import Fernet, InvalidToken
+except Exception:  # pragma: no cover
+    Fernet = None  # type: ignore[assignment]
+    InvalidToken = Exception  # type: ignore[assignment,misc]
+
+
+# ---------------------------------------------------------------- configuration
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+SESSION_SECRET = os.getenv("SESSION_SECRET", "").strip()
 PORT = int(os.getenv("PORT", "8000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip() or None
-APP_VERSION = "4.0.0"
-ADMIN_TELEGRAM_ID = 8357023784
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+# The Telegram webhook secret is derived from the bot token unless WEBHOOK_SECRET is set,
+# so the webhook is always protected and no extra variable is needed.
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip() or (
+    hmac.new(TELEGRAM_BOT_TOKEN.encode(), b"funpay-lister-webhook", hashlib.sha256).hexdigest()[:48]
+    if TELEGRAM_BOT_TOKEN else None
+)
+FUNPAY_USER_AGENT_DEFAULT = os.getenv("FUNPAY_USER_AGENT", "").strip()
+FUNPAY_GOLDEN_KEY_ENV = os.getenv("FUNPAY_GOLDEN_KEY", "").strip()
+FUNPAY_TIMEOUT = float(os.getenv("FUNPAY_TIMEOUT", "15"))
+APP_VERSION = "5.0.0"
+ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "8357023784"))
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
 START_TIME = time.monotonic()
-SESSION_TTL_SECONDS = 12 * 60 * 60
-LICENSE_DB_PATH = os.getenv("LICENSE_DB_PATH", str(Path(__file__).with_name("licenses.sqlite3")))
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR))).expanduser()
+LICENSE_DB_PATH = os.getenv("LICENSE_DB_PATH", str(DATA_DIR / "licenses.sqlite3"))
+CATALOG_PATH = DATA_DIR / "catalog_cache.json"
+SECRET_FILE = DATA_DIR / "app_secret.key"
+
+FREE_PLAN_SECONDS = 30 * 60            # strict 30 minutes from first sign-in
+FOREVER_SESSION_SECONDS = 365 * 24 * 3600
+ADMIN_SESSION_SECONDS = 7 * 24 * 3600
+SESSION_COOKIE = "fpl_session"
+SESSION_TOUCH_SECONDS = 60             # how often last_seen is written
+IDLE_CONNECTION_SECONDS = 2 * 60 * 60  # evict FunPay connections idle for 2 h
+POLL_INTERVAL_SECONDS = 20
+CATALOG_MAX_AGE_SECONDS = 6 * 60 * 60
+CATALOG_WAIT_SECONDS = 9.0
+FP_READ_TIMEOUT = FUNPAY_TIMEOUT
+FP_WRITE_TIMEOUT = max(FUNPAY_TIMEOUT, 20.0)
+KEEPALIVE_SECONDS = 10 * 60
+
 STAR_PLANS: dict[str, dict[str, Any]] = {
     "day": {"title": "1 день", "stars": 15, "seconds": 24 * 60 * 60},
     "day_half": {"title": "1,5 дня", "stars": 25, "seconds": 36 * 60 * 60},
@@ -57,107 +95,6 @@ STAR_PLANS: dict[str, dict[str, Any]] = {
     "month": {"title": "1 месяц", "stars": 400, "seconds": 30 * 24 * 60 * 60},
     "forever": {"title": "Навсегда", "stars": 1000, "seconds": None},
 }
-
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger("funpay_lister")
-
-# Dashboard sessions are intentionally ephemeral. Restarting the process invalidates them.
-SESSIONS: dict[str, float] = {}
-SESSION_META: dict[str, dict[str, Any]] = {}
-LOGIN_ATTEMPTS: dict[str, list[float]] = {}
-FP_CLIENT: Any = None
-FP_ACCOUNT: Any = None
-FP_PROFILE: dict[str, Any] | None = None
-FP_LOCK = asyncio.Lock()
-FP_CATEGORIES_CACHE: list[dict[str, Any]] = []
-FP_CATEGORIES_CACHE_AT = 0.0
-
-
-def init_license_db() -> None:
-    """Persistent storage for free claims and Telegram Stars purchases."""
-    Path(LICENSE_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(LICENSE_DB_PATH) as db:
-        db.execute("""CREATE TABLE IF NOT EXISTS license_keys (
-            license_key TEXT PRIMARY KEY,
-            telegram_user_id INTEGER NOT NULL,
-            plan_id TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            expires_at INTEGER,
-            telegram_payment_charge_id TEXT UNIQUE
-        )""")
-        db.execute("""CREATE TABLE IF NOT EXISTS free_claims (
-            telegram_user_id INTEGER PRIMARY KEY,
-            license_key TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        )""")
-        db.execute("""CREATE TABLE IF NOT EXISTS sent_chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT NOT NULL,
-            message_id TEXT NOT NULL,
-            text TEXT NOT NULL,
-            author TEXT NOT NULL DEFAULT 'Вы',
-            timestamp TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            image_link TEXT,
-            UNIQUE(chat_id, message_id)
-        )""")
-        # Safe migration for installations created by older versions.
-        columns = {row[1] for row in db.execute("PRAGMA table_info(sent_chat_messages)").fetchall()}
-        if "image_link" not in columns:
-            db.execute("ALTER TABLE sent_chat_messages ADD COLUMN image_link TEXT")
-        db.commit()
-
-
-def create_license_key() -> str:
-    token = secrets.token_hex(12).upper()
-    return "FP-" + "-".join(token[i:i + 6] for i in range(0, len(token), 6))
-
-
-def claim_free_license(user_id: int) -> tuple[str | None, int | None, bool]:
-    """Return (key, expiry, was_created). Free plan is one 24-hour key per Telegram account."""
-    init_license_db()
-    now = int(time.time())
-    with sqlite3.connect(LICENSE_DB_PATH) as db:
-        row = db.execute("SELECT license_key FROM free_claims WHERE telegram_user_id=?", (user_id,)).fetchone()
-        if row:
-            key_row = db.execute("SELECT expires_at FROM license_keys WHERE license_key=?", (row[0],)).fetchone()
-            return row[0], (key_row[0] if key_row else now + 86400), False
-        key = create_license_key()
-        expires = now + 86400
-        db.execute(
-            "INSERT INTO license_keys(license_key,telegram_user_id,plan_id,created_at,expires_at) VALUES(?,?,?,?,?)",
-            (key, user_id, "free", now, expires),
-        )
-        db.execute("INSERT INTO free_claims(telegram_user_id,license_key,created_at) VALUES(?,?,?)", (user_id, key, now))
-        db.commit()
-        return key, expires, True
-
-
-def issue_paid_license(user_id: int, plan_id: str, charge_id: str) -> tuple[str, int | None, bool]:
-    init_license_db()
-    if plan_id not in STAR_PLANS:
-        raise ValueError("Unknown license plan")
-    now = int(time.time())
-    plan = STAR_PLANS[plan_id]
-    expires = now + int(plan["seconds"]) if plan["seconds"] is not None else None
-    with sqlite3.connect(LICENSE_DB_PATH) as db:
-        existing = db.execute(
-            "SELECT license_key,expires_at FROM license_keys WHERE telegram_payment_charge_id=?", (charge_id,)
-        ).fetchone()
-        if existing:
-            return existing[0], existing[1], False
-        key = create_license_key()
-        db.execute(
-            "INSERT INTO license_keys(license_key,telegram_user_id,plan_id,created_at,expires_at,telegram_payment_charge_id) VALUES(?,?,?,?,?,?)",
-            (key, user_id, plan_id, now, expires, charge_id),
-        )
-        db.commit()
-        return key, expires, True
-
 
 ADMIN_LICENSE_DURATIONS: dict[str, tuple[str, int | None]] = {
     "1h": ("1 час", 3600),
@@ -171,46 +108,21 @@ ADMIN_LICENSE_DURATIONS: dict[str, tuple[str, int | None]] = {
     "forever": ("Навсегда", None),
 }
 
-
-def create_admin_license(duration: str, telegram_user_id: int | None = None) -> dict[str, Any]:
-    """Issue a manually-created key; old keys remain in the ledger after expiry."""
-    if duration not in ADMIN_LICENSE_DURATIONS:
-        raise ValueError("Неизвестный срок ключа.")
-    title, seconds = ADMIN_LICENSE_DURATIONS[duration]
-    now = int(time.time())
-    expires = now + seconds if seconds is not None else None
-    key = create_license_key()
-    owner_id = int(telegram_user_id or 0)
-    init_license_db()
-    with sqlite3.connect(LICENSE_DB_PATH) as db:
-        db.execute(
-            "INSERT INTO license_keys(license_key,telegram_user_id,plan_id,created_at,expires_at) VALUES(?,?,?,?,?)",
-            (key, owner_id, f"admin_{duration}", now, expires),
-        )
-        db.commit()
-    return {"key": key, "duration": duration, "duration_title": title, "telegram_user_id": owner_id,
-            "created_at": now, "expires_at": expires, "active": expires is None or expires > now}
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("funpay_lister")
 
 
-def save_sent_chat_message(
-    chat_id: int | str,
-    message_id: str | int | None,
-    text: str,
-    author: str = "Вы",
-    image_link: str | None = None,
-) -> dict[str, Any]:
-    init_license_db()
-    now = int(time.time())
-    stable_id = str(message_id) if message_id is not None else f"local-{now}-{secrets.token_hex(5)}"
-    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with sqlite3.connect(LICENSE_DB_PATH) as db:
-        db.execute(
-            "INSERT OR IGNORE INTO sent_chat_messages(chat_id,message_id,text,author,timestamp,created_at,image_link) VALUES(?,?,?,?,?,?,?)",
-            (str(chat_id), stable_id, text or "", author or "Вы", stamp, now, image_link),
-        )
-        db.commit()
-    return {"id": stable_id, "chat_id": str(chat_id), "text": text or "", "author": author or "Вы",
-            "author_id": None, "is_incoming": False, "image_link": image_link, "timestamp": stamp}
+# ---------------------------------------------------------------- small helpers
+def now_ts() -> int:
+    return int(time.time())
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def format_expiry(expires_at: int | None) -> str:
@@ -219,61 +131,324 @@ def format_expiry(expires_at: int | None) -> str:
     return datetime.fromtimestamp(expires_at, timezone.utc).strftime("%d.%m.%Y в %H:%M UTC")
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def clean_model(value: Any) -> Any:
+    """Convert library models, enums and nested containers into JSON-compatible values."""
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {str(k): clean_model(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [clean_model(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "value") and isinstance(getattr(value, "value"), (str, int, float, bool)):
+        return value.value
+    if hasattr(value, "__dict__") and not callable(value):
+        return {k: clean_model(v) for k, v in vars(value).items() if not k.startswith("_")}
+    return str(value)
+
+
+def create_license_key() -> str:
+    token = secrets.token_hex(12).upper()
+    return "FP-" + "-".join(token[i:i + 6] for i in range(0, len(token), 6))
 
 
 def public_url() -> str:
     return RENDER_EXTERNAL_URL or f"http://127.0.0.1:{PORT}"
 
 
-def clean_model(value: Any) -> Any:
-    """Convert Pydantic models/enums into JSON-compatible values."""
-    if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
-    if isinstance(value, dict):
-        return {str(k): clean_model(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [clean_model(v) for v in value]
-    if hasattr(value, "value"):
-        return value.value
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)
+# ---------------------------------------------------------------- database
+@contextmanager
+def db():
+    """Short-lived SQLite connection. Each call is one transaction."""
+    Path(LICENSE_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(LICENSE_DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-def require_session(x_dashboard_session: str | None = Header(default=None, alias="X-Dashboard-Session")) -> bool:
-    """Protect endpoints and enforce license expiration server-side."""
-    if not x_dashboard_session:
-        raise HTTPException(status_code=401, detail="Сессия закончилась. Войдите снова.")
-    expiry = SESSIONS.get(x_dashboard_session)
-    meta = SESSION_META.get(x_dashboard_session, {})
-    now = time.time()
-    license_expiry = meta.get("license_expires_at")
-    if expiry is None or expiry < now or (license_expiry is not None and int(license_expiry) <= int(now)):
-        SESSIONS.pop(x_dashboard_session, None)
-        SESSION_META.pop(x_dashboard_session, None)
-        raise HTTPException(status_code=401, detail="Срок ключа закончился или сессия истекла. Получите новый ключ.")
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+_DB_READY: dict[str, bool] = {}
+
+
+def init_db() -> None:
+    """Create tables and apply in-place migrations from v4 installations (once per process)."""
+    if _DB_READY.get(LICENSE_DB_PATH):
+        return
+    _DB_READY[LICENSE_DB_PATH] = True
+    with db() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""CREATE TABLE IF NOT EXISTS license_keys (
+            license_key TEXT PRIMARY KEY,
+            telegram_user_id INTEGER NOT NULL DEFAULT 0,
+            plan_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER,
+            telegram_payment_charge_id TEXT UNIQUE,
+            activated_at INTEGER,
+            duration_seconds INTEGER,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            expiry_notified INTEGER NOT NULL DEFAULT 0
+        )""")
+        cols = _columns(conn, "license_keys")
+        for name, ddl in (
+            ("activated_at", "ALTER TABLE license_keys ADD COLUMN activated_at INTEGER"),
+            ("duration_seconds", "ALTER TABLE license_keys ADD COLUMN duration_seconds INTEGER"),
+            ("revoked", "ALTER TABLE license_keys ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0"),
+            ("expiry_notified", "ALTER TABLE license_keys ADD COLUMN expiry_notified INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in cols:
+                conn.execute(ddl)
+        conn.execute("""CREATE TABLE IF NOT EXISTS free_claims (
+            telegram_user_id INTEGER PRIMARY KEY,
+            license_key TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS sent_chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            author TEXT NOT NULL DEFAULT 'Вы',
+            timestamp TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            image_link TEXT,
+            UNIQUE(chat_id, message_id)
+        )""")
+        if "image_link" not in _columns(conn, "sent_chat_messages"):
+            conn.execute("ALTER TABLE sent_chat_messages ADD COLUMN image_link TEXT")
+        conn.execute("""CREATE TABLE IF NOT EXISTS web_sessions (
+            token_hash TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            plan_id TEXT NOT NULL,
+            is_admin INTEGER NOT NULL DEFAULT 0,
+            license_key TEXT,
+            created_at INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            user_agent TEXT
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_owner ON web_sessions(owner)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS fp_accounts (
+            owner TEXT PRIMARY KEY,
+            golden_enc TEXT NOT NULL,
+            user_agent TEXT,
+            updated_at INTEGER NOT NULL
+        )""")
+        # Legacy free keys (v4) were issued for 24 h from creation. Re-base them to the
+        # strict 30-minute rule measured from creation, then keep the flag consistent.
+        conn.execute(
+            """UPDATE license_keys SET activated_at = created_at,
+               expires_at = MIN(COALESCE(expires_at, created_at + ?), created_at + ?),
+               duration_seconds = ?
+               WHERE plan_id = 'free' AND activated_at IS NULL""",
+            (FREE_PLAN_SECONDS, FREE_PLAN_SECONDS, FREE_PLAN_SECONDS),
+        )
+
+
+# ---------------------------------------------------------------- licenses
+def claim_free_license(user_id: int) -> tuple[str, bool, bool]:
+    """Return (key, created, activated). One FREE PLAN key per Telegram account."""
+    init_db()
+    now = now_ts()
+    with db() as conn:
+        row = conn.execute("SELECT license_key FROM free_claims WHERE telegram_user_id=?", (user_id,)).fetchone()
+        if row:
+            key_row = conn.execute(
+                "SELECT activated_at FROM license_keys WHERE license_key=?", (row["license_key"],)
+            ).fetchone()
+            return row["license_key"], False, bool(key_row and key_row["activated_at"])
+        key = create_license_key()
+        conn.execute(
+            """INSERT INTO license_keys(license_key,telegram_user_id,plan_id,created_at,expires_at,duration_seconds)
+               VALUES(?,?,?,?,?,?)""",
+            (key, user_id, "free", now, None, FREE_PLAN_SECONDS),
+        )
+        conn.execute(
+            "INSERT INTO free_claims(telegram_user_id,license_key,created_at) VALUES(?,?,?)", (user_id, key, now)
+        )
+        return key, True, False
+
+
+def issue_paid_license(user_id: int, plan_id: str, charge_id: str) -> tuple[str, int | None, bool]:
+    init_db()
+    if plan_id not in STAR_PLANS:
+        raise ValueError("Unknown license plan")
+    now = now_ts()
+    plan = STAR_PLANS[plan_id]
+    seconds = plan["seconds"]
+    expires = now + int(seconds) if seconds is not None else None
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT license_key, expires_at FROM license_keys WHERE telegram_payment_charge_id=?", (charge_id,)
+        ).fetchone()
+        if existing:
+            return existing["license_key"], existing["expires_at"], False
+        key = create_license_key()
+        conn.execute(
+            """INSERT INTO license_keys(license_key,telegram_user_id,plan_id,created_at,expires_at,
+               telegram_payment_charge_id,activated_at,duration_seconds) VALUES(?,?,?,?,?,?,?,?)""",
+            (key, user_id, plan_id, now, expires, charge_id, now, seconds),
+        )
+    return key, expires, True
+
+
+def create_admin_license(duration: str, telegram_user_id: int | None = None) -> dict[str, Any]:
+    if duration not in ADMIN_LICENSE_DURATIONS:
+        raise ValueError("Неизвестный срок ключа.")
+    title, seconds = ADMIN_LICENSE_DURATIONS[duration]
+    now = now_ts()
+    expires = now + seconds if seconds is not None else None
+    key = create_license_key()
+    owner_id = int(telegram_user_id or 0)
+    init_db()
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO license_keys(license_key,telegram_user_id,plan_id,created_at,expires_at,activated_at,duration_seconds)
+               VALUES(?,?,?,?,?,?,?)""",
+            (key, owner_id, f"admin_{duration}", now, expires, now, seconds),
+        )
+    return {"key": key, "duration": duration, "duration_title": title, "telegram_user_id": owner_id,
+            "created_at": now, "expires_at": expires, "active": expires is None or expires > now}
+
+
+def license_status(row: sqlite3.Row | dict[str, Any], now: int | None = None) -> tuple[bool, str]:
+    """Return (valid, reason) for a license row."""
+    now = now or now_ts()
+    if row["revoked"]:
+        return False, "revoked"
+    if row["plan_id"] == "free" and row["activated_at"] is None:
+        return True, "not_activated"
+    if row["expires_at"] is not None and int(row["expires_at"]) <= now:
+        return False, "expired"
+    return True, "ok"
+
+
+def activate_license_if_needed(key: str) -> None:
+    """A FREE PLAN key starts its 30-minute clock at the first successful sign-in."""
+    now = now_ts()
+    with db() as conn:
+        conn.execute(
+            """UPDATE license_keys SET activated_at = ?, expires_at = ?, duration_seconds = ?
+               WHERE license_key = ? AND plan_id = 'free' AND activated_at IS NULL""",
+            (now, now + FREE_PLAN_SECONDS, FREE_PLAN_SECONDS, key),
+        )
+
+
+def find_license(key: str) -> sqlite3.Row | None:
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM license_keys WHERE license_key = ? COLLATE NOCASE", (key,)
+        ).fetchone()
+
+
+# ---------------------------------------------------------------- encryption of FunPay keys
+def _fernet():
+    if Fernet is None:
+        return None
+    material = SESSION_SECRET or TELEGRAM_BOT_TOKEN or DASHBOARD_PASSWORD
+    if not material:
+        if not SECRET_FILE.exists():
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            SECRET_FILE.write_text(secrets.token_urlsafe(48), encoding="utf-8")
+        material = SECRET_FILE.read_text(encoding="utf-8").strip()
+    key = base64.urlsafe_b64encode(hashlib.sha256(("fpl-v5:" + material).encode()).digest())
+    return Fernet(key)
+
+
+def encrypt_secret(value: str) -> str | None:
+    fernet = _fernet()
+    if fernet is None:
+        log.warning("cryptography is not installed; FunPay key is kept only in memory")
+        return None
+    return fernet.encrypt(value.encode()).decode()
+
+
+def decrypt_secret(token: str) -> str | None:
+    fernet = _fernet()
+    if fernet is None:
+        return None
+    try:
+        return fernet.decrypt(token.encode()).decode()
+    except (InvalidToken, ValueError):
+        log.warning("Stored FunPay key could not be decrypted; reconnect the account")
+        return None
+
+
+def save_fp_account(owner: str, golden_key: str, user_agent: str) -> bool:
+    encrypted = encrypt_secret(golden_key)
+    if encrypted is None:
+        return False
+    init_db()
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO fp_accounts(owner,golden_enc,user_agent,updated_at) VALUES(?,?,?,?)
+               ON CONFLICT(owner) DO UPDATE SET golden_enc=excluded.golden_enc,
+               user_agent=excluded.user_agent, updated_at=excluded.updated_at""",
+            (owner, encrypted, user_agent, now_ts()),
+        )
     return True
 
 
-def require_admin(x_dashboard_session: str | None = Header(default=None, alias="X-Dashboard-Session")) -> bool:
-    require_session(x_dashboard_session)
-    if not SESSION_META.get(x_dashboard_session or "", {}).get("is_admin", False):
-        raise HTTPException(status_code=403, detail="Этот раздел доступен только администратору Telegram.")
-    return True
+def load_fp_account(owner: str) -> tuple[str, str] | None:
+    init_db()
+    with db() as conn:
+        row = conn.execute("SELECT golden_enc, user_agent FROM fp_accounts WHERE owner=?", (owner,)).fetchone()
+    if not row:
+        return None
+    golden = decrypt_secret(row["golden_enc"])
+    return (golden, row["user_agent"] or "") if golden else None
 
 
+def delete_fp_account(owner: str) -> None:
+    init_db()
+    with db() as conn:
+        conn.execute("DELETE FROM fp_accounts WHERE owner=?", (owner,))
+
+
+# ---------------------------------------------------------------- local sent-message ledger
+def save_sent_chat_message(
+    chat_id: int | str,
+    message_id: str | int | None,
+    text: str,
+    author: str = "Вы",
+    image_link: str | None = None,
+) -> dict[str, Any]:
+    init_db()
+    now = now_ts()
+    stable_id = str(message_id) if message_id is not None else f"local-{now}-{secrets.token_hex(5)}"
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with db() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO sent_chat_messages(chat_id,message_id,text,author,timestamp,created_at,image_link)
+               VALUES(?,?,?,?,?,?,?)""",
+            (str(chat_id), stable_id, text or "", author or "Вы", stamp, now, image_link),
+        )
+    return {"id": stable_id, "chat_id": str(chat_id), "text": text or "", "author": author or "Вы",
+            "author_id": None, "is_incoming": False, "image_link": image_link, "timestamp": stamp,
+            "status": "sent" if message_id is not None else "pending"}
+
+
+# ---------------------------------------------------------------- Telegram WebApp verification
 def verify_telegram_init_data(init_data: str) -> dict[str, Any] | None:
-    """Validate Telegram WebApp initData using the configured bot token."""
+    """Validate Telegram WebApp initData with the bot token (HMAC-SHA256 scheme)."""
     if not TELEGRAM_BOT_TOKEN or not init_data or len(init_data) > 8192:
         return None
     try:
-        from urllib.parse import parse_qsl
         values = dict(parse_qsl(init_data, keep_blank_values=True, strict_parsing=True))
         supplied_hash = values.pop("hash", "")
         auth_date = int(values.get("auth_date", "0"))
-        now = int(time.time())
+        now = now_ts()
         if not supplied_hash or auth_date <= 0 or auth_date > now + 30 or now - auth_date > 86400:
             return None
         check_string = "\n".join(f"{key}={value}" for key, value in sorted(values.items()))
@@ -288,15 +463,196 @@ def verify_telegram_init_data(init_data: str) -> dict[str, Any] | None:
         return None
 
 
-def need_funpay() -> tuple[Any, Any]:
-    if FP_CLIENT is None or FP_ACCOUNT is None:
-        raise HTTPException(status_code=409, detail="Сначала подключите аккаунт FunPay в разделе «Настройки».")
-    return FP_CLIENT, FP_ACCOUNT
+# ---------------------------------------------------------------- web sessions (HttpOnly cookie)
+LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 
 
-async def funpay_connect(golden_key: str, user_agent: str | None = None) -> dict[str, Any]:
-    """Connect and verify a FunPay session without writing credentials to disk."""
-    global FP_CLIENT, FP_ACCOUNT, FP_PROFILE, FP_CATEGORIES_CACHE, FP_CATEGORIES_CACHE_AT
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def plan_title(plan_id: str) -> str:
+    if plan_id == "free":
+        return "FREE PLAN"
+    if plan_id == "admin":
+        return "Администратор"
+    if plan_id in STAR_PLANS:
+        return str(STAR_PLANS[plan_id]["title"])
+    if plan_id.startswith("admin_"):
+        return ADMIN_LICENSE_DURATIONS.get(plan_id[len("admin_"):], ("Ключ", None))[0]
+    return "Ключ"
+
+
+def cookie_is_secure(request: Request) -> bool:
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return RENDER_EXTERNAL_URL.startswith("https://") or forwarded == "https"
+
+
+def create_web_session(
+    owner: str,
+    plan_id: str,
+    is_admin: bool,
+    license_key: str | None,
+    expires_at: int,
+    user_agent: str,
+) -> str:
+    token = secrets.token_urlsafe(32)
+    now = now_ts()
+    init_db()
+    with db() as conn:
+        conn.execute("DELETE FROM web_sessions WHERE expires_at <= ?", (now,))
+        conn.execute(
+            """INSERT INTO web_sessions(token_hash,owner,plan_id,is_admin,license_key,created_at,last_seen,expires_at,user_agent)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (_token_hash(token), owner, plan_id, 1 if is_admin else 0, license_key, now, now, expires_at,
+             (user_agent or "")[:300]),
+        )
+    return token
+
+
+class SessionInfo:
+    """Resolved, validated session for one request."""
+
+    def __init__(self, row: sqlite3.Row, token_hash: str):
+        self.owner: str = row["owner"]
+        self.plan_id: str = row["plan_id"]
+        self.is_admin: bool = bool(row["is_admin"])
+        self.license_key: str | None = row["license_key"]
+        self.expires_at: int = int(row["expires_at"])
+        self.token_hash = token_hash
+
+    def payload(self) -> dict[str, Any]:
+        now = now_ts()
+        forever = self.plan_id in ("forever", "admin_forever")
+        key_hint = (self.license_key or "")[-4:] if self.license_key else ""
+        return {
+            "plan_id": self.plan_id,
+            "plan_title": plan_title(self.plan_id),
+            "is_admin": self.is_admin,
+            "free": self.plan_id == "free",
+            "forever": forever,
+            "license_hint": key_hint,
+            "expires_at": self.expires_at,
+            "remaining_seconds": max(0, self.expires_at - now),
+            "server_time": now,
+            "version": APP_VERSION,
+        }
+
+
+def _expire_session(token_hash: str) -> None:
+    with db() as conn:
+        conn.execute("DELETE FROM web_sessions WHERE token_hash=?", (token_hash,))
+
+
+def get_session(request: Request) -> SessionInfo:
+    """Dependency: validate the HttpOnly cookie and enforce license expiry server-side."""
+    token = request.cookies.get(SESSION_COOKIE, "")
+    if not token or len(token) > 200:
+        raise HTTPException(status_code=401, detail={"code": "no_session", "message": "Войдите по ключу доступа."})
+    token_hash = _token_hash(token)
+    init_db()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM web_sessions WHERE token_hash=?", (token_hash,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=401, detail={"code": "session_revoked", "message": "Сессия завершена. Войдите снова."})
+    now = now_ts()
+    if int(row["expires_at"]) <= now:
+        _expire_session(token_hash)
+        raise HTTPException(status_code=401, detail={"code": "session_expired", "message": "Срок действия ключа истёк."})
+    if row["license_key"]:
+        lic = find_license(row["license_key"])
+        valid, reason = (license_status(lic, now) if lic is not None else (False, "revoked"))
+        if not valid:
+            _expire_session(token_hash)
+            message = ("Срок действия ключа истёк." if reason == "expired"
+                       else "Ключ отозван. Обратитесь к администратору.")
+            raise HTTPException(status_code=401, detail={"code": f"session_{reason}", "message": message})
+    if now - int(row["last_seen"]) >= SESSION_TOUCH_SECONDS:
+        with db() as conn:
+            conn.execute("UPDATE web_sessions SET last_seen=? WHERE token_hash=?", (now, token_hash))
+    return SessionInfo(row, token_hash)
+
+
+def get_admin_session(session: SessionInfo = Depends(get_session)) -> SessionInfo:
+    if not session.is_admin:
+        raise HTTPException(status_code=403, detail="Этот раздел доступен только администратору.")
+    return session
+
+
+# ---------------------------------------------------------------- in-app notifications
+NOTIF_SEQ = 0
+NOTIFS: dict[str, collections.deque] = {}
+
+
+def push_notification(owner: str, kind: str, title: str, text: str, chat_id: Any = None) -> dict[str, Any]:
+    global NOTIF_SEQ
+    NOTIF_SEQ += 1
+    item = {
+        "seq": NOTIF_SEQ,
+        "type": kind,
+        "title": title[:120],
+        "text": (text or "")[:600],
+        "chat_id": str(chat_id) if chat_id is not None else None,
+        "created_at": now_ts(),
+    }
+    NOTIFS.setdefault(owner, collections.deque(maxlen=150)).append(item)
+    return item
+
+
+def notifications_after(owner: str, after: int) -> tuple[list[dict[str, Any]], int]:
+    items = [item for item in NOTIFS.get(owner, []) if item["seq"] > after]
+    if after <= 0:
+        items = items[-60:]
+    return items, NOTIF_SEQ
+
+
+def check_login_rate(host: str) -> None:
+    now = time.time()
+    attempts = [t for t in LOGIN_ATTEMPTS.get(host, []) if now - t < 300]
+    LOGIN_ATTEMPTS[host] = attempts
+    if len(attempts) >= 8:
+        raise HTTPException(status_code=429, detail="Слишком много попыток. Подождите пять минут.")
+
+
+def note_failed_login(host: str) -> None:
+    LOGIN_ATTEMPTS.setdefault(host, []).append(time.time())
+
+
+
+# ---------------------------------------------------------------- FunPay connections
+class FunPayError(Exception):
+    """Upstream FunPay failure that a background caller may swallow."""
+
+
+class FPConn:
+    def __init__(self, client: Any, account: Any, profile: dict[str, Any], user_agent: str):
+        self.owner = ""
+        self.client = client
+        self.account = account
+        self.profile = profile
+        self.balance: Any = None
+        self.user_agent = user_agent
+        self.lock = asyncio.Lock()
+        self.connected_at = utc_now()
+        self.last_used = time.time()
+        self.closed = False
+        self.chat_seen: dict[str, tuple[str, str]] = {}
+        self.chat_baseline = False
+        self.sale_seen: set[str] = set()
+        self.sale_baseline = False
+        self.tick = 0
+        self.error_notified_at = 0.0
+
+    @property
+    def username(self) -> str:
+        return str(self.profile.get("username") or self.profile.get("name") or "")
+
+
+FP_CONNS: dict[str, FPConn] = {}
+FP_CONN_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _library():
     try:
         from funpay_api_python import FunPayAccount, FunPayClient
     except ImportError as exc:
@@ -304,404 +660,483 @@ async def funpay_connect(golden_key: str, user_agent: str | None = None) -> dict
             status_code=503,
             detail="Библиотека FunPay не установлена. Добавьте funpay-api-python в requirements.txt.",
         ) from exc
+    return FunPayClient, FunPayAccount
 
+
+async def _close_client(client: Any) -> None:
+    try:
+        await client.close()
+    except Exception:
+        pass
+
+
+async def open_account(golden_key: str, user_agent: str) -> FPConn:
+    """Build a client, verify the session with get_me(), and return a live connection."""
+    FunPayClient, FunPayAccount = _library()
     if len(golden_key.strip()) < 8:
         raise HTTPException(status_code=422, detail="Проверьте значение golden_key.")
-
-    new_client = FunPayClient(
+    ua = (user_agent or "").strip() or FUNPAY_USER_AGENT_DEFAULT or DEFAULT_USER_AGENT
+    client = FunPayClient(
         golden_key=golden_key.strip(),
-        user_agent=(user_agent or "").strip() or os.getenv("FUNPAY_USER_AGENT", "").strip() or DEFAULT_USER_AGENT,
-        timeout=float(os.getenv("FUNPAY_TIMEOUT", "20")),
+        user_agent=ua,
+        timeout=FUNPAY_TIMEOUT,
         locale="ru",
         min_interval=0.45,
     )
-    new_account = FunPayAccount(new_client)
+    account = FunPayAccount(client)
     try:
-        async with FP_LOCK:
-            profile = await new_account.get_me()
-            balance = await new_account.get_balance()
-        profile_data = clean_model(profile)
-        balance_data = clean_model(balance)
+        profile = await asyncio.wait_for(account.get_me(), timeout=FP_READ_TIMEOUT)
     except Exception as exc:
-        await new_client.close()
-        # Do not echo request headers/cookies or any submitted secret in the response.
+        await _close_client(client)
         reason = str(exc)
+        log.warning("FunPay sign-in failed: %s", type(exc).__name__)
         if "Unauthorized" in reason or "Profile not detected" in reason or "401" in reason:
-            reason = "FunPay не принял сессию. Проверьте golden_key и User-Agent."
+            message = "FunPay не принял сессию. Проверьте golden_key и User-Agent."
         else:
-            reason = "Не удалось подключиться к FunPay. Проверьте сессию и попробуйте ещё раз."
-        log.warning("FunPay connection failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=401, detail=reason) from exc
-
-    old_client = FP_CLIENT
-    FP_CLIENT, FP_ACCOUNT = new_client, new_account
-    FP_PROFILE = {"profile": profile_data, "balance": balance_data, "connected_at": utc_now()}
-    FP_CATEGORIES_CACHE = []
-    FP_CATEGORIES_CACHE_AT = 0.0
-    if old_client is not None:
-        try:
-            await old_client.close()
-        except Exception:
-            pass
-    log.info("FunPay connected as account id %s", profile_data.get("id"))
-    return {"connected": True, **FP_PROFILE}
-
-
-def extract_form_fields(form: Any) -> dict[str, str]:
-    """Extract the default values from a FunPay offer-editor form."""
-    fields: dict[str, str] = {}
-    for node in form.find_all(["input", "textarea", "select"]):
-        name = node.get("name")
-        if not name:
-            continue
-        tag = node.name
-        if tag == "input":
-            input_type = (node.get("type") or "text").lower()
-            if input_type in ("checkbox", "radio"):
-                if node.has_attr("checked"):
-                    fields[name] = node.get("value") or "on"
-            else:
-                fields[name] = node.get("value") or ""
-        elif tag == "textarea":
-            fields[name] = node.get_text() or ""
-        elif tag == "select":
-            selected = node.find("option", selected=True) or node.find("option")
-            if selected is not None:
-                fields[name] = selected.get("value") or selected.get_text(strip=True)
-    return fields
-
-
-async def create_funpay_lot(
-    subcategory_id: int,
-    title: str,
-    description: str,
-    price: float,
-    amount: int,
-    active: bool = True,
-) -> dict[str, Any]:
-    """Create a new regular offer by using the editor form returned by FunPay."""
-    client, _account = need_funpay()
-    async with FP_LOCK:
-        response = await client.get("lots/offerEdit", node=subcategory_id, raise_not_200=True)
-        soup = BeautifulSoup(response.text, "html.parser")
-        form = soup.select_one("form.form-offer-editor") or soup.find("form")
-        if not form:
-            raise HTTPException(
-                status_code=502,
-                detail="FunPay не вернул форму создания оффера для этой категории. Попробуйте другую игру или создайте лот на сайте FunPay.",
-            )
-        fields = extract_form_fields(form)
-        # Retain dynamic fields (server/platform/payment options) from the category form.
-        fields["offer_id"] = fields.get("offer_id") or "0"
-        fields["node_id"] = str(subcategory_id)
-        fields["csrf_token"] = getattr(client, "csrf_token", "") or fields.get("csrf_token", "")
-        fields["fields[summary][ru]"] = title.strip()
-        fields["fields[desc][ru]"] = description.strip()
-        fields["price"] = str(price)
-        fields["amount"] = str(amount)
-        if active:
-            fields["active"] = "on"
-        else:
-            fields.pop("active", None)
-        headers = {
-            "accept": "*/*",
-            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "x-requested-with": "XMLHttpRequest",
-        }
-        saved = await client.post("lots/offerSave", data=fields, headers=headers, raise_not_200=True)
-        try:
-            result = saved.json()
-        except Exception:
-            raise HTTPException(status_code=502, detail="FunPay вернул неожиданный ответ при сохранении оффера.")
-        if result.get("error") or result.get("errors"):
-            errors = result.get("errors") or result.get("error")
-            safe_errors = str(errors)[:700]
-            raise HTTPException(status_code=422, detail=f"FunPay не сохранил оффер: {safe_errors}")
-        return {"ok": True, "result": result, "subcategory_id": subcategory_id}
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global FP_CLIENT, FP_ACCOUNT, FP_PROFILE
-    tg_app = None
-    notify_task = None
-    if TELEGRAM_BOT_TOKEN:
-        try:
-            from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, MenuButtonWebApp, WebAppInfo, Update
-            from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, PreCheckoutQueryHandler, filters
-
-            tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-            init_license_db()
-
-            async def start_command(update: Any, context: Any) -> None:
-                caption = (
-                    "<b>FunPay Auto Lister</b>\n"
-                    "Управляйте офферами, поиском, чатами и заказами в одной панели.\n\n"
-                    "Выберите бесплатный план или оформите ключ за Telegram Stars."
-                )
-                target = public_url()
-                keyboard = [
-                    [InlineKeyboardButton("Получить секретный ключ FREE PLAN", callback_data="license:free")],
-                    [InlineKeyboardButton("Купить ключ по лучшей цене!", callback_data="license:buy")],
-                ]
-                if target.startswith("https://"):
-                    keyboard.append([InlineKeyboardButton("Открыть панель", web_app=WebAppInfo(url=target))])
-                else:
-                    keyboard.append([InlineKeyboardButton("Открыть панель", url=target)])
-                markup = InlineKeyboardMarkup(keyboard)
-                image_path = Path(__file__).with_name("a_sleek_dark_futuristic_cyber_neon_ui_welcome_s.png")
-                message = update.effective_message
-                if image_path.is_file():
-                    with image_path.open("rb") as photo:
-                        await message.reply_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=markup)
-                else:
-                    await message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
-
-            async def license_callback(update: Any, context: Any) -> None:
-                query = update.callback_query
-                await query.answer()
-                user = update.effective_user
-                if not user:
-                    return
-                if query.data == "license:free":
-                    key, expires, created = claim_free_license(user.id)
-                    text = (
-                        ("✅ <b>Ваш FREE PLAN ключ создан</b>" if created else "ℹ️ <b>Ваш FREE PLAN ключ уже был выдан</b>")
-                        + f"\n\n<code>{html.escape(key or '')}</code>\n\n"
-                        + f"Действует до: <b>{format_expiry(expires)}</b>\n"
-                        + "Бесплатный ключ выдаётся один раз на Telegram-аккаунт. Сохраните его в безопасном месте."
-                    )
-                    await query.message.reply_text(text, parse_mode="HTML")
-                    return
-                if query.data == "license:buy":
-                    rows = [[InlineKeyboardButton(f"{p['title']} · {p['stars']} ⭐", callback_data=f"license:plan:{pid}")]
-                            for pid, p in STAR_PLANS.items()]
-                    await query.message.reply_text(
-                        "<b>Выберите срок ключа</b>\nОплата проходит внутри Telegram в Stars.",
-                        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows),
-                    )
-                    return
-                if query.data.startswith("license:plan:"):
-                    plan_id = query.data.rsplit(":", 1)[-1]
-                    plan = STAR_PLANS.get(plan_id)
-                    if not plan:
-                        await query.message.reply_text("Этот тариф больше недоступен. Откройте /start и выберите снова.")
-                        return
-                    payload = f"license:{plan_id}:{user.id}:{secrets.token_urlsafe(8)}"
-                    await context.bot.send_invoice(
-                        chat_id=update.effective_chat.id,
-                        title=f"Ключ — {plan['title']}",
-                        description=f"Лицензионный ключ на срок: {plan['title']}.",
-                        payload=payload,
-                        provider_token="",
-                        currency="XTR",
-                        prices=[LabeledPrice(label=f"Ключ на {plan['title']}", amount=int(plan["stars"]))],
-                    )
-
-            async def pre_checkout(update: Any, context: Any) -> None:
-                query = update.pre_checkout_query
-                try:
-                    payload = query.invoice_payload.split(":")
-                    valid = len(payload) == 4 and payload[0] == "license" and payload[1] in STAR_PLANS and int(payload[2]) == query.from_user.id
-                    if valid:
-                        await query.answer(ok=True)
-                    else:
-                        await query.answer(ok=False, error_message="Платёж не прошёл проверку. Создайте новый счёт через /start.")
-                except Exception:
-                    await query.answer(ok=False, error_message="Не удалось проверить оплату. Попробуйте ещё раз.")
-
-            async def successful_payment(update: Any, context: Any) -> None:
-                payment = update.effective_message.successful_payment
-                try:
-                    payload = payment.invoice_payload.split(":")
-                    if len(payload) != 4 or payload[0] != "license":
-                        raise ValueError("invalid payment payload")
-                    plan_id, buyer_id = payload[1], int(payload[2])
-                    user = update.effective_user
-                    if user is None or user.id != buyer_id or plan_id not in STAR_PLANS:
-                        raise ValueError("payment user mismatch")
-                    key, expires, created = issue_paid_license(
-                        user.id, plan_id, payment.telegram_payment_charge_id
-                    )
-                    plan = STAR_PLANS[plan_id]
-                    caption = (
-                        "✅ <b>Оплата прошла успешно!</b>\n\n"
-                        f"Тариф: <b>{plan['title']}</b> · <b>{plan['stars']} ⭐</b>\n"
-                        f"Ваш ключ: <code>{html.escape(key)}</code>\n"
-                        f"Действует: <b>{format_expiry(expires)}</b>\n\n"
-                        "Скопируйте и сохраните ключ."
-                    )
-                    await update.effective_message.reply_text(caption, parse_mode="HTML")
-                except Exception as exc:
-                    log.exception("Could not issue purchased key: %s", type(exc).__name__)
-                    await update.effective_message.reply_text(
-                        "Оплата получена, но автоматическая выдача ключа не завершилась. Напишите администратору и укажите ID платежа: "
-                        + html.escape(getattr(payment, "telegram_payment_charge_id", "unknown")),
-                        parse_mode="HTML",
-                    )
-
-            tg_app.add_handler(CommandHandler("start", start_command))
-            tg_app.add_handler(CallbackQueryHandler(license_callback, pattern=r"^license:"))
-            tg_app.add_handler(PreCheckoutQueryHandler(pre_checkout))
-            tg_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-            app.state.telegram_app = tg_app
-            await tg_app.initialize()
-            await tg_app.start()
-            me = await tg_app.bot.get_me()
-            if RENDER_EXTERNAL_URL.startswith("https://"):
-                await tg_app.bot.set_webhook(
-                    url=f"{RENDER_EXTERNAL_URL}/telegram/webhook",
-                    secret_token=WEBHOOK_SECRET,
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=False,
-                )
-                log.info("Telegram webhook configured for %s", RENDER_EXTERNAL_URL)
-                try:
-                    await tg_app.bot.set_chat_menu_button(
-                        menu_button=MenuButtonWebApp(text="Lister", web_app=WebAppInfo(url=RENDER_EXTERNAL_URL))
-                    )
-                except Exception:
-                    pass
-            else:
-                await tg_app.bot.delete_webhook(drop_pending_updates=True)
-                await tg_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-            log.info("Telegram bot started: @%s", me.username)
-            notify_task = asyncio.create_task(telegram_message_notifier(tg_app.bot), name="funpay-message-notifier")
-        except Exception as exc:
-            log.exception("Telegram bot initialization failed: %s", type(exc).__name__)
-            if tg_app:
-                try:
-                    await tg_app.shutdown()
-                except Exception:
-                    pass
-            tg_app = None
-            app.state.telegram_app = None
-    else:
-        log.warning("TELEGRAM_BOT_TOKEN is not configured; the web dashboard will still start.")
-    startup_golden_key = os.getenv("FUNPAY_GOLDEN_KEY", "").strip()
-    if startup_golden_key and FP_ACCOUNT is None:
-        try:
-            await funpay_connect(startup_golden_key, os.getenv("FUNPAY_USER_AGENT", "").strip() or DEFAULT_USER_AGENT)
-            log.info("FunPay auto-connected from environment configuration")
-        except Exception as exc:
-            log.warning("FunPay auto-connect failed: %s", type(exc).__name__)
-    if not DASHBOARD_PASSWORD:
-        log.warning("DASHBOARD_PASSWORD is not set; sign-in still works with a valid license key or Telegram admin initData.")
+            message = "Не удалось подключиться к FunPay. Проверьте сессию и попробуйте ещё раз."
+        raise HTTPException(status_code=401, detail=message) from exc
+    conn = FPConn(client, account, clean_model(profile) or {}, ua)
     try:
-        yield
-    finally:
-        if notify_task:
-            notify_task.cancel()
-            try:
-                await notify_task
-            except asyncio.CancelledError:
-                pass
-        if tg_app:
-            try:
-                if tg_app.updater and tg_app.updater.running:
-                    await tg_app.updater.stop()
-                await tg_app.stop()
-                await tg_app.shutdown()
-            except Exception as exc:
-                log.warning("Telegram shutdown issue: %s", type(exc).__name__)
-        if FP_CLIENT is not None:
-            try:
-                await FP_CLIENT.close()
-            except Exception:
-                pass
-            FP_CLIENT = None
-            FP_ACCOUNT = None
-            FP_PROFILE = None
+        conn.balance = clean_model(await asyncio.wait_for(account.get_balance(), timeout=FP_READ_TIMEOUT))
+    except Exception:
+        conn.balance = None
+    return conn
 
 
-async def telegram_message_notifier(bot: Any) -> None:
-    """Poll FunPay chat IDs and notify the configured administrator about new incoming messages."""
-    seen: dict[str, tuple[str, str]] = {}
-    initialized = False
-    while True:
+async def connect_owner(owner: str, golden_key: str, user_agent: str) -> FPConn:
+    conn = await open_account(golden_key, user_agent)
+    conn.owner = owner
+    old = FP_CONNS.get(owner)
+    FP_CONNS[owner] = conn
+    if old is not None and old is not conn:
+        old.closed = True
+        await _close_client(old.client)
+    if not save_fp_account(owner, golden_key.strip(), conn.user_agent):
+        log.warning("FunPay account kept in memory only (install cryptography to persist it)")
+    log.info("FunPay account connected for owner %s", owner.split(":")[0])
+    return conn
+
+
+async def close_owner(owner: str) -> None:
+    conn = FP_CONNS.pop(owner, None)
+    if conn is not None:
+        conn.closed = True
+        await _close_client(conn.client)
+
+
+async def conn_for(owner: str) -> FPConn:
+    """Return the live FunPay connection for an owner, restoring it from encrypted storage if needed."""
+    conn = FP_CONNS.get(owner)
+    if conn is not None and not conn.closed:
+        conn.last_used = time.time()
+        return conn
+    stored = load_fp_account(owner)
+    if not stored:
+        raise HTTPException(status_code=409, detail="Сначала подключите аккаунт FunPay в разделе «Настройки».")
+    lock = FP_CONN_LOCKS.setdefault(owner, asyncio.Lock())
+    async with lock:
+        conn = FP_CONNS.get(owner)
+        if conn is not None and not conn.closed:
+            return conn
+        golden, ua = stored
         try:
-            account = FP_ACCOUNT
-            if account is not None:
-                async with FP_LOCK:
-                    chat_items = await account.get_chats()
-                snapshots = []
-                for item in chat_items:
-                    data = clean_model(item)
-                    if not isinstance(data, dict):
-                        continue
-                    cid = str(data.get("id", ""))
-                    if not cid:
-                        continue
-                    latest_id = str(data.get("last_message_id") or "")
-                    latest_text = str(data.get("last_message_text") or "")
-                    snapshots.append((cid, data, latest_id, latest_text))
-                if not initialized:
-                    for cid, _data, latest_id, latest_text in snapshots:
-                        seen[cid] = (latest_id, latest_text)
-                    initialized = True
-                else:
-                    for cid, data, latest_id, latest_text in snapshots:
-                        old_id, old_text = seen.get(cid, ("", ""))
-                        if latest_id == old_id and latest_text == old_text:
-                            continue
-                        incoming_messages = []
-                        try:
-                            previous_id = int(old_id) if old_id.isdigit() else None
-                            async with FP_LOCK:
-                                history = await account.get_chat_history(int(cid) if cid.isdigit() else cid, last_message_id=previous_id)
-                            for msg in history or []:
-                                msg_data = clean_model(msg)
-                                if not isinstance(msg_data, dict):
-                                    continue
-                                msg_id = str(msg_data.get("id") or "")
-                                if old_id.isdigit() and msg_id.isdigit() and int(msg_id) <= int(old_id):
-                                    continue
-                                if msg_data.get("is_incoming"):
-                                    incoming_messages.append(msg_data)
-                        except Exception:
-                            log.debug("Notification history lookup failed", exc_info=True)
-                        # A newly appearing chat may not have an old ID; only notify on a changed snapshot.
-                        if incoming_messages:
-                            outgoing = incoming_messages[-3:]
-                            for msg in outgoing:
-                                content = str(msg.get("text") or "Сообщение без текста").strip()
-                                if msg.get("image_link"):
-                                    content += " [изображение]"
-                                message = ("💬 <b>Новое сообщение в FunPay</b>\n"
-                                           f"Чат: <b>{html.escape(str(data.get('name') or cid))}</b>\n"
-                                           f"От: <b>{html.escape(str(msg.get('author') or 'Покупатель'))}</b>\n"
-                                           f"{html.escape(content[:2500])}\n"
-                                           f"<i>Чат ID: {html.escape(cid)}</i>")
-                                try:
-                                    await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message, parse_mode="HTML", disable_web_page_preview=True)
-                                except Exception as send_exc:
-                                    log.warning("Telegram message notification could not be delivered: %s", type(send_exc).__name__)
-                        elif cid not in seen and latest_text:
-                            latest_author = str(data.get("last_message_author") or "")
-                            own_name = str((FP_PROFILE or {}).get("profile", {}).get("username") or "")
-                            if latest_author and latest_author.casefold() != own_name.casefold():
-                                message = ("💬 <b>Новое сообщение в FunPay</b>\n"
-                                           f"Чат: <b>{html.escape(str(data.get('name') or cid))}</b>\n"
-                                           f"{html.escape(latest_text[:2500])}\n<i>Чат ID: {html.escape(cid)}</i>")
-                                try:
-                                    await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message, parse_mode="HTML", disable_web_page_preview=True)
-                                except Exception as send_exc:
-                                    log.warning("Telegram message notification could not be delivered: %s", type(send_exc).__name__)
-                        seen[cid] = (latest_id, latest_text)
-                known = {cid for cid, *_ in snapshots}
-                if len(seen) > 1000:
-                    seen = {k: v for k, v in seen.items() if k in known}
-        except asyncio.CancelledError:
+            conn = await open_account(golden, ua)
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Не удалось переподключить аккаунт FunPay. Откройте «Настройки» и подключите его заново.",
+            ) from exc
+        conn.owner = owner
+        FP_CONNS[owner] = conn
+        return conn
+
+
+async def fp_call(
+    conn: FPConn,
+    factory: Any,
+    label: str | None,
+    *,
+    write: bool = False,
+    timeout: float | None = None,
+    retries: int | None = None,
+) -> Any:
+    """Run one FunPay coroutine under a hard timeout.
+
+    Reads retry on failure. Writes never retry automatically, because a retry after a
+    timeout could create a duplicate lot or message. label=None raises FunPayError instead
+    of HTTP 502 (used by background pollers).
+    """
+    if retries is None:
+        retries = 0 if write else 1
+    limit = timeout or (FP_WRITE_TIMEOUT if write else FP_READ_TIMEOUT)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            async with conn.lock:
+                return await asyncio.wait_for(factory(), timeout=limit)
+        except HTTPException:
             raise
         except Exception as exc:
-            log.debug("FunPay notifier loop issue: %s", type(exc).__name__)
-        await asyncio.sleep(3)
+            reason = "timeout" if isinstance(exc, asyncio.TimeoutError) else type(exc).__name__
+            if attempt > retries:
+                if label is None:
+                    raise FunPayError(reason) from exc
+                if "unauthorized" in str(exc).lower() or "401" in str(exc):
+                    push_error(conn.owner, "FunPay больше не принимает сессию. Переподключите аккаунт в «Настройках».")
+                push_error(conn.owner, f"{label}: FunPay не ответил вовремя ({reason}).")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"{label}. FunPay не ответил вовремя — попробуйте ещё раз.",
+                ) from exc
+        await asyncio.sleep(0.8 * attempt)
 
 
-app = FastAPI(title="FunPay Auto Lister Bot", version=APP_VERSION, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+def push_error(owner: str, text: str) -> None:
+    if not owner:
+        return
+    conn = FP_CONNS.get(owner)
+    if conn is not None:
+        if time.time() - conn.error_notified_at < 60:
+            return
+        conn.error_notified_at = time.time()
+    push_notification(owner, "error", "Ошибка FunPay", text)
 
 
+# ---------------------------------------------------------------- catalogue (games and categories)
+CATALOG: dict[str, Any] = {"items": [], "fetched_at": 0.0, "error": "", "refreshing": False}
+CATALOG_TASK: asyncio.Task | None = None
+
+
+def load_catalog_cache() -> None:
+    try:
+        data = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            CATALOG["items"] = data["items"]
+            CATALOG["fetched_at"] = float(data.get("fetched_at", 0))
+    except (OSError, ValueError):
+        pass
+
+
+def save_catalog_cache() -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CATALOG_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"items": CATALOG["items"], "fetched_at": CATALOG["fetched_at"]},
+                                  ensure_ascii=False), encoding="utf-8")
+        tmp.replace(CATALOG_PATH)
+    except OSError:
+        log.warning("Catalogue cache could not be written to disk")
+
+
+def _as_id(value: Any) -> Any:
+    text = str(value).strip()
+    return int(text) if text.isdigit() else text
+
+
+def normalize_catalog(values: Any) -> list[dict[str, Any]]:
+    categories: list[dict[str, Any]] = []
+    for raw in values or []:
+        data = clean_model(raw)
+        if not isinstance(data, dict) or data.get("id") is None or not str(data.get("name") or "").strip():
+            continue
+        subs = []
+        for sub in data.get("subcategories") or []:
+            item = clean_model(sub)
+            if isinstance(item, dict) and item.get("id") is not None and str(item.get("name") or "").strip():
+                subs.append({"id": _as_id(item["id"]), "name": str(item["name"]).strip(), "icon": None})
+        categories.append({"id": _as_id(data["id"]), "name": str(data["name"]).strip(), "icon": None,
+                           "subcategories": subs})
+    return categories
+
+
+async def _icon_map(conn: FPConn) -> dict[str, str]:
+    """Best-effort: map FunPay node ids to the game images shown on the public storefront."""
+    response = await fp_call(conn, lambda: conn.client.get("", raise_not_200=True), None, timeout=20, retries=0)
+    soup = BeautifulSoup(response.text, "html.parser")
+    icons: dict[str, str] = {}
+    for link in soup.select('a[href*="/lots/"]'):
+        match = re.search(r"/lots/(\d+)/?", link.get("href") or "")
+        image = link.find("img")
+        src = (image.get("src") or image.get("data-src") or "") if image else ""
+        if match and src:
+            icons.setdefault(match.group(1), urljoin("https://funpay.com", src))
+    return icons
+
+
+async def refresh_catalog(conn: FPConn) -> None:
+    values = await fp_call(conn, lambda: conn.account.get_categories(), "Не удалось получить каталог FunPay",
+                           timeout=max(FP_READ_TIMEOUT, 25), retries=2)
+    categories = normalize_catalog(values)
+    if not categories:
+        raise HTTPException(status_code=502, detail="FunPay вернул пустой каталог. Попробуйте обновить позже.")
+    try:
+        icons = await _icon_map(conn)
+    except Exception:
+        icons = {}
+    for category in categories:
+        for sub in category["subcategories"]:
+            sub["icon"] = icons.get(str(sub["id"]))
+        found = [s["icon"] for s in category["subcategories"] if s["icon"]]
+        category["icon"] = found[0] if found else None
+    CATALOG.update(items=categories, fetched_at=time.time(), error="")
+    save_catalog_cache()
+
+
+async def _catalog_job(owner: str) -> None:
+    CATALOG["refreshing"] = True
+    try:
+        conn = await conn_for(owner)
+        await refresh_catalog(conn)
+    except HTTPException as exc:
+        detail = exc.detail.get("message") if isinstance(exc.detail, dict) else exc.detail
+        CATALOG["error"] = str(detail)
+    except Exception as exc:
+        log.warning("Catalogue refresh failed: %s", type(exc).__name__)
+        CATALOG["error"] = "Не удалось обновить каталог FunPay."
+    finally:
+        CATALOG["refreshing"] = False
+
+
+async def ensure_catalog(owner: str) -> None:
+    """Serve the cache at once; start a refresh when stale and wait only a few seconds for it."""
+    global CATALOG_TASK
+    fresh = CATALOG["items"] and time.time() - CATALOG["fetched_at"] < CATALOG_MAX_AGE_SECONDS
+    if fresh:
+        return
+    if CATALOG_TASK is None or CATALOG_TASK.done():
+        CATALOG_TASK = asyncio.create_task(_catalog_job(owner), name="funpay-catalog")
+    try:
+        await asyncio.wait_for(asyncio.shield(CATALOG_TASK), timeout=CATALOG_WAIT_SECONDS)
+    except (asyncio.TimeoutError, Exception):
+        pass
+
+
+_WORD = re.compile(r"\s+")
+
+
+def _norm(text: str) -> str:
+    return _WORD.sub(" ", str(text or "").casefold()).strip()
+
+
+def rank_text(query: str, name: str) -> float:
+    """Score one query token against one name. 0 means no match."""
+    n = _norm(name)
+    if not query or not n:
+        return 0.0
+    if n == query:
+        return 200.0
+    if n.startswith(query):
+        return 150.0 - min(len(n), 80) / 10
+    words = n.split()
+    if any(w.startswith(query) for w in words):
+        return 120.0
+    if query in n:
+        return 100.0 - n.index(query) / 10
+    ratio = max([difflib.SequenceMatcher(None, query, w).ratio() for w in words + [n]] or [0.0])
+    if len(query) >= 3 and ratio >= 0.72:
+        return 60.0 * ratio
+    if len(query) >= 2 and ratio >= 0.5:
+        return 40.0 * ratio
+    return 0.0
+
+
+def search_catalog(query: str) -> list[dict[str, Any]]:
+    tokens = [t for t in _norm(query).split(" ") if t][:6]
+    results: list[tuple[float, dict[str, Any]]] = []
+    for category in CATALOG["items"]:
+        cat_name = category["name"]
+        if not tokens:
+            results.append((1.0, {"type": "category", "id": category["id"], "name": cat_name,
+                                  "category_id": category["id"], "category_name": cat_name,
+                                  "icon": category.get("icon"), "subcategories": category["subcategories"]}))
+            continue
+        scores = [rank_text(t, cat_name) for t in tokens]
+        if all(s > 0 for s in scores):
+            results.append((min(scores), {"type": "category", "id": category["id"], "name": cat_name,
+                                          "category_id": category["id"], "category_name": cat_name,
+                                          "icon": category.get("icon"), "subcategories": category["subcategories"]}))
+        for sub in category["subcategories"]:
+            text = f"{sub['name']} {cat_name}"
+            sub_scores = [rank_text(t, text) for t in tokens]
+            if all(s > 0 for s in sub_scores):
+                results.append((min(sub_scores) + 1.0, {
+                    "type": "subcategory", "id": sub["id"], "name": sub["name"],
+                    "category_id": category["id"], "category_name": cat_name,
+                    "subcategory_id": sub["id"], "icon": sub.get("icon") or category.get("icon"),
+                    "subcategories": []}))
+    results.sort(key=lambda pair: (-pair[0], str(pair[1]["name"]).casefold()))
+    limit = 60 if tokens else len(results)
+    return [item for _score, item in results[:limit]]
+
+
+# ---------------------------------------------------------------- normalizers for FunPay data
+def normalize_lot(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": data.get("id") or data.get("lot_id") or data.get("offer_id"),
+        "title": data.get("description") or data.get("title") or data.get("name") or "Без названия",
+        "price": data.get("price"),
+        "amount": data.get("amount"),
+        "active": bool(data.get("active", True)),
+        "currency": data.get("currency") or "RUB",
+        "subcategory_id": data.get("subcategory_id"),
+        "subcategory_name": data.get("subcategory_name") or "",
+        "server": data.get("server") or "",
+    }
+
+
+def normalize_order(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": data.get("id") or data.get("order_id"),
+        "title": data.get("description") or data.get("title") or "Заказ FunPay",
+        "game": data.get("game") or data.get("subcategory_name") or "",
+        "server": data.get("server") or "",
+        "buyer_username": data.get("buyer_username") or data.get("buyer") or "",
+        "status": str(data.get("status") or ""),
+        "date": str(data.get("date") or data.get("created_at") or ""),
+        "price": data.get("price"),
+        "amount": data.get("amount"),
+        "currency": data.get("currency") or "RUB",
+    }
+
+
+def normalize_chat(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(data.get("id", "")),
+        "name": data.get("name") or "Пользователь",
+        "last_message_id": str(data.get("last_message_id") or ""),
+        "last_message_text": data.get("last_message_text") or "",
+        "last_message_author": data.get("last_message_author") or "",
+        "unread_count": int(data.get("unread_count") or 0) if str(data.get("unread_count") or "0").isdigit() else 0,
+        "interlocutor_id": data.get("interlocutor_id"),
+    }
+
+
+def normalize_message(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(data.get("id", "")),
+        "text": data.get("text") or "",
+        "author": data.get("author") or "",
+        "author_id": data.get("author_id"),
+        "is_incoming": bool(data.get("is_incoming", False)),
+        "image_link": data.get("image_link") or None,
+        "timestamp": str(data.get("timestamp") or ""),
+        "status": data.get("status") or "received",
+    }
+
+
+def _message_id_from_runner_result(payload: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+    """Return (new message id, FunPay error text, image link) from a runner response."""
+    response_data = payload.get("response")
+    error_text = None
+    if payload.get("error"):
+        error_text = str(payload.get("msg") or payload.get("error"))[:300]
+    elif isinstance(response_data, dict) and response_data.get("error"):
+        error_text = str(response_data.get("error"))[:300]
+    last_message: dict[str, Any] | None = None
+    for obj in payload.get("objects") if isinstance(payload.get("objects"), list) else []:
+        data = obj.get("data") if isinstance(obj, dict) and isinstance(obj.get("data"), dict) else {}
+        messages = data.get("messages") if isinstance(data.get("messages"), list) else []
+        if messages and isinstance(messages[-1], dict):
+            last_message = messages[-1]
+    image_link = None
+    if last_message and last_message.get("html"):
+        try:
+            node = BeautifulSoup(str(last_message.get("html")), "html.parser").select_one("a.chat-img-link")
+            if node and node.get("href"):
+                image_link = urljoin("https://funpay.com", node.get("href"))
+        except Exception:
+            pass
+    raw_id = last_message.get("id") if last_message else None
+    return (str(raw_id) if raw_id is not None else None), error_text, image_link
+
+
+async def chat_history(conn: FPConn, chat_id: Any, label: str | None = "Не удалось открыть историю чата") -> list[dict[str, Any]]:
+    values = await fp_call(conn, lambda: conn.account.get_chat_history(_as_id(chat_id)), label, retries=1)
+    return [normalize_message(clean_model(m)) for m in values or [] if isinstance(clean_model(m), dict)]
+
+
+async def send_runner(conn: FPConn, chat_id: Any, text: str, image_id: int | None = None,
+                      known_ids: set[str] | None = None, image_mode: bool = False) -> dict[str, Any]:
+    """Send through the FunPay runner.
+
+    A runner response without an error counts as sent. Verification through history is
+    best-effort: failing to see the message yet is reported as verified=False, not as an error.
+    Only an explicit FunPay error, or an ambiguous timeout that is not visible in history,
+    fails the request, and writes are never retried automatically.
+    """
+    client = conn.client
+    node_id = _as_id(chat_id)
+    data: dict[str, Any] = {"node": node_id, "content": text or ""}
+    if image_id is not None:
+        data["image_id"] = int(image_id)
+        data["content"] = ""
+    objects = [{"type": "chat_node", "id": node_id, "tag": "00000000",
+                "data": {"node": node_id, "last_message": "", "content": text or ""}}]
+    headers = {"accept": "*/*", "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+               "x-requested-with": "XMLHttpRequest"}
+    for index, action in enumerate(("message_send", "chat_message")):
+        form = {
+            "objects": json.dumps(objects, ensure_ascii=False),
+            "request": json.dumps({"action": action, "data": dict(data)}, ensure_ascii=False),
+            "csrf_token": getattr(client, "csrf_token", "") or "",
+        }
+        try:
+            response = await fp_call(conn, lambda: client.post("runner/", data=form, headers=headers,
+                                                              raise_not_200=True),
+                                     None, write=True)
+            payload = response.json()
+        except (FunPayError, HTTPException, ValueError):
+            payload = None
+        if not isinstance(payload, dict):
+            # Ambiguous: the request may have reached FunPay. Look for the message before failing.
+            await asyncio.sleep(2.0)
+            found = await _find_sent(conn, chat_id, text, image_mode, known_ids)
+            if found:
+                return {"message_id": found["id"], "verified": True, "image_link": found.get("image_link")}
+            raise HTTPException(status_code=502, detail=(
+                "FunPay не подтвердил отправку. Проверьте чат перед повторной отправкой, "
+                "чтобы не получить дубль."))
+        message_id, error_text, image_link = _message_id_from_runner_result(payload)
+        if error_text:
+            lowered = error_text.casefold()
+            unsupported = any(token in lowered for token in (
+                "unknown action", "unsupported action", "action not found", "неизвестн", "not implemented"))
+            if index == 0 and unsupported:
+                continue
+            raise HTTPException(status_code=422, detail=f"FunPay отклонил отправку: {error_text}")
+        if message_id and (known_ids is None or message_id not in known_ids):
+            return {"message_id": message_id, "verified": True, "image_link": image_link}
+        for delay in (1.5, 3.0):
+            await asyncio.sleep(delay)
+            found = await _find_sent(conn, chat_id, text, image_mode, known_ids)
+            if found:
+                return {"message_id": found["id"], "verified": True, "image_link": found.get("image_link")}
+        return {"message_id": None, "verified": False, "image_link": image_link}
+    raise HTTPException(status_code=502, detail="FunPay отклонил отправку: действие не поддерживается.")
+
+
+async def _find_sent(conn: FPConn, chat_id: Any, text: str, image_mode: bool,
+                     known_ids: set[str] | None) -> dict[str, Any] | None:
+    if known_ids is None:
+        return None
+    try:
+        history = await chat_history(conn, chat_id, label=None)
+    except Exception:
+        return None
+    for item in reversed(history):
+        if item["is_incoming"] or not item["id"] or item["id"] in known_ids:
+            continue
+        if image_mode and item.get("image_link"):
+            return item
+        if not image_mode and item["text"].strip() == text.strip():
+            return item
+    return None
+
+
+# ---------------------------------------------------------------- request models
 class LoginBody(BaseModel):
+    key: str = Field(default="", max_length=300)
     password: str = Field(default="", max_length=300)
     init_data: str = Field(default="", max_length=8192)
 
@@ -711,8 +1146,14 @@ class FunPayConnectBody(BaseModel):
     user_agent: str = Field(default="", max_length=1000)
 
 
-class ChatMessageBody(BaseModel):
+class MessageBody(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
+
+
+class ChatPhotoBody(BaseModel):
+    filename: str = Field(default="photo.jpg", min_length=1, max_length=180)
+    mime_type: str = Field(default="image/jpeg", min_length=3, max_length=100)
+    data: str = Field(min_length=20, max_length=12_000_000)
 
 
 class LotCreateBody(BaseModel):
@@ -732,14 +1173,8 @@ class LotEditBody(BaseModel):
     active: bool = True
 
 
-class MessageBody(BaseModel):
-    text: str = Field(min_length=1, max_length=4000)
-
-
-class ChatPhotoBody(BaseModel):
-    filename: str = Field(default="photo.jpg", min_length=1, max_length=180)
-    mime_type: str = Field(default="image/jpeg", min_length=3, max_length=100)
-    data: str = Field(min_length=20, max_length=12_000_000)
+class RaiseBody(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=100)
 
 
 class AdminLicenseCreateBody(BaseModel):
@@ -747,532 +1182,421 @@ class AdminLicenseCreateBody(BaseModel):
     telegram_user_id: int | None = Field(default=None, ge=0)
 
 
+class AdminRevokeBody(BaseModel):
+    key: str = Field(min_length=5, max_length=100)
+
+
+app = FastAPI(title="FunPay Lister", version=APP_VERSION, docs_url=None, redoc_url=None, openapi_url=None)
+
+
+def _dicts(values: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for value in values or []:
+        data = clean_model(value)
+        if isinstance(data, dict):
+            out.append(data)
+    return out
+
+
+def balance_value(balance: Any) -> float | None:
+    if isinstance(balance, (int, float)) and not isinstance(balance, bool):
+        return float(balance)
+    if isinstance(balance, dict):
+        for key in ("total_rub", "rub", "balance", "total", "value", "amount"):
+            value = balance.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+    return None
+
+
+def session_summary(plan_id: str, is_admin: bool, license_key: str | None, expires_at: int) -> dict[str, Any]:
+    now = now_ts()
+    return {
+        "plan_id": plan_id,
+        "plan_title": plan_title(plan_id),
+        "is_admin": is_admin,
+        "free": plan_id == "free",
+        "forever": plan_id in ("forever", "admin_forever"),
+        "license_hint": (license_key or "")[-4:],
+        "expires_at": expires_at,
+        "remaining_seconds": max(0, expires_at - now),
+        "server_time": now,
+        "version": APP_VERSION,
+    }
+
+
+# ---------------------------------------------------------------- auth and session
 @app.post("/api/login")
-async def login(payload: LoginBody, request: Request) -> dict[str, Any]:
+async def login(payload: LoginBody, request: Request, response: Response) -> dict[str, Any]:
     host = request.client.host if request.client else "unknown"
-    now = time.time()
-    attempts = [t for t in LOGIN_ATTEMPTS.get(host, []) if now - t < 300]
-    if len(attempts) >= 8:
-        raise HTTPException(status_code=429, detail="Слишком много попыток. Подождите пять минут.")
+    check_login_rate(host)
+    supplied = (payload.key or payload.password or "").strip()
+    now = now_ts()
+    user_agent = request.headers.get("user-agent", "")
+    tg_user = verify_telegram_init_data(payload.init_data)
+    is_tg_admin = bool(tg_user and int(tg_user.get("id", 0) or 0) == ADMIN_TELEGRAM_ID)
+    password_ok = bool(DASHBOARD_PASSWORD and supplied and hmac.compare_digest(supplied, DASHBOARD_PASSWORD))
 
-    supplied = payload.password.strip()
-    verified_user = verify_telegram_init_data(payload.init_data)
-    is_admin = bool(verified_user and int(verified_user.get("id", 0) or 0) == ADMIN_TELEGRAM_ID)
-    password_ok = bool(DASHBOARD_PASSWORD) and bool(supplied) and hmac.compare_digest(supplied, DASHBOARD_PASSWORD)
-    license_row = None
-    license_ok = False
-    if not password_ok and not is_admin and supplied:
-        try:
-            init_license_db()
-            with sqlite3.connect(LICENSE_DB_PATH) as db:
-                license_row = db.execute(
-                    "SELECT license_key,telegram_user_id,plan_id,expires_at,created_at FROM license_keys WHERE license_key = ? COLLATE NOCASE",
-                    (supplied,),
-                ).fetchone()
-            license_ok = bool(license_row and (license_row[3] is None or int(license_row[3]) > int(now)))
-        except sqlite3.Error:
-            log.exception("License lookup failed during login")
-            license_ok = False
+    if is_tg_admin or password_ok:
+        expires = now + ADMIN_SESSION_SECONDS
+        token = create_web_session("admin", "admin", True, None, expires, user_agent)
+        plan_id, is_admin, license_key = "admin", True, None
+    elif supplied:
+        lic = find_license(supplied)
+        if lic is None:
+            note_failed_login(host)
+            raise HTTPException(status_code=401, detail="Неверный ключ доступа. Проверьте ключ и срок его действия.")
+        valid, reason = license_status(lic, now)
+        if not valid:
+            note_failed_login(host)
+            text = {"expired": "Срок действия ключа истёк. Получите новый ключ в боте.",
+                    "revoked": "Ключ отозван. Обратитесь к администратору."}.get(reason, "Ключ недействителен.")
+            raise HTTPException(status_code=401, detail={"code": f"session_{reason}", "message": text})
+        if reason == "not_activated":
+            activate_license_if_needed(lic["license_key"])
+            lic = find_license(lic["license_key"])
+        license_key = lic["license_key"]
+        expires = FOREVER_SESSION_SECONDS + now if lic["expires_at"] is None else int(lic["expires_at"])
+        plan_id, is_admin = lic["plan_id"], False
+        token = create_web_session(f"lic:{license_key}", plan_id, False, license_key, expires, user_agent)
+    else:
+        note_failed_login(host)
+        raise HTTPException(status_code=401, detail="Введите ключ доступа.")
 
-    if not (password_ok or license_ok or is_admin):
-        attempts.append(now)
-        LOGIN_ATTEMPTS[host] = attempts
-        raise HTTPException(status_code=401, detail="Неверный пароль панели или ключ. Проверьте ключ и срок его действия.")
     LOGIN_ATTEMPTS.pop(host, None)
-    token = secrets.token_urlsafe(32)
-    session_expiry = now + SESSION_TTL_SECONDS
-    meta: dict[str, Any] = {"is_admin": is_admin, "plan_id": "admin" if is_admin else "password" if password_ok else "", "license_key": None, "license_expires_at": None}
-    if license_ok and license_row:
-        meta.update({"plan_id": str(license_row[2]), "license_key": str(license_row[0]), "license_expires_at": license_row[3], "license_created_at": int(license_row[4])})
-        if license_row[3] is not None:
-            session_expiry = min(session_expiry, float(license_row[3]))
-    SESSIONS[token] = session_expiry
-    SESSION_META[token] = meta
-    for old_token, expiry in list(SESSIONS.items()):
-        if expiry < now:
-            SESSIONS.pop(old_token, None)
-            SESSION_META.pop(old_token, None)
-    return {"token": token, "expires_in": max(0, int(session_expiry - now)), "is_admin": is_admin, "plan_id": meta["plan_id"]}
+    response.set_cookie(
+        SESSION_COOKIE, token, max_age=max(60, expires - now), httponly=True, samesite="lax",
+        secure=cookie_is_secure(request), path="/",
+    )
+    return {"ok": True, "session": session_summary(plan_id, is_admin, license_key, expires)}
 
 
 @app.post("/api/logout")
-async def logout(_: bool = Depends(require_session), x_dashboard_session: str | None = Header(default=None, alias="X-Dashboard-Session")) -> dict[str, bool]:
-    if x_dashboard_session:
-        SESSIONS.pop(x_dashboard_session, None)
-        SESSION_META.pop(x_dashboard_session, None)
+async def logout(request: Request, response: Response) -> dict[str, bool]:
+    """Graceful logout: ends this session only; the FunPay connection stays for the key's other devices."""
+    token = request.cookies.get(SESSION_COOKIE, "")
+    if token:
+        _expire_session(_token_hash(token))
+    response.delete_cookie(SESSION_COOKIE, path="/", secure=cookie_is_secure(request), httponly=True, samesite="lax")
     return {"ok": True}
 
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "version": APP_VERSION, "uptime_seconds": int(time.monotonic() - START_TIME), "telegram_enabled": bool(TELEGRAM_BOT_TOKEN)}
+    return {"status": "ok", "version": APP_VERSION, "uptime_seconds": int(time.monotonic() - START_TIME),
+            "telegram_enabled": bool(TELEGRAM_BOT_TOKEN), "server_time": now_ts()}
 
 
-@app.get("/api/session/info")
-async def session_info(_: bool = Depends(require_session), x_dashboard_session: str | None = Header(default=None, alias="X-Dashboard-Session")) -> dict[str, Any]:
-    meta = SESSION_META.get(x_dashboard_session or "", {})
-    expiry = meta.get("license_expires_at")
-    return {"is_admin": bool(meta.get("is_admin")), "plan_id": meta.get("plan_id", ""), "created_at": meta.get("license_created_at"), "expires_at": expiry,
-            "remaining_seconds": None if expiry is None else max(0, int(expiry - time.time()))}
+@app.get("/api/session")
+async def session_info(session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    return session.payload()
 
 
-@app.post("/api/admin/licenses")
-async def admin_create_license(payload: AdminLicenseCreateBody, _: bool = Depends(require_admin)) -> dict[str, Any]:
-    if payload.duration not in ADMIN_LICENSE_DURATIONS:
-        raise HTTPException(status_code=422, detail="Выберите срок из списка.")
-    try:
-        return create_admin_license(payload.duration, payload.telegram_user_id)
-    except sqlite3.Error as exc:
-        log.exception("Admin key creation failed")
-        raise HTTPException(status_code=500, detail="Не удалось сохранить ключ в журнале.") from exc
+@app.get("/api/notifications")
+async def notifications(after: int = 0, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    items, last_seq = notifications_after(session.owner, max(0, int(after)))
+    return {"items": items, "last_seq": last_seq, "session": session.payload()}
 
 
-@app.get("/api/admin/licenses")
-async def admin_licenses(_: bool = Depends(require_admin)) -> dict[str, Any]:
-    """Read-only historical license ledger; expired keys remain in the database."""
-    init_license_db()
-    now = int(time.time())
-    with sqlite3.connect(LICENSE_DB_PATH) as db:
-        db.row_factory = sqlite3.Row
-        rows = db.execute("SELECT license_key,telegram_user_id,plan_id,created_at,expires_at,telegram_payment_charge_id FROM license_keys ORDER BY created_at DESC").fetchall()
-    values = []
-    for row in rows:
-        expires = row["expires_at"]
-        values.append({"key": row["license_key"], "telegram_user_id": row["telegram_user_id"] or None, "plan_id": row["plan_id"],
-                       "created_at": row["created_at"], "expires_at": expires,
-                       "active": expires is None or int(expires) > now,
-                       "payment_id": row["telegram_payment_charge_id"]})
-    return {"total": len(values), "items": values}
-
-
+# ---------------------------------------------------------------- FunPay account
 @app.get("/api/funpay/status")
-async def funpay_status(_: bool = Depends(require_session)) -> dict[str, Any]:
-    return {"connected": bool(FP_CLIENT and FP_ACCOUNT), **(FP_PROFILE or {})}
+async def funpay_status(session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    try:
+        conn = await conn_for(session.owner)
+    except HTTPException as exc:
+        return {"connected": False, "message": exc.detail if isinstance(exc.detail, str) else ""}
+    return {"connected": True, "username": conn.username, "balance": balance_value(conn.balance),
+            "connected_at": conn.connected_at, "profile_id": conn.profile.get("id")}
 
 
 @app.post("/api/funpay/connect")
-async def connect_funpay(payload: FunPayConnectBody, _: bool = Depends(require_session)) -> dict[str, Any]:
-    return await funpay_connect(payload.golden_key, payload.user_agent)
+async def connect_funpay(payload: FunPayConnectBody, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    conn = await connect_owner(session.owner, payload.golden_key, payload.user_agent)
+    return {"connected": True, "username": conn.username, "balance": balance_value(conn.balance),
+            "connected_at": conn.connected_at, "profile_id": conn.profile.get("id")}
 
 
 @app.post("/api/funpay/disconnect")
-async def disconnect_funpay(_: bool = Depends(require_session)) -> dict[str, bool]:
-    global FP_CLIENT, FP_ACCOUNT, FP_PROFILE, FP_CATEGORIES_CACHE, FP_CATEGORIES_CACHE_AT
-    old_client = FP_CLIENT
-    FP_CLIENT = FP_ACCOUNT = FP_PROFILE = None
-    FP_CATEGORIES_CACHE = []
-    FP_CATEGORIES_CACHE_AT = 0.0
-    if old_client is not None:
-        await old_client.close()
+async def disconnect_funpay(session: SessionInfo = Depends(get_session)) -> dict[str, bool]:
+    await close_owner(session.owner)
+    delete_fp_account(session.owner)
     return {"ok": True}
 
 
-async def refresh_funpay_categories(force: bool = False) -> list[dict[str, Any]]:
-    """Return a normalised category catalogue, keeping a stale copy during short outages."""
-    global FP_CATEGORIES_CACHE, FP_CATEGORIES_CACHE_AT
-    _client, account = need_funpay()
-    fresh = bool(FP_CATEGORIES_CACHE) and (time.time() - FP_CATEGORIES_CACHE_AT < 300)
-    if fresh and not force:
-        return FP_CATEGORIES_CACHE
-    try:
-        async with FP_LOCK:
-            values = await account.get_categories()
-        cleaned = [clean_model(item) for item in values]
-        # Normalise Pydantic/dataclass-like nested category shapes before the UI sees them.
-        cleaned = [c for c in cleaned if isinstance(c, dict) and c.get("id") is not None and c.get("name")]
-        for category in cleaned:
-            subs = category.get("subcategories")
-            category["subcategories"] = [x for x in subs if isinstance(x, dict) and x.get("id") is not None and x.get("name")] if isinstance(subs, list) else []
-        if not cleaned:
-            raise RuntimeError("FunPay вернул пустой каталог категорий")
-        FP_CATEGORIES_CACHE = cleaned
-        FP_CATEGORIES_CACHE_AT = time.time()
-        return FP_CATEGORIES_CACHE
-    except Exception as exc:
-        if FP_CATEGORIES_CACHE:
-            log.warning("Using cached FunPay categories after refresh failure: %s", type(exc).__name__)
-            return FP_CATEGORIES_CACHE
-        log.warning("FunPay category catalogue unavailable: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Не удалось получить каталог FunPay. Проверьте сессию аккаунта и попробуйте ещё раз.") from exc
+# ---------------------------------------------------------------- catalogue search
+@app.get("/api/funpay/catalog")
+async def catalog_search(q: str = "", session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    query = " ".join(q.split())[:80]
+    await ensure_catalog(session.owner)
+    items = search_catalog(query)
+    return {
+        "items": items,
+        "count": len(items),
+        "fetched_at": int(CATALOG["fetched_at"]),
+        "refreshing": bool(CATALOG["refreshing"]),
+        "error": CATALOG["error"] if not CATALOG["items"] or CATALOG["error"] else "",
+    }
 
 
-@app.get("/api/funpay/categories")
-async def categories(_: bool = Depends(require_session)) -> list[dict[str, Any]]:
-    return await refresh_funpay_categories()
-
-
-@app.get("/api/funpay/catalog/search")
-async def search_funpay_catalog(q: str = "", _: bool = Depends(require_session)) -> list[dict[str, Any]]:
-    """Search cached real categories/subcategories; only refresh upstream when stale."""
-    global FP_CATEGORIES_CACHE, FP_CATEGORIES_CACHE_AT
-    query = " ".join(q.casefold().split())[:80]
-    catalogue = await refresh_funpay_categories()
-
-    def rank(name: str) -> float:
-        normalized = " ".join(str(name or "").casefold().split())
-        if not query:
-            return 5.0
-        if normalized.startswith(query):
-            return 120.0 - min(len(normalized), 80) / 20
-        words = normalized.split()
-        if any(word.startswith(query) for word in words):
-            return 108.0 - min(len(normalized), 80) / 20
-        if query in normalized:
-            return 95.0 - normalized.index(query) / 100
-        ratio = max([difflib.SequenceMatcher(None, query, word).ratio() for word in words] or [0.0])
-        if len(query) == 1 and ratio < 1:
-            return 0.0
-        if len(query) >= 2 and ratio >= 0.35:
-            return 45.0 * ratio
-        return 0.0
-
-    matches: list[dict[str, Any]] = []
-    for category in catalogue:
-        category_id = category.get("id")
-        category_name = str(category.get("name") or "")
-        score = rank(category_name)
-        if score > 0:
-            matches.append({"type": "category", "category_id": category_id, "subcategory_id": None,
-                            "category_name": category_name, "name": category_name, "score": score})
-        subs = category.get("subcategories") if isinstance(category.get("subcategories"), list) else []
-        for sub in subs:
-            sub_name = str(sub.get("name") or "")
-            sub_score = rank(sub_name)
-            if sub_score > 0:
-                matches.append({"type": "subcategory", "category_id": category_id, "subcategory_id": sub.get("id"),
-                                "category_name": category_name, "name": sub_name, "score": sub_score + 1.0})
-    matches.sort(key=lambda item: (-item["score"], str(item["name"]).casefold()))
-    return [{k: v for k, v in item.items() if k != "score"} for item in matches[:50]]
-
-
-@app.get("/api/funpay/subcategories/{category_id}")
-async def subcategories(category_id: int, _: bool = Depends(require_session)) -> list[dict[str, Any]]:
-    _client, account = need_funpay()
-    try:
-        async with FP_LOCK:
-            values = await account.get_subcategories(category_id)
-        return [clean_model(item) for item in values]
-    except Exception as exc:
-        log.warning("Subcategories read failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Не удалось загрузить подкатегории этой игры.") from exc
-
-
+# ---------------------------------------------------------------- lots
 @app.get("/api/funpay/lots")
-async def my_lots(subcategory_id: int, _: bool = Depends(require_session)) -> list[dict[str, Any]]:
-    _client, account = need_funpay()
-    try:
-        async with FP_LOCK:
-            values = await account.get_my_lots(subcategory_id)
-        return [clean_model(item) for item in values]
-    except Exception as exc:
-        log.warning("My lots read failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Не удалось загрузить офферы. Проверьте выбранную категорию.") from exc
+async def my_lots(subcategory_id: int, session: SessionInfo = Depends(get_session)) -> list[dict[str, Any]]:
+    conn = await conn_for(session.owner)
+    values = await fp_call(conn, lambda: conn.account.get_my_lots(subcategory_id), "Не удалось загрузить офферы")
+    return [normalize_lot(d) for d in _dicts(values)]
 
 
 @app.get("/api/funpay/offers")
-async def search_offers(subcategory_id: int, q: str = "", _: bool = Depends(require_session)) -> list[dict[str, Any]]:
-    """Search publicly visible offer cards in the selected FunPay subcategory."""
-    client, _account = need_funpay()
+async def search_offers(subcategory_id: int, q: str = "", session: SessionInfo = Depends(get_session)) -> list[dict[str, Any]]:
+    """Public market search: offer cards of one FunPay subcategory."""
     if len(q) > 180:
         raise HTTPException(status_code=422, detail="Поисковый запрос слишком длинный.")
-    try:
-        async with FP_LOCK:
-            response = await client.get(f"lots/{subcategory_id}/", query=q.strip() or None, raise_not_200=True)
-        soup = BeautifulSoup(response.text, "html.parser")
-        offers: list[dict[str, Any]] = []
-        for node in soup.select("a.tc-item")[:100]:
-            href = node.get("href") or ""
-            title_node = node.select_one(".tc-desc-text")
-            price_node = node.select_one(".tc-price")
-            seller_node = node.select_one(".media-user-name, .tc-user, .tc-user-name")
-            server_node = node.select_one(".tc-server")
-            amount_node = node.select_one(".tc-amount")
-            offer_id = node.get("data-offer")
-            if not offer_id and href:
-                offer_id = parse_qs(urlparse(href).query).get("id", [None])[0]
-            price_raw = (price_node.get("data-s") if price_node else None)
-            if not price_raw and price_node:
-                price_raw = price_node.get_text(" ", strip=True).replace("\u00a0", " ").split()[0]
-            try:
-                price_value = float(str(price_raw).replace(" ", "").replace(",", ".")) if price_raw else None
-            except ValueError:
-                price_value = None
-            offers.append({
-                "id": str(offer_id or ""),
-                "title": title_node.get_text(" ", strip=True) if title_node else "Оффер FunPay",
-                "price": price_value,
-                "price_text": price_node.get_text(" ", strip=True) if price_node else "—",
-                "seller": seller_node.get_text(" ", strip=True) if seller_node else "Продавец",
-                "server": server_node.get_text(" ", strip=True) if server_node else "",
-                "amount": amount_node.get_text(" ", strip=True) if amount_node else "",
-                "url": urljoin("https://funpay.com", href) if href else "https://funpay.com/",
-            })
-        return offers
-    except Exception as exc:
-        log.warning("Offer search failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="FunPay не вернул список офферов. Проверьте категорию и попробуйте ещё раз.") from exc
+    conn = await conn_for(session.owner)
+    response = await fp_call(
+        conn,
+        lambda: conn.client.get(f"lots/{subcategory_id}/", query=q.strip() or None, raise_not_200=True),
+        "Не удалось получить офферы FunPay",
+    )
+    return parse_market_offers(response.text)
+
+
+def parse_market_offers(page_html: str) -> list[dict[str, Any]]:
+    soup = BeautifulSoup(page_html, "html.parser")
+    offers: list[dict[str, Any]] = []
+    for node in soup.select("a.tc-item")[:100]:
+        href = node.get("href") or ""
+        title_node = node.select_one(".tc-desc-text")
+        price_node = node.select_one(".tc-price")
+        seller_node = node.select_one(".media-user-name, .tc-user, .tc-user-name")
+        server_node = node.select_one(".tc-server")
+        amount_node = node.select_one(".tc-amount")
+        offer_id = node.get("data-offer")
+        if not offer_id and href:
+            offer_id = parse_qs(urlparse(href).query).get("id", [None])[0]
+        price_raw = price_node.get("data-s") if price_node else None
+        if not price_raw and price_node:
+            price_raw = price_node.get_text(" ", strip=True).replace(" ", " ").split()[0]
+        try:
+            price_value = float(str(price_raw).replace(" ", "").replace(",", ".")) if price_raw else None
+        except ValueError:
+            price_value = None
+        offers.append({
+            "id": str(offer_id or ""),
+            "title": title_node.get_text(" ", strip=True) if title_node else "Оффер FunPay",
+            "price": price_value,
+            "price_text": price_node.get_text(" ", strip=True) if price_node else "—",
+            "seller": seller_node.get_text(" ", strip=True) if seller_node else "Продавец",
+            "server": server_node.get_text(" ", strip=True) if server_node else "",
+            "amount": amount_node.get_text(" ", strip=True) if amount_node else "",
+            "url": urljoin("https://funpay.com", href) if href else "https://funpay.com/",
+        })
+    return offers
+
+
+def extract_form_fields(form: Any) -> dict[str, str]:
+    """Default values of a FunPay offer-editor form."""
+    fields: dict[str, str] = {}
+    for node in form.find_all(["input", "textarea", "select"]):
+        name = node.get("name")
+        if not name:
+            continue
+        if node.name == "input":
+            input_type = (node.get("type") or "text").lower()
+            if input_type in ("checkbox", "radio"):
+                if node.has_attr("checked"):
+                    fields[name] = node.get("value") or "on"
+            else:
+                fields[name] = node.get("value") or ""
+        elif node.name == "textarea":
+            fields[name] = node.get_text() or ""
+        elif node.name == "select":
+            selected = node.find("option", selected=True) or node.find("option")
+            if selected is not None:
+                fields[name] = selected.get("value") or selected.get_text(strip=True)
+    return fields
 
 
 @app.post("/api/funpay/lots/create")
-async def create_lot(payload: LotCreateBody, _: bool = Depends(require_session)) -> dict[str, Any]:
+async def create_lot(payload: LotCreateBody, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    conn = await conn_for(session.owner)
+    client = conn.client
+    response = await fp_call(
+        conn, lambda: client.get("lots/offerEdit", node=payload.subcategory_id, raise_not_200=True),
+        "Не удалось открыть форму оффера FunPay",
+    )
+    soup = BeautifulSoup(response.text, "html.parser")
+    form = soup.select_one("form.form-offer-editor") or soup.find("form")
+    if not form:
+        raise HTTPException(status_code=502, detail="FunPay не вернул форму создания оффера для этой категории. "
+                                                     "Попробуйте другую игру или создайте лот на сайте FunPay.")
+    fields = extract_form_fields(form)
+    fields["offer_id"] = fields.get("offer_id") or "0"
+    fields["node_id"] = str(payload.subcategory_id)
+    fields["csrf_token"] = getattr(client, "csrf_token", "") or fields.get("csrf_token", "")
+    fields["fields[summary][ru]"] = payload.title.strip()
+    fields["fields[desc][ru]"] = payload.description.strip()
+    fields["price"] = str(payload.price)
+    fields["amount"] = str(payload.amount)
+    if payload.active:
+        fields["active"] = "on"
+    else:
+        fields.pop("active", None)
+    headers = {"accept": "*/*", "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+               "x-requested-with": "XMLHttpRequest"}
+    saved = await fp_call(conn, lambda: client.post("lots/offerSave", data=fields, headers=headers,
+                                                    raise_not_200=True),
+                          "Не удалось сохранить оффер", write=True)
     try:
-        return await create_funpay_lot(
-            payload.subcategory_id, payload.title, payload.description, payload.price, payload.amount, payload.active
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.warning("Lot create failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Не удалось создать оффер. Проверьте обязательные поля этой категории на FunPay.") from exc
+        result = saved.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="FunPay вернул неожиданный ответ при сохранении оффера.")
+    if isinstance(result, dict) and (result.get("error") or result.get("errors")):
+        errors = result.get("errors") or result.get("error")
+        raise HTTPException(status_code=422, detail=f"FunPay не сохранил оффер: {str(errors)[:700]}")
+    return {"ok": True, "subcategory_id": payload.subcategory_id}
 
 
 @app.get("/api/funpay/lots/{lot_id}/fields")
-async def lot_fields(lot_id: int, _: bool = Depends(require_session)) -> dict[str, Any]:
-    _client, account = need_funpay()
-    try:
-        async with FP_LOCK:
-            lot = await account.get_lot_fields(lot_id)
-        fields = getattr(lot, "fields", {}) or {}
-        return {
-            "lot_id": lot_id,
-            "title": fields.get("fields[summary][ru]", ""),
-            "description": fields.get("fields[desc][ru]", ""),
-            "price": fields.get("price", ""),
-            "amount": fields.get("amount", "1"),
-            "active": "active" in fields,
-        }
-    except Exception as exc:
-        log.warning("Lot fields read failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Не удалось открыть редактор этого оффера.") from exc
+async def lot_fields(lot_id: int, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    conn = await conn_for(session.owner)
+    lot = await fp_call(conn, lambda: conn.account.get_lot_fields(lot_id), "Не удалось открыть редактор оффера")
+    fields = dict(getattr(lot, "fields", {}) or {})
+    return {
+        "lot_id": lot_id,
+        "title": fields.get("fields[summary][ru]", ""),
+        "description": fields.get("fields[desc][ru]", ""),
+        "price": fields.get("price", ""),
+        "amount": fields.get("amount", "1"),
+        "active": "active" in fields,
+    }
 
 
 @app.put("/api/funpay/lots/{lot_id}")
-async def save_lot(lot_id: int, payload: LotEditBody, _: bool = Depends(require_session)) -> dict[str, Any]:
-    _client, account = need_funpay()
-    try:
-        async with FP_LOCK:
-            lot = await account.get_lot_fields(lot_id)
-            fields = dict(getattr(lot, "fields", {}) or {})
-            fields["fields[summary][ru]"] = payload.title.strip()
-            fields["fields[desc][ru]"] = payload.description.strip()
-            fields["price"] = str(payload.price)
-            fields["amount"] = str(payload.amount)
-            if payload.active:
-                fields["active"] = "on"
-            else:
-                fields.pop("active", None)
-            result = await account.save_lot(lot_id, fields)
-        return {"ok": bool(getattr(result, "saved", True)), "lot_id": lot_id}
-    except Exception as exc:
-        log.warning("Lot save failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Не удалось сохранить изменения оффера.") from exc
+async def save_lot(lot_id: int, payload: LotEditBody, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    conn = await conn_for(session.owner)
+    lot = await fp_call(conn, lambda: conn.account.get_lot_fields(lot_id), "Не удалось открыть редактор оффера")
+    fields = dict(getattr(lot, "fields", {}) or {})
+    fields["fields[summary][ru]"] = payload.title.strip()
+    fields["fields[desc][ru]"] = payload.description.strip()
+    fields["price"] = str(payload.price)
+    fields["amount"] = str(payload.amount)
+    if payload.active:
+        fields["active"] = "on"
+    else:
+        fields.pop("active", None)
+    result = await fp_call(conn, lambda: conn.account.save_lot(lot_id, fields), "Не удалось сохранить оффер", write=True)
+    saved = getattr(result, "saved", None)
+    if saved is None and isinstance(result, dict):
+        saved = result.get("saved", True)
+    return {"ok": bool(True if saved is None else saved), "lot_id": lot_id}
 
 
 @app.delete("/api/funpay/lots/{lot_id}")
-async def delete_lot(lot_id: int, _: bool = Depends(require_session)) -> dict[str, Any]:
-    _client, account = need_funpay()
-    try:
-        async with FP_LOCK:
-            result = await account.delete_lot(lot_id)
-        return {"ok": bool(getattr(result, "saved", True)), "lot_id": lot_id}
-    except Exception as exc:
-        log.warning("Lot delete failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Не удалось удалить оффер.") from exc
+async def delete_lot(lot_id: int, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    conn = await conn_for(session.owner)
+    result = await fp_call(conn, lambda: conn.account.delete_lot(lot_id), "Не удалось удалить оффер", write=True)
+    saved = getattr(result, "saved", None)
+    return {"ok": bool(True if saved is None else saved), "lot_id": lot_id}
 
 
 @app.post("/api/funpay/lots/raise")
-async def raise_lots(payload: dict[str, Any], _: bool = Depends(require_session)) -> dict[str, Any]:
-    _client, account = need_funpay()
-    raw_ids = payload.get("ids", [])
-    if not isinstance(raw_ids, list) or not raw_ids or len(raw_ids) > 100:
-        raise HTTPException(status_code=422, detail="Выберите от 1 до 100 офферов.")
-    try:
-        ids = [int(i) for i in raw_ids]
-        async with FP_LOCK:
-            result = await account.raise_lots(ids)
-        return clean_model(result)
-    except Exception as exc:
-        log.warning("Lot raise failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Не удалось поднять выбранные офферы. FunPay может ограничивать частоту поднятия.") from exc
+async def raise_lots(payload: RaiseBody, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    conn = await conn_for(session.owner)
+    ids = [int(i) for i in payload.ids]
+    result = await fp_call(conn, lambda: conn.account.raise_lots(ids),
+                           "Не удалось поднять офферы. FunPay может ограничивать частоту поднятия", write=True)
+    return {"ok": True, "result": clean_model(result)}
 
 
+# ---------------------------------------------------------------- chats
 @app.get("/api/funpay/chats")
-async def chats(_: bool = Depends(require_session)) -> list[dict[str, Any]]:
-    _client, account = need_funpay()
-    try:
-        async with FP_LOCK:
-            values = await account.get_chats()
-        return [clean_model(v) for v in values]
-    except Exception as exc:
-        log.warning("Chats read failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Не удалось загрузить чаты FunPay.") from exc
+async def chats(session: SessionInfo = Depends(get_session)) -> list[dict[str, Any]]:
+    conn = await conn_for(session.owner)
+    values = await fp_call(conn, lambda: conn.account.get_chats(), "Не удалось загрузить чаты FunPay")
+    return [normalize_chat(d) for d in _dicts(values)]
 
 
 @app.get("/api/funpay/chats/{chat_id}")
-async def chat_history(chat_id: int, _: bool = Depends(require_session)) -> list[dict[str, Any]]:
-    _client, account = need_funpay()
-    try:
-        async with FP_LOCK:
-            values = await account.get_chat_history(chat_id)
-        remote = [clean_model(v) for v in values or []]
-        init_license_db()
-        with sqlite3.connect(LICENSE_DB_PATH) as db:
-            db.row_factory = sqlite3.Row
-            saved = db.execute(
-                "SELECT message_id,text,author,timestamp,created_at,image_link FROM sent_chat_messages WHERE chat_id=? ORDER BY created_at ASC LIMIT 500",
-                (str(chat_id),),
-            ).fetchall()
-        remote_ids = {str(m.get("id")) for m in remote if isinstance(m, dict) and m.get("id") is not None}
-        for row in saved:
-            mid = str(row["message_id"])
-            if mid in remote_ids:
-                continue
-            remote.append({"id": mid, "chat_id": str(chat_id), "text": row["text"], "author": row["author"] or "Вы",
-                           "author_id": None, "is_incoming": False, "image_link": row["image_link"], "timestamp": row["timestamp"],
-                           "local_confirmed": True})
-        # Keep stable chronological ordering where FunPay exposes numeric message IDs.
-        remote.sort(key=lambda m: (0, int(m.get("id"))) if str(m.get("id", "")).isdigit() else (1, str(m.get("timestamp") or "")))
-        return remote
-    except Exception as exc:
-        log.warning("Chat history read failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Не удалось открыть историю этого чата. Проверьте соединение с FunPay.") from exc
-
-
-def _message_id_from_runner_result(payload: dict[str, Any]) -> tuple[str | None, str | None, dict[str, Any] | None]:
-    response_data = payload.get("response")
-    error_text = None
-    if payload.get("error"):
-        error_text = str(payload.get("msg") or payload.get("error"))[:300]
-    elif isinstance(response_data, dict) and response_data.get("error"):
-        error_text = str(response_data.get("error"))[:300]
-    objects = payload.get("objects") if isinstance(payload.get("objects"), list) else []
-    last_message: dict[str, Any] | None = None
-    for obj in objects:
-        if not isinstance(obj, dict):
+async def chat_messages(chat_id: str, session: SessionInfo = Depends(get_session)) -> list[dict[str, Any]]:
+    conn = await conn_for(session.owner)
+    remote = await chat_history(conn, chat_id, label="Не удалось открыть историю чата")
+    remote_ids = {m["id"] for m in remote if m["id"]}
+    now = now_ts()
+    with db() as dbconn:
+        saved = dbconn.execute(
+            """SELECT message_id,text,author,timestamp,created_at,image_link FROM sent_chat_messages
+               WHERE chat_id=? ORDER BY created_at ASC LIMIT 500""",
+            (str(chat_id),),
+        ).fetchall()
+    merged = list(remote)
+    for row in saved:
+        mid = str(row["message_id"])
+        if mid in remote_ids:
             continue
-        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
-        messages = data.get("messages") if isinstance(data.get("messages"), list) else []
-        if messages:
-            candidate = messages[-1]
-            if isinstance(candidate, dict):
-                last_message = candidate
-    raw_id = last_message.get("id") if last_message else None
-    message_html = str(last_message.get("html") or "") if last_message else ""
-    image_link = None
-    if message_html:
-        try:
-            node = BeautifulSoup(message_html, "html.parser").select_one("a.chat-img-link")
-            if node and node.get("href"):
-                image_link = urljoin("https://funpay.com", node.get("href"))
-        except Exception:
-            pass
-    return (str(raw_id) if raw_id is not None else None, error_text, {"image_link": image_link, "raw": last_message} if last_message else None)
+        local = mid.startswith("local-")
+        age = now - int(row["created_at"])
+        status = "sent" if not local else ("pending" if age < 180 else "unconfirmed")
+        merged.append({"id": mid, "text": row["text"], "author": row["author"] or "Вы", "author_id": None,
+                       "is_incoming": False, "image_link": row["image_link"], "timestamp": row["timestamp"],
+                       "status": status})
+    merged.sort(key=lambda m: (0, int(m["id"])) if m["id"].isdigit() else (1, str(m["timestamp"])))
+    return merged
 
 
-async def send_funpay_runner_message(
-    client: Any,
-    account: Any,
-    chat_id: int,
-    text: str = "",
-    interlocutor_id: int | None = None,
-    image_id: int | None = None,
-    known_message_ids: set[str] | None = None,
-) -> tuple[str, str | None]:
-    """Send through FunPay runner, inspect the acknowledgement, and verify ambiguous responses."""
-    await client.ensure_initialized()
-    node_id: int | str = int(chat_id) if str(chat_id).isdigit() else chat_id
-    data: dict[str, Any] = {"node": node_id, "content": text or ""}
-    if interlocutor_id is not None:
-        data["interlocutor_id"] = int(interlocutor_id)
-    if image_id is not None:
-        data["image_id"] = int(image_id)
-        data["content"] = ""
-    objects = [{"type": "chat_node", "id": node_id, "tag": "00000000",
-                "data": {"node": node_id, "last_message": "", "content": text or ""}}]
-    headers = {"accept": "*/*", "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-               "x-requested-with": "XMLHttpRequest"}
-    actions = ["message_send", "chat_message"]
-    for index, action in enumerate(actions):
-        request_payload = {"action": action, "data": dict(data)}
-        form = {
-            "objects": json.dumps(objects, ensure_ascii=False),
-            "request": json.dumps(request_payload, ensure_ascii=False),
-            "csrf_token": client.csrf_token,
-        }
-        response = await client.post("runner/", data=form, headers=headers, raise_not_200=True)
-        try:
-            raw_payload = response.json()
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail="FunPay вернул некорректный ответ при отправке.") from exc
-        if not isinstance(raw_payload, dict):
-            raise HTTPException(status_code=502, detail="FunPay вернул неожиданный ответ при отправке.")
-        message_id, error_text, message_meta = _message_id_from_runner_result(raw_payload)
-        if error_text:
-            lower_error = error_text.casefold()
-            action_unsupported = any(token in lower_error for token in (
-                "unknown action", "unsupported action", "action not found", "неизвестное действие",
-                "неизвестн", "not implemented", "undefined action",
-            ))
-            if index == 0 and action_unsupported:
-                continue
-            raise HTTPException(status_code=502, detail=f"FunPay отклонил отправку: {error_text}")
-        if message_id and (known_message_ids is None or message_id not in known_message_ids):
-            return message_id, (message_meta or {}).get("image_link")
-        # Some responses omit the sent ID or include the last old message. Match only a new ID.
-        try:
-            history = await account.get_chat_history(chat_id)
-            for candidate in reversed(history or []):
-                item = clean_model(candidate)
-                if not isinstance(item, dict) or item.get("is_incoming", False) or item.get("id") is None:
-                    continue
-                candidate_id = str(item["id"])
-                if known_message_ids is not None and candidate_id in known_message_ids:
-                    continue
-                if image_id is not None:
-                    matched = bool(item.get("image_link"))
-                else:
-                    matched = str(item.get("text") or "").strip() == text.strip()
-                if matched:
-                    return candidate_id, item.get("image_link")
-        except Exception as exc:
-            log.debug("Could not verify FunPay send via history: %s", type(exc).__name__)
-        if index == 0:
-            # No new message was observed: never retry a possibly delivered send and risk duplicates.
-            break
-    raise HTTPException(status_code=502, detail="FunPay не подтвердил отправку. Сообщение не считается отправленным — проверьте чат и повторите попытку.")
+async def _store_sent(conn: FPConn, chat_id: str, text: str, result: dict[str, Any]) -> dict[str, Any]:
+    saved = save_sent_chat_message(chat_id, result.get("message_id"), text, conn.username or "Вы",
+                                   result.get("image_link"))
+    if result.get("verified"):
+        saved["status"] = "sent"
+    return saved
 
 
 @app.post("/api/funpay/chats/{chat_id}/send")
-async def send_chat_message(chat_id: int, payload: MessageBody, _: bool = Depends(require_session)) -> dict[str, Any]:
-    client, account = need_funpay()
-    message_text = payload.text.strip()
-    if not message_text:
+async def send_chat_message(chat_id: str, payload: MessageBody, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    text = payload.text.strip()
+    if not text:
         raise HTTPException(status_code=422, detail="Введите текст сообщения.")
-    if len(message_text) > 4000:
-        raise HTTPException(status_code=422, detail="Сообщение слишком длинное.")
+    conn = await conn_for(session.owner)
     try:
-        async with FP_LOCK:
-            before_history = await account.get_chat_history(chat_id)
-            known_message_ids = {str(clean_model(m).get("id")) for m in before_history or [] if clean_model(m).get("id") is not None}
-            message_id, image_link = await send_funpay_runner_message(client, account, chat_id, message_text, known_message_ids=known_message_ids)
-        profile = FP_PROFILE or {}
-        author = str((profile.get("profile") or {}).get("username") or "Вы")
-        saved_message = save_sent_chat_message(chat_id, message_id, message_text, author, image_link)
-        return {"ok": True, "message_id": str(message_id), "chat_id": str(chat_id), "text": message_text,
-                "author": author, "is_incoming": False, "timestamp": saved_message["timestamp"], "message": saved_message}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.warning("Message send failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="FunPay не подтвердил отправку. Проверьте подключение, откройте чат повторно и попробуйте ещё раз.") from exc
+        known: set[str] | None = {m["id"] for m in await chat_history(conn, chat_id, label=None)}
+    except Exception:
+        known = None  # history unavailable: still send, but skip verification
+    result = await send_runner(conn, chat_id, text, None, known)
+    saved = await _store_sent(conn, chat_id, text, result)
+    return {"ok": True, "verified": bool(result["verified"]), "message": saved}
+
+
+async def _upload_chat_image(conn: FPConn, filename: str, image_bytes: bytes, mime_type: str) -> int:
+    client = conn.client
+
+    async def upload() -> Any:
+        await client.ensure_initialized()
+        await client._throttle()
+        return await client._client.post(
+            "file/addChatImage",
+            data={"file_id": "0"},
+            files={"file": (filename, image_bytes, mime_type)},
+            headers={"accept": "*/*", "x-requested-with": "XMLHttpRequest"},
+        )
+
+    response = await fp_call(conn, upload, "Не удалось загрузить фотографию в FunPay", write=True)
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"FunPay не принял фотографию (HTTP {response.status_code}).")
+    try:
+        upload_data = response.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="FunPay вернул некорректный ответ при загрузке фотографии.")
+    image_id = upload_data.get("fileId") if isinstance(upload_data, dict) else None
+    if image_id is None:
+        detail = str(upload_data.get("msg") or "сервер не вернул fileId") if isinstance(upload_data, dict) else "сервер не вернул fileId"
+        raise HTTPException(status_code=502, detail=f"Не удалось загрузить фотографию в FunPay: {detail[:180]}")
+    return int(image_id)
 
 
 @app.post("/api/funpay/chats/{chat_id}/send-image")
-async def send_chat_image(chat_id: int, payload: ChatPhotoBody, _: bool = Depends(require_session)) -> dict[str, Any]:
-    client, account = need_funpay()
+async def send_chat_image(chat_id: str, payload: ChatPhotoBody, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
     mime_type = (payload.mime_type or "").split(";", 1)[0].strip().lower()
-    allowed_mimes = {"image/jpeg", "image/png", "image/webp", "image/gif"}
-    if mime_type not in allowed_mimes:
+    if mime_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
         raise HTTPException(status_code=415, detail="Поддерживаются изображения JPG, PNG, WEBP и GIF.")
     try:
         image_bytes = base64.b64decode(payload.data, validate=True)
@@ -1283,52 +1607,412 @@ async def send_chat_image(chat_id: int, payload: ChatPhotoBody, _: bool = Depend
     if len(image_bytes) > 8 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Изображение слишком большое. Максимальный размер — 8 МБ.")
     filename = Path(payload.filename.replace("\\", "/")).name[:120] or "photo"
+    conn = await conn_for(session.owner)
     try:
-        async with FP_LOCK:
-            before_history = await account.get_chat_history(chat_id)
-            known_message_ids = {str(clean_model(m).get("id")) for m in before_history or [] if clean_model(m).get("id") is not None}
-            await client.ensure_initialized()
-            await client._throttle()
-            upload_response = await client._client.post(
-                "file/addChatImage",
-                data={"file_id": "0"},
-                files={"file": (filename, image_bytes, mime_type)},
-                headers={"accept": "*/*", "x-requested-with": "XMLHttpRequest"},
-            )
-            if upload_response.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"FunPay не принял фотографию (HTTP {upload_response.status_code}).")
-            try:
-                upload_data = upload_response.json()
-            except Exception as exc:
-                raise HTTPException(status_code=502, detail="FunPay вернул некорректный ответ при загрузке фотографии.") from exc
-            image_id = upload_data.get("fileId") if isinstance(upload_data, dict) else None
-            if image_id is None:
-                safe_detail = str(upload_data.get("msg") or "сервер не вернул fileId") if isinstance(upload_data, dict) else "сервер не вернул fileId"
-                raise HTTPException(status_code=502, detail=f"Не удалось загрузить фотографию в FunPay: {safe_detail[:180]}")
-            message_id, image_link = await send_funpay_runner_message(client, account, chat_id, "", None, int(image_id), known_message_ids)
-        profile = FP_PROFILE or {}
-        author = str((profile.get("profile") or {}).get("username") or "Вы")
-        saved_message = save_sent_chat_message(chat_id, message_id, "", author, image_link)
-        return {"ok": True, "message_id": str(message_id), "chat_id": str(chat_id), "text": "", "image_link": image_link,
-                "author": author, "is_incoming": False, "timestamp": saved_message["timestamp"], "message": saved_message}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.warning("Photo send failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Не удалось отправить фотографию в FunPay. Проверьте тип файла и подключение.") from exc
+        known: set[str] | None = {m["id"] for m in await chat_history(conn, chat_id, label=None)}
+    except Exception:
+        known = None
+    image_id = await _upload_chat_image(conn, filename, image_bytes, mime_type)
+    result = await send_runner(conn, chat_id, "", image_id, known, image_mode=True)
+    saved = await _store_sent(conn, chat_id, "", result)
+    return {"ok": True, "verified": bool(result["verified"]), "message": saved}
 
 
+# ---------------------------------------------------------------- orders
 @app.get("/api/funpay/orders")
-async def orders(limit: int = 50, _: bool = Depends(require_session)) -> list[dict[str, Any]]:
-    _client, account = need_funpay()
+async def orders(limit: int = 50, session: SessionInfo = Depends(get_session)) -> list[dict[str, Any]]:
     limit = min(max(limit, 1), 100)
+    conn = await conn_for(session.owner)
+    values = await fp_call(
+        conn,
+        lambda: conn.account.get_sales(include_paid=True, include_closed=False, include_refunded=False, limit=limit),
+        "Не удалось загрузить заказы FunPay",
+    )
+    return [normalize_order(d) for d in _dicts(values)]
+
+
+# ---------------------------------------------------------------- admin (Telegram admin or dashboard owner)
+@app.get("/api/admin/licenses")
+async def admin_licenses(session: SessionInfo = Depends(get_admin_session)) -> dict[str, Any]:
+    now = now_ts()
+    init_db()
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT license_key,telegram_user_id,plan_id,created_at,expires_at,telegram_payment_charge_id,revoked
+               FROM license_keys ORDER BY created_at DESC LIMIT 200"""
+        ).fetchall()
+    items = [{"key": r["license_key"], "telegram_user_id": r["telegram_user_id"] or None, "plan_id": r["plan_id"],
+              "created_at": r["created_at"], "expires_at": r["expires_at"], "revoked": bool(r["revoked"]),
+              "active": bool(not r["revoked"] and (r["expires_at"] is None or int(r["expires_at"]) > now)),
+              "payment_id": r["telegram_payment_charge_id"]} for r in rows]
+    return {"total": len(items), "items": items}
+
+
+@app.post("/api/admin/licenses")
+async def admin_create_license(payload: AdminLicenseCreateBody, session: SessionInfo = Depends(get_admin_session)) -> dict[str, Any]:
+    if payload.duration not in ADMIN_LICENSE_DURATIONS:
+        raise HTTPException(status_code=422, detail="Выберите срок из списка.")
+    return create_admin_license(payload.duration, payload.telegram_user_id)
+
+
+@app.post("/api/admin/licenses/revoke")
+async def admin_revoke_license(payload: AdminRevokeBody, session: SessionInfo = Depends(get_admin_session)) -> dict[str, bool]:
+    init_db()
+    with db() as conn:
+        cursor = conn.execute("UPDATE license_keys SET revoked = 1 WHERE license_key = ? COLLATE NOCASE", (payload.key.strip(),))
+        changed = cursor.rowcount
+    if not changed:
+        raise HTTPException(status_code=404, detail="Ключ не найден.")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- notifications out of the web app
+TG_APP: Any = None
+TG_BOT: Any = None
+
+
+async def _tg_text(chat_id: int, text: str) -> None:
+    bot = TG_BOT
+    if bot is None or not chat_id:
+        return
     try:
-        async with FP_LOCK:
-            values = await account.get_sales(include_paid=True, include_closed=False, include_refunded=False, limit=limit)
-        return [clean_model(v) for v in values]
+        await bot.send_message(chat_id=chat_id, text=text[:3800])
     except Exception as exc:
-        log.warning("Orders read failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Не удалось загрузить заказы FunPay.") from exc
+        log.warning("Telegram message could not be delivered: %s", type(exc).__name__)
+
+
+def _emit_chat(conn: FPConn, chat: dict[str, Any], author: str, body: str) -> None:
+    push_notification(conn.owner, "chat", chat["name"], f"{author}: {body}", chat_id=chat["id"])
+    if conn.owner == "admin":
+        asyncio.create_task(_tg_text(ADMIN_TELEGRAM_ID, f"💬 Новое сообщение в FunPay\n"
+                                                        f"Чат: {chat['name']}\n{author}: {body}\n"
+                                                        f"Чат ID: {chat['id']}"))
+
+
+async def _notify_chat(conn: FPConn, chat: dict[str, Any], previous_id: str) -> None:
+    incoming: list[dict[str, Any]] = []
+    try:
+        for message in await chat_history(conn, chat["id"], label=None):
+            if not message["is_incoming"]:
+                continue
+            if previous_id.isdigit() and message["id"].isdigit() and int(message["id"]) <= int(previous_id):
+                continue
+            incoming.append(message)
+    except Exception:
+        incoming = []
+    if incoming:
+        for message in incoming[-2:]:
+            body = message["text"] or ("[изображение]" if message["image_link"] else "Сообщение без текста")
+            _emit_chat(conn, chat, message["author"] or chat["name"], str(body)[:500])
+    elif chat["last_message_text"] and chat["last_message_author"].casefold() != conn.username.casefold():
+        _emit_chat(conn, chat, chat["last_message_author"] or chat["name"], str(chat["last_message_text"])[:500])
+
+
+async def _poll_sales(conn: FPConn) -> None:
+    values = await fp_call(
+        conn,
+        lambda: conn.account.get_sales(include_paid=True, include_closed=False, include_refunded=False, limit=20),
+        None, timeout=12, retries=0,
+    )
+    sales = [normalize_order(d) for d in _dicts(values)]
+    if not conn.sale_baseline:
+        conn.sale_seen = {str(s["id"]) for s in sales}
+        conn.sale_baseline = True
+        return
+    fresh = [s for s in sales if str(s["id"]) not in conn.sale_seen]
+    for sale in fresh:
+        conn.sale_seen.add(str(sale["id"]))
+    if len(conn.sale_seen) > 800:
+        conn.sale_seen = set(list(conn.sale_seen)[-400:])
+    for sale in fresh[:5]:
+        text = f"{sale['title']} · {sale['price']} {sale['currency']} · покупатель {sale['buyer_username'] or '—'}"
+        push_notification(conn.owner, "order", f"Новый заказ #{sale['id']}", text)
+        if conn.owner == "admin":
+            asyncio.create_task(_tg_text(ADMIN_TELEGRAM_ID, f"🛒 Новый заказ #{sale['id']}\n{text}"))
+
+
+async def poll_connection(conn: FPConn) -> None:
+    conn.tick += 1
+    values = await fp_call(conn, lambda: conn.account.get_chats(), None, timeout=12, retries=0)
+    chats = [normalize_chat(d) for d in _dicts(values)]
+    previous = dict(conn.chat_seen)
+    changed: list[tuple[dict[str, Any], str]] = []
+    for chat in chats:
+        current = (chat["last_message_id"], chat["last_message_text"])
+        old = previous.get(chat["id"])
+        if conn.chat_baseline and chat["last_message_text"]:
+            if old is None and chat["last_message_author"].casefold() != conn.username.casefold():
+                changed.append((chat, ""))
+            elif old is not None and old != current:
+                changed.append((chat, old[0]))
+        conn.chat_seen[chat["id"]] = current
+    conn.chat_baseline = True
+    for chat, previous_id in changed[:3]:
+        await _notify_chat(conn, chat, previous_id)
+    if conn.tick % 3 == 1:
+        await _poll_sales(conn)
+
+
+async def poll_loop() -> None:
+    """Background watcher: chat messages and orders for every recently used FunPay connection."""
+    while True:
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        now = time.time()
+        for owner, conn in list(FP_CONNS.items()):
+            if conn.closed:
+                continue
+            if now - conn.last_used > IDLE_CONNECTION_SECONDS:
+                log.info("Closing idle FunPay connection")
+                await close_owner(owner)
+                continue
+            try:
+                await poll_connection(conn)
+            except FunPayError:
+                if time.time() - conn.error_notified_at > 600:
+                    conn.error_notified_at = time.time()
+                    push_notification(owner, "error", "FunPay временно не отвечает",
+                                      "Панель повторит проверку автоматически.")
+            except Exception as exc:
+                log.warning("Poll step skipped: %s", type(exc).__name__)
+
+
+async def expiry_loop() -> None:
+    """Telegram message when a key expires, once per key."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            init_db()
+            with db() as conn:
+                rows = conn.execute(
+                    """SELECT license_key, telegram_user_id FROM license_keys
+                       WHERE expiry_notified = 0 AND revoked = 0 AND expires_at IS NOT NULL
+                       AND expires_at <= ? AND telegram_user_id > 0 LIMIT 20""",
+                    (now_ts(),),
+                ).fetchall()
+                for row in rows:
+                    conn.execute("UPDATE license_keys SET expiry_notified = 1 WHERE license_key = ?",
+                                 (row["license_key"],))
+            for row in rows:
+                await _tg_text(int(row["telegram_user_id"]),
+                               f"⏰ Срок вашего ключа (…{row['license_key'][-6:]}) истёк.\n"
+                               "Получите новый ключ через /start.")
+        except Exception as exc:
+            log.warning("Expiry check skipped: %s", type(exc).__name__)
+
+
+def _ping(url: str) -> None:
+    with urllib.request.urlopen(url, timeout=20) as response:
+        response.read(200)
+
+
+async def keepalive_loop() -> None:
+    """Self-ping so a free Render instance does not sleep between visits."""
+    if not RENDER_EXTERNAL_URL:
+        return
+    url = f"{RENDER_EXTERNAL_URL}/api/health"
+    while True:
+        await asyncio.sleep(KEEPALIVE_SECONDS)
+        try:
+            await asyncio.to_thread(_ping, url)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- Telegram bot
+async def _start_telegram(app_: FastAPI) -> Any:
+    global TG_APP, TG_BOT
+    from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, MenuButtonWebApp,
+                          Update, WebAppInfo)
+    from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, MessageHandler,
+                              PreCheckoutQueryHandler, filters)
+
+    tg_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    async def start_command(update: Any, context: Any) -> None:
+        caption = (
+            "<b>FunPay Lister</b>\n"
+            "Офферы, поиск по каталогу, чаты и заказы в одной панели.\n\n"
+            "Начните с FREE PLAN (30 минут) или оформите ключ за Telegram Stars."
+        )
+        target = public_url()
+        keyboard = [
+            [InlineKeyboardButton("Получить секретный ключ FREE PLAN", callback_data="license:free")],
+            [InlineKeyboardButton("Купить ключ по лучшей цене!", callback_data="license:buy")],
+        ]
+        if target.startswith("https://"):
+            keyboard.append([InlineKeyboardButton("Открыть панель", web_app=WebAppInfo(url=target))])
+        else:
+            keyboard.append([InlineKeyboardButton("Открыть панель", url=target)])
+        markup = InlineKeyboardMarkup(keyboard)
+        image_path = BASE_DIR / "a_sleek_dark_futuristic_cyber_neon_ui_welcome_s.png"
+        message = update.effective_message
+        if image_path.is_file():
+            with image_path.open("rb") as photo:
+                await message.reply_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=markup)
+        else:
+            await message.reply_text(caption, parse_mode="HTML", reply_markup=markup)
+
+    async def license_callback(update: Any, context: Any) -> None:
+        query = update.callback_query
+        await query.answer()
+        user = update.effective_user
+        if not user:
+            return
+        if query.data == "license:free":
+            key, created, activated = claim_free_license(user.id)
+            if created:
+                state = ("✅ <b>Ваш FREE PLAN ключ создан</b>",
+                         "Срок: <b>30 минут</b>. Отсчёт начнётся при первом входе в панель, "
+                         "после чего доступ закроется автоматически.")
+            elif activated:
+                state = ("ℹ️ <b>Ваш FREE PLAN ключ</b>",
+                         "Бесплатные 30 минут уже использованы. Оформите ключ за Stars, чтобы продолжить.")
+            else:
+                state = ("ℹ️ <b>Ваш FREE PLAN ключ</b>",
+                         "Ключ ещё не активирован: 30 минут начнутся при первом входе в панель.")
+            text = (f"{state[0]}\n\n<code>{html.escape(key)}</code>\n\n{state[1]}\n"
+                    "Бесплатный ключ выдаётся один раз на Telegram-аккаунт. Сохраните его в безопасном месте.")
+            await query.message.reply_text(text, parse_mode="HTML")
+            return
+        if query.data == "license:buy":
+            rows = [[InlineKeyboardButton(f"{p['title']} · {p['stars']} ⭐", callback_data=f"license:plan:{pid}")]
+                    for pid, p in STAR_PLANS.items()]
+            await query.message.reply_text("<b>Выберите срок ключа</b>\nОплата проходит внутри Telegram в Stars.",
+                                           parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+            return
+        if query.data.startswith("license:plan:"):
+            plan_id = query.data.rsplit(":", 1)[-1]
+            plan = STAR_PLANS.get(plan_id)
+            if not plan:
+                await query.message.reply_text("Этот тариф больше недоступен. Откройте /start и выберите снова.")
+                return
+            payload = f"license:{plan_id}:{user.id}:{secrets.token_urlsafe(8)}"
+            await context.bot.send_invoice(
+                chat_id=update.effective_chat.id,
+                title=f"Ключ — {plan['title']}",
+                description=f"Лицензионный ключ на срок: {plan['title']}.",
+                payload=payload,
+                provider_token="",
+                currency="XTR",
+                prices=[LabeledPrice(label=f"Ключ на {plan['title']}", amount=int(plan["stars"]))],
+            )
+
+    async def pre_checkout(update: Any, context: Any) -> None:
+        query = update.pre_checkout_query
+        try:
+            payload = query.invoice_payload.split(":")
+            valid = len(payload) == 4 and payload[0] == "license" and payload[1] in STAR_PLANS and int(payload[2]) == query.from_user.id
+            if valid:
+                await query.answer(ok=True)
+            else:
+                await query.answer(ok=False, error_message="Платёж не прошёл проверку. Создайте новый счёт через /start.")
+        except Exception:
+            await query.answer(ok=False, error_message="Не удалось проверить оплату. Попробуйте ещё раз.")
+
+    async def successful_payment(update: Any, context: Any) -> None:
+        payment = update.effective_message.successful_payment
+        try:
+            payload = payment.invoice_payload.split(":")
+            if len(payload) != 4 or payload[0] != "license":
+                raise ValueError("invalid payment payload")
+            plan_id, buyer_id = payload[1], int(payload[2])
+            user = update.effective_user
+            if user is None or user.id != buyer_id or plan_id not in STAR_PLANS:
+                raise ValueError("payment user mismatch")
+            key, expires, _created = issue_paid_license(user.id, plan_id, payment.telegram_payment_charge_id)
+            plan = STAR_PLANS[plan_id]
+            caption = ("✅ <b>Оплата прошла успешно!</b>\n\n"
+                       f"Тариф: <b>{plan['title']}</b> · <b>{plan['stars']} ⭐</b>\n"
+                       f"Ваш ключ: <code>{html.escape(key)}</code>\n"
+                       f"Действует: <b>{format_expiry(expires)}</b>\n\n"
+                       "Скопируйте и сохраните ключ.")
+            await update.effective_message.reply_text(caption, parse_mode="HTML")
+        except Exception as exc:
+            log.exception("Could not issue purchased key: %s", type(exc).__name__)
+            await update.effective_message.reply_text(
+                "Оплата получена, но автоматическая выдача ключа не завершилась. Напишите администратору и укажите ID платежа: "
+                + html.escape(getattr(payment, "telegram_payment_charge_id", "unknown")),
+                parse_mode="HTML",
+            )
+
+    tg_app.add_handler(CommandHandler("start", start_command))
+    tg_app.add_handler(CallbackQueryHandler(license_callback, pattern=r"^license:"))
+    tg_app.add_handler(PreCheckoutQueryHandler(pre_checkout))
+    tg_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    await tg_app.initialize()
+    await tg_app.start()
+    TG_APP, TG_BOT = tg_app, tg_app.bot
+    app_.state.telegram_app = tg_app
+    if RENDER_EXTERNAL_URL.startswith("https://"):
+        await tg_app.bot.set_webhook(url=f"{RENDER_EXTERNAL_URL}/telegram/webhook", secret_token=WEBHOOK_SECRET,
+                                     allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+        try:
+            await tg_app.bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="Lister", web_app=WebAppInfo(url=RENDER_EXTERNAL_URL)))
+        except Exception:
+            pass
+        log.info("Telegram webhook configured")
+    else:
+        await tg_app.bot.delete_webhook(drop_pending_updates=True)
+        await tg_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        log.info("Telegram polling started")
+    return tg_app
+
+
+async def _bootstrap_admin_account() -> None:
+    try:
+        await connect_owner("admin", FUNPAY_GOLDEN_KEY_ENV, FUNPAY_USER_AGENT_DEFAULT)
+        log.info("Owner FunPay account connected from FUNPAY_GOLDEN_KEY")
+    except Exception as exc:
+        log.warning("FUNPAY_GOLDEN_KEY auto-connect failed: %s", type(exc).__name__)
+
+
+@asynccontextmanager
+async def lifespan(app_: FastAPI):
+    global TG_APP, TG_BOT
+    init_db()
+    load_catalog_cache()
+    tasks = [
+        asyncio.create_task(poll_loop(), name="fp-poll"),
+        asyncio.create_task(expiry_loop(), name="fp-expiry"),
+        asyncio.create_task(keepalive_loop(), name="fp-keepalive"),
+    ]
+    if TELEGRAM_BOT_TOKEN:
+        try:
+            await _start_telegram(app_)
+        except Exception as exc:
+            log.exception("Telegram bot initialization failed: %s", type(exc).__name__)
+            TG_APP = TG_BOT = None
+    else:
+        log.warning("TELEGRAM_BOT_TOKEN is not set; the web panel still starts.")
+    if FUNPAY_GOLDEN_KEY_ENV and not FP_CONNS.get("admin") and not load_fp_account("admin"):
+        tasks.append(asyncio.create_task(_bootstrap_admin_account(), name="fp-bootstrap"))
+    if not DASHBOARD_PASSWORD:
+        log.warning("DASHBOARD_PASSWORD is not set; sign-in works with license keys only.")
+    try:
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if TG_APP is not None:
+            try:
+                if TG_APP.updater and TG_APP.updater.running:
+                    await TG_APP.updater.stop()
+                await TG_APP.stop()
+                await TG_APP.shutdown()
+            except Exception as exc:
+                log.warning("Telegram shutdown issue: %s", type(exc).__name__)
+            TG_APP = TG_BOT = None
+        for owner in list(FP_CONNS):
+            await close_owner(owner)
+
+
+app.router.lifespan_context = lifespan
 
 
 @app.post("/telegram/webhook")
@@ -1337,354 +2021,165 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
         raise HTTPException(status_code=404, detail="Telegram bot is disabled")
     if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
-    # The Application object is held by lifespan so imports and startup remain optional.
     tg_app = getattr(app.state, "telegram_app", None)
     if tg_app is None:
         raise HTTPException(status_code=503, detail="Telegram bot is not ready")
     from telegram import Update
+
     update = Update.de_json(await request.json(), tg_app.bot)
     await tg_app.process_update(update)
     return {"ok": True}
 
 
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline' https://telegram.org; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; "
+    "img-src 'self' data: blob: https:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+    "form-action 'self'; frame-ancestors 'none'"
+)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
-    return HTMLResponse(HTML_PAGE, headers={"Cache-Control": "no-store"})
+    return HTMLResponse(HTML_PAGE, headers={
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": CONTENT_SECURITY_POLICY,
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+    })
 
 
-# Frontend is embedded to keep the project deployable as one Python service.
+# The interface is embedded so the project stays a single deployable file.
 HTML_PAGE = r'''<!doctype html>
-<html lang="ru" data-theme="dark">
+<html lang="ru">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<meta name="theme-color" content="#101018"><meta name="description" content="FunPay Auto Lister Bot — управление офферами, чатами и заказами">
-<title>FunPay Auto Lister</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#070708">
+<meta name="robots" content="noindex,nofollow">
+<title>FunPay Lister</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
 <style>
-:root{color-scheme:dark;--bg:#0c0c13;--panel:#12121d;--panel2:#171724;--panel3:#1d1d2b;--text:#f4f4fb;--muted:#9696ad;--line:rgba(255,255,255,.085);--line2:rgba(255,255,255,.15);--accent:#9672ff;--accent2:#6f9cff;--good:#4cd6a0;--warn:#f6c768;--bad:#ff7188;--r:17px;--shadow:0 24px 70px rgba(0,0,0,.28);--ease:cubic-bezier(.2,.8,.2,1)}
-*{box-sizing:border-box}html,body{width:100vw;height:100dvh;margin:0;overflow:hidden}body{font-family:'DM Sans',system-ui,sans-serif;background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased}button,input,textarea,select{font:inherit;color:inherit}button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}input,textarea,select{outline:none}button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}::selection{background:#9672ff55}::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{border-radius:20px;background:#ffffff1d;border:2px solid transparent;background-clip:padding-box}::-webkit-scrollbar-thumb:hover{background:#ffffff35;background-clip:padding-box}
-body:before{content:'';position:fixed;inset:-22%;z-index:-1;pointer-events:none;background:radial-gradient(45% 36% at 8% 4%,#6540b42b,transparent 75%),radial-gradient(45% 35% at 95% 4%,#246dba1c,transparent 75%),radial-gradient(45% 30% at 62% 105%,#8f42b31a,transparent 80%)}
-.hidden{display:none!important}.app{height:100dvh;display:grid;grid-template-columns:248px minmax(0,1fr);grid-template-rows:68px minmax(0,1fr);grid-template-areas:'side top' 'side main';overflow:hidden}.sidebar{grid-area:side;display:flex;flex-direction:column;gap:26px;padding:22px 14px 16px;background:rgba(14,14,23,.94);border-right:1px solid var(--line);min-height:0;overflow:auto;z-index:40}.brand{display:flex;align-items:center;gap:12px;padding:0 10px 22px;border-bottom:1px solid var(--line)}.brand-mark{width:38px;height:38px;display:grid;place-items:center;border-radius:12px;background:linear-gradient(145deg,#a18aff,#5c67ce);box-shadow:0 8px 24px #7d63ff36;color:#fff}.brand-mark svg{width:24px;height:24px}.brand-title{font:800 13px/1.2 Manrope,sans-serif;letter-spacing:.09em}.brand-sub{font-size:11px;color:var(--muted);margin-top:5px;letter-spacing:.11em}.nav-label{padding:0 12px 7px;color:#68687f;font-size:10px;font-weight:700;letter-spacing:.16em;text-transform:uppercase}.nav{display:flex;flex-direction:column;gap:5px}.nav-item{position:relative;display:flex;align-items:center;gap:13px;width:100%;padding:12px 13px;border:1px solid transparent;border-radius:12px;background:transparent;color:#a5a5b9;text-align:left;transition:background .2s,color .2s,transform .2s}.nav-item:hover{background:#ffffff08;color:#fff;transform:translateX(2px)}.nav-item.active{background:linear-gradient(100deg,#8e6dff26,#6964e90b);border-color:#9672ff23;color:#fff}.nav-item.active:before{content:'';position:absolute;left:-14px;top:22%;height:56%;width:3px;border-radius:3px;background:var(--accent);box-shadow:0 0 14px #9672ffb3}.nav-item svg{width:18px;height:18px;stroke:currentColor;stroke-width:1.7;fill:none;flex:none}.nav-item .label{font-size:13px;font-weight:600;flex:1}.badge{min-width:21px;height:21px;padding:0 6px;border-radius:7px;display:inline-grid;place-items:center;background:#ffffff0b;color:#acacc0;font-size:10px}.sidebar-bottom{margin-top:auto;display:grid;gap:12px}.connection-card{padding:13px;border:1px solid var(--line);border-radius:13px;background:linear-gradient(140deg,#ffffff08,#ffffff02)}.connection-top{display:flex;align-items:center;gap:9px;font-size:12px;font-weight:600}.status-dot{width:7px;height:7px;border-radius:50%;background:#77778a;box-shadow:0 0 0 4px #77778a15;flex:none}.status-dot.on{background:var(--good);box-shadow:0 0 0 4px #4cd6a01a}.status-dot.off{background:var(--bad);box-shadow:0 0 0 4px #ff71881a}.connection-sub{font-size:11px;color:var(--muted);margin:8px 0 0 16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.side-footer{font-size:10px;color:#67677e;padding:0 11px;letter-spacing:.06em}
-.topbar{grid-area:top;display:flex;align-items:center;gap:15px;padding:0 25px;border-bottom:1px solid var(--line);background:#0e0e16a8;backdrop-filter:blur(22px);z-index:30}.mobile-menu{display:none}.crumb{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:12px}.crumb strong{color:#eeeef7;font-weight:600}.top-spacer{flex:1}.live-label{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted);padding:8px 11px;border:1px solid var(--line);border-radius:10px;background:#ffffff04}.live-label .status-dot{width:6px;height:6px}.top-actions{display:flex;align-items:center;gap:8px}.icon-btn{width:38px;height:38px;display:grid;place-items:center;border-radius:11px;border:1px solid var(--line);background:#ffffff06;color:#c7c7d6;transition:background .2s,transform .15s,border-color .2s}.icon-btn:hover{background:#ffffff10;border-color:var(--line2);transform:translateY(-1px)}.icon-btn svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.7}.user-chip{display:flex;align-items:center;gap:9px;margin-left:4px;padding-left:13px;border-left:1px solid var(--line)}.user-avatar{width:32px;height:32px;display:grid;place-items:center;border-radius:10px;background:linear-gradient(140deg,#7d5ee4,#4b75cb);font-size:10px;font-weight:800;letter-spacing:.08em}.user-name{max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:600}.user-caption{font-size:10px;color:var(--muted);margin-top:2px}
-.main{grid-area:main;min-width:0;min-height:0;overflow:auto;padding:14px clamp(13px,1.7vw,25px) 22px;scroll-behavior:smooth}.page{max-width:1450px;margin:0 auto;animation:page-in .32s var(--ease) both}.page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:25px}.eyebrow{color:#a38aff;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.17em;margin-bottom:8px}.h1{font:800 clamp(24px,2.4vw,32px)/1.15 Manrope,sans-serif;letter-spacing:-.045em;margin:0}.page-desc{color:var(--muted);font-size:13px;margin-top:9px}.actions{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:39px;padding:0 14px;border:1px solid var(--line);border-radius:11px;background:#ffffff06;color:#ececf7;font-size:12px;font-weight:700;white-space:nowrap;transition:transform .15s,background .2s,border-color .2s,box-shadow .2s}.btn:hover{transform:translateY(-1px);background:#ffffff0c;border-color:var(--line2)}.btn:active{transform:scale(.98)}.btn svg{width:15px;height:15px;stroke:currentColor;stroke-width:1.8;fill:none}.btn-primary{border-color:#9672ff88;background:linear-gradient(120deg,#936fff,#6e72e8);box-shadow:0 10px 28px #7658ea26;color:white}.btn-primary:hover{background:linear-gradient(120deg,#a085ff,#7d83fa);box-shadow:0 12px 30px #7658ea38}.btn-danger{border-color:#ff718830;background:#ff718812;color:#ff8d9f}.btn-small{min-height:32px;padding:0 10px;font-size:11px;border-radius:9px}.btn-quiet{background:transparent}.grid{display:grid;gap:15px}.stats-grid{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:17px}.stat-card{position:relative;min-width:0;overflow:hidden;padding:19px;border-radius:16px;border:1px solid var(--line);background:linear-gradient(145deg,#181824e8,#12121bd9);box-shadow:0 12px 36px #0000000b}.stat-card:after{content:'';position:absolute;right:-30px;top:-40px;width:110px;height:110px;border-radius:50%;background:radial-gradient(circle,#9672ff27,transparent 70%);pointer-events:none}.stat-header{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:11px;font-weight:600}.stat-icon{width:29px;height:29px;display:grid;place-items:center;background:#9672ff16;border:1px solid #9672ff1c;border-radius:9px;color:#ad98ff}.stat-icon svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.7}.stat-value{font:800 clamp(24px,2.3vw,32px)/1.1 Manrope,sans-serif;letter-spacing:-.04em;margin-top:18px;overflow:hidden;text-overflow:ellipsis}.stat-foot{margin-top:8px;font-size:11px;color:#85859d}.stat-foot strong{color:var(--good);font-weight:600}.two-col{grid-template-columns:minmax(0,1.25fr) minmax(300px,.75fr)}.panel{min-width:0;border:1px solid var(--line);border-radius:16px;background:#14141ee6;box-shadow:0 15px 45px #0000000b;overflow:hidden}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:17px 19px;border-bottom:1px solid var(--line)}.panel-title{font:700 13px Manrope,sans-serif}.panel-sub{font-size:11px;color:var(--muted);margin-top:5px}.panel-body{padding:18px}.quick-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.quick-card{display:flex;align-items:center;gap:12px;min-height:76px;text-align:left;padding:14px;border:1px solid var(--line);border-radius:13px;background:#ffffff03;transition:background .2s,border-color .2s,transform .2s}.quick-card:hover{background:#9672ff0d;border-color:#9672ff44;transform:translateY(-2px)}.quick-ico{width:36px;height:36px;display:grid;place-items:center;border-radius:11px;background:#9672ff16;color:#b3a2ff;flex:none}.quick-ico svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.7}.quick-title{font-size:12px;font-weight:700}.quick-text{margin-top:5px;color:var(--muted);font-size:10px}.activity{display:grid;gap:0}.activity-row{display:flex;align-items:flex-start;gap:11px;padding:13px 0;border-bottom:1px solid var(--line)}.activity-row:last-child{border-bottom:0}.activity-mark{margin-top:4px;width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px #9672ff14;flex:none}.activity-title{font-size:12px;font-weight:600}.activity-note{font-size:10px;color:var(--muted);margin-top:4px;line-height:1.5}
-.form-layout{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(270px,.7fr);gap:16px}.form-card{padding:21px}.section-label{color:#a9a9bc;font-size:10px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;margin-bottom:15px}.field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px}.field{display:grid;gap:7px;min-width:0}.field.full{grid-column:1/-1}.field label{color:#b8b8ca;font-size:11px;font-weight:600}.field input,.field textarea,.field select{width:100%;min-width:0;border:1px solid #ffffff13;background:#0e0e17;border-radius:10px;padding:11px 12px;font-size:12px;color:#f4f4fb;transition:border-color .2s,box-shadow .2s}.field input,.field select{height:42px}.field textarea{min-height:112px;resize:vertical;line-height:1.55}.field input:focus,.field textarea:focus,.field select:focus{border-color:#9672ff93;box-shadow:0 0 0 3px #9672ff17}.field input::placeholder,.field textarea::placeholder{color:#626278}.field select option{background:#13131e;color:#fff}.field-hint{color:#797990;font-size:10px;line-height:1.5}.mode-switch{display:flex;gap:4px;width:max-content;max-width:100%;padding:4px;background:#0d0d16;border:1px solid var(--line);border-radius:12px;margin-bottom:20px}.mode-switch button{padding:9px 16px;border-radius:8px;border:0;background:transparent;color:var(--muted);font-size:11px;font-weight:700}.mode-switch button.active{background:#28223e;color:#c5b7ff;box-shadow:inset 0 0 0 1px #9672ff29}.preview-box{height:100%;padding:20px;border-radius:15px;border:1px solid #9672ff21;background:radial-gradient(100% 60% at 100% 0%,#9672ff15,transparent 70%),#10101a}.preview-icon{width:45px;height:45px;display:grid;place-items:center;border-radius:13px;background:#9672ff18;color:#b6a2ff;margin-bottom:23px}.preview-icon svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.6}.preview-title{font:800 17px/1.3 Manrope,sans-serif;overflow-wrap:anywhere}.preview-desc{font-size:11px;color:var(--muted);margin-top:9px;line-height:1.65;overflow-wrap:anywhere;white-space:pre-wrap}.preview-divider{height:1px;background:var(--line);margin:18px 0}.preview-line{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:7px 0;color:var(--muted);font-size:11px}.preview-line strong{color:#f0f0fa;font-weight:700}.preview-price{font:800 25px Manrope,sans-serif;color:#b8a6ff;margin-top:5px}.notice{padding:12px 14px;border:1px solid #9672ff23;background:#9672ff0b;border-radius:11px;color:#b9b3d4;font-size:11px;line-height:1.6}.toolbar{display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:13px 15px;border-bottom:1px solid var(--line)}.toolbar .field-inline{display:flex;align-items:center;gap:7px}.toolbar label{font-size:10px;color:var(--muted)}.toolbar select,.toolbar input{height:36px;min-width:130px;border:1px solid var(--line);border-radius:9px;background:#0d0d16;padding:0 10px;font-size:11px}.toolbar input{min-width:200px}.toolbar-spacer{flex:1}.table-wrap{width:100%;overflow:auto}table{width:100%;border-collapse:collapse;min-width:680px}th{padding:12px 15px;text-align:left;color:#7f7f97;text-transform:uppercase;letter-spacing:.1em;font-size:9px;font-weight:800;border-bottom:1px solid var(--line);white-space:nowrap}td{padding:13px 15px;border-bottom:1px solid #ffffff09;font-size:11px;color:#c9c9d9;vertical-align:middle}tbody tr:hover{background:#ffffff04}tbody tr:last-child td{border-bottom:0}.cell-main{font-size:11px;font-weight:700;color:#ededf8;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cell-sub{font-size:10px;color:var(--muted);margin-top:4px}.price{font-weight:800;color:#c3b2ff;font-variant-numeric:tabular-nums}.pill{display:inline-flex;align-items:center;gap:6px;padding:5px 8px;border-radius:7px;background:#ffffff08;border:1px solid var(--line);font-size:9px;color:#b5b5c9;white-space:nowrap}.pill.good{color:var(--good);background:#4cd6a00b;border-color:#4cd6a022}.pill.warn{color:var(--warn);background:#f6c7680b;border-color:#f6c76822}.pill.bad{color:var(--bad);background:#ff71880b;border-color:#ff718822}.empty-state{display:grid;place-items:center;text-align:center;min-height:220px;padding:30px;color:var(--muted)}.empty-state svg{width:31px;height:31px;stroke:#8a7cba;fill:none;stroke-width:1.5;margin-bottom:13px}.empty-state strong{font:700 13px Manrope,sans-serif;color:#deddec}.empty-state p{max-width:340px;line-height:1.6;font-size:11px}.empty-state .btn{margin-top:6px}
-.chat-layout{display:grid;grid-template-columns:minmax(230px,.72fr) minmax(0,1.28fr);min-height:min(650px,calc(100dvh - 220px))}.chat-sidebar{border-right:1px solid var(--line);min-width:0}.chat-list{overflow:auto;max-height:620px}.chat-item{display:flex;width:100%;gap:11px;text-align:left;padding:14px;border:0;border-bottom:1px solid #ffffff09;background:transparent}.chat-item:hover,.chat-item.active{background:#9672ff0e}.chat-item.active{box-shadow:inset 2px 0 var(--accent)}.chat-avatar{width:34px;height:34px;display:grid;place-items:center;flex:none;border-radius:11px;background:#28243b;color:#bdb0ff;font-size:11px;font-weight:800}.chat-meta{min-width:0;flex:1}.chat-name{font-size:11px;font-weight:700;display:flex;justify-content:space-between;gap:5px}.chat-preview{font-size:10px;color:var(--muted);margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.unread{border-radius:8px;background:#9672ff30;color:#c6b9ff;padding:2px 5px;font-size:9px}.chat-main{min-width:0;display:flex;flex-direction:column}.chat-main-head{padding:15px 17px;border-bottom:1px solid var(--line)}.chat-messages{flex:1;min-height:280px;max-height:540px;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:10px}.message{max-width:min(80%,490px);padding:10px 12px;border-radius:12px;background:#20202d;border:1px solid #ffffff09;font-size:11px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}.message.outgoing{align-self:flex-end;background:#30284a;border-color:#9672ff21}.message-meta{font-size:9px;color:#8d8da3;margin-top:5px}.chat-composer{display:flex;gap:8px;padding:13px;border-top:1px solid var(--line)}.chat-composer input{min-width:0;flex:1;height:40px;border-radius:10px;border:1px solid var(--line);background:#0d0d16;padding:0 12px;font-size:11px}.chat-composer input:focus{border-color:#9672ff83}
-.settings-grid{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(260px,.8fr);gap:16px}.settings-card{padding:21px}.settings-card h3{font:700 14px Manrope,sans-serif;margin:0 0 6px}.settings-card>p{color:var(--muted);font-size:11px;line-height:1.65;margin:0 0 20px}.settings-field{margin-top:14px}.settings-foot{margin-top:16px;display:flex;gap:9px;align-items:center;flex-wrap:wrap}.security-note{padding:14px;border:1px solid #f6c76823;background:#f6c76808;border-radius:12px;color:#c9b98d;font-size:10px;line-height:1.6}.toggle-row{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:15px 0;border-bottom:1px solid var(--line)}.toggle-row:last-child{border-bottom:0}.toggle-label{font-size:12px;font-weight:700}.toggle-help{font-size:10px;color:var(--muted);margin-top:4px}.switch{position:relative;width:39px;height:23px;flex:none}.switch input{opacity:0;width:0;height:0}.switch span{position:absolute;inset:0;border-radius:20px;background:#444455;transition:background .2s}.switch span:before{content:'';position:absolute;left:3px;top:3px;width:17px;height:17px;border-radius:50%;background:#fff;transition:transform .2s}.switch input:checked+span{background:#8869ed}.switch input:checked+span:before{transform:translateX(16px)}
-#login-view{position:fixed;inset:0;display:grid;place-items:center;padding:20px;overflow:auto;background:radial-gradient(55% 45% at 20% 15%,#7653d927,transparent 75%),radial-gradient(55% 45% at 90% 90%,#336bd31d,transparent 75%),#0c0c13;z-index:500} .login-card{width:min(430px,100%);padding:32px;border:1px solid #ffffff17;border-radius:23px;background:#151520eb;box-shadow:0 35px 110px #0008;animation:pop .45s var(--ease) both}.login-brand{display:flex;align-items:center;gap:12px;margin-bottom:28px}.login-symbol{width:47px;height:47px;display:grid;place-items:center;border-radius:15px;background:linear-gradient(140deg,#a18aff,#5f6ed5);box-shadow:0 12px 35px #8768ff36}.login-symbol svg{width:27px;height:27px;stroke:#fff;fill:none;stroke-width:1.6}.login-title{font:800 22px/1.2 Manrope,sans-serif;letter-spacing:-.035em;margin:0}.login-sub{font-size:12px;color:var(--muted);margin-top:7px;line-height:1.6}.login-field{margin-top:23px}.login-field label{display:block;color:#b9b9cd;font-size:11px;font-weight:700;margin-bottom:8px}.login-field input{width:100%;height:46px;padding:0 13px;border-radius:11px;border:1px solid var(--line2);background:#0d0d16;font-size:13px}.login-card .btn{width:100%;height:45px;margin-top:13px}.login-note{font-size:10px;color:#77778f;line-height:1.6;margin-top:16px;text-align:center}.login-error{font-size:11px;color:var(--bad);margin-top:10px;min-height:16px}
-.toast-stack{position:fixed;right:17px;top:80px;width:min(350px,calc(100vw - 34px));z-index:1000;display:grid;gap:9px;pointer-events:none}.toast{display:flex;align-items:flex-start;gap:10px;padding:12px 13px;border-radius:13px;background:#1c1c29f2;border:1px solid #ffffff17;border-left:3px solid var(--accent);box-shadow:var(--shadow);font-size:11px;line-height:1.55;animation:toast-in .28s var(--ease) both;pointer-events:auto}.toast.ok{border-left-color:var(--good)}.toast.error{border-left-color:var(--bad)}.toast.warn{border-left-color:var(--warn)}.toast button{border:0;background:none;color:#8f8fa5;font-size:16px;margin-left:auto;padding:0 2px}.scrim{display:none;position:fixed;inset:0;background:#0008;backdrop-filter:blur(3px);z-index:35}.loading{opacity:.65;pointer-events:none}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:10px;color:var(--muted)}
-/* Requested cross-browser fullscreen control. */
-#fs{position:fixed;top:12px;right:12px;z-index:9999;width:38px;height:38px;border:1px solid rgba(255,255,255,.15);border-radius:11px;background:rgba(20,20,28,.78);backdrop-filter:blur(12px) saturate(160%);color:#fff;font-size:18px;cursor:pointer;transition:transform .15s,background .15s;display:grid;place-items:center}#fs:hover{background:rgba(40,40,55,.9);transform:scale(1.05)}#fs:active{transform:scale(.95)}body.is-fs{cursor:none}body.is-fs #fs{cursor:pointer}.topbar{padding-right:62px}
-@keyframes page-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}@keyframes pop{from{opacity:0;transform:translateY(10px) scale(.985)}to{opacity:1;transform:none}}@keyframes toast-in{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
-@media(max-width:1120px){.stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.two-col{grid-template-columns:1fr}.form-layout,.settings-grid{grid-template-columns:1fr}.preview-box{min-height:320px}.app{grid-template-columns:225px minmax(0,1fr)}}
-@media(max-width:780px){.app{grid-template-columns:minmax(0,1fr);grid-template-rows:60px minmax(0,1fr);grid-template-areas:'top' 'main'}.sidebar{position:fixed;left:0;top:0;bottom:0;width:min(285px,86vw);transform:translateX(-105%);transition:transform .28s var(--ease);box-shadow:var(--shadow)}.sidebar.open{transform:translateX(0)}.scrim.show{display:block}.mobile-menu{display:grid}.topbar{padding:0 13px 0 13px;padding-right:59px;gap:10px}.crumb{display:none}.live-label{display:none}.user-chip{display:none}.main{padding:21px 13px 28px}.page-head{align-items:flex-start;flex-direction:column;margin-bottom:20px}.page-head>.actions{width:100%}.page-head>.actions .btn{flex:1}.chat-layout{grid-template-columns:minmax(125px,.68fr) minmax(0,1.32fr)}.chat-item{padding:11px 8px;gap:7px}.chat-avatar{width:29px;height:29px}.chat-name{font-size:10px}.chat-preview{font-size:9px}.chat-main-head{padding:12px}.chat-messages{padding:11px;min-height:240px}.message{max-width:92%}.panel-head{padding:14px}.panel-body{padding:14px}.toolbar{padding:11px}.toolbar input{min-width:140px;flex:1}.toolbar .field-inline{flex:1}.toolbar-spacer{display:none}}
-@media(max-width:520px){.stats-grid{gap:9px}.stat-card{padding:13px}.stat-value{margin-top:13px;font-size:23px}.stat-header{font-size:10px;gap:7px}.stat-icon{width:25px;height:25px}.stat-foot{font-size:9px}.quick-grid{grid-template-columns:1fr}.quick-card{min-height:65px}.field-grid{grid-template-columns:1fr}.field.full{grid-column:auto}.form-card,.settings-card{padding:15px}.chat-layout{grid-template-columns:1fr;min-height:520px}.chat-sidebar{border-right:0;border-bottom:1px solid var(--line)}.chat-list{display:flex;overflow-x:auto;max-height:none}.chat-item{min-width:165px;border-right:1px solid var(--line);border-bottom:0}.chat-messages{min-height:235px}.mode-switch{width:100%}.mode-switch button{flex:1}.login-card{padding:24px}.h1{font-size:25px}}
-@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.001ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.001ms!important}}
-
-/* V3 polish: crisp outlines, subtle motion, stable touch viewport, generated profile portraits */
-:root{--line:rgba(190,177,255,.13);--line2:rgba(190,177,255,.25)}
-@keyframes glow-breathe{0%,100%{box-shadow:0 0 0 1px #9d83ff12,0 8px 22px #7d63ff0a}50%{box-shadow:0 0 0 1px #9d83ff2d,0 8px 28px #7d63ff1c}}
-.panel,.stat-card,.preview-box,.settings-card,.form-card{border-color:rgba(178,157,255,.14);transition:border-color .24s ease,box-shadow .24s ease,transform .24s ease}
-.panel:hover,.stat-card:hover{border-color:rgba(178,157,255,.25);box-shadow:0 18px 50px #00000018}
-.btn-primary{position:relative;overflow:hidden}
-.btn-primary:after{content:'';position:absolute;inset:0;transform:translateX(-130%);background:linear-gradient(105deg,transparent 25%,#ffffff30 48%,transparent 72%);transition:transform .65s ease;pointer-events:none}
-.btn-primary:hover:after{transform:translateX(130%)}
-.chat-avatar,.user-avatar{position:relative;overflow:hidden;border-radius:14px;border:1px solid #ffffff24;box-shadow:0 5px 18px #0003;isolation:isolate}
-.chat-avatar img,.user-avatar img{width:100%;height:100%;display:block;object-fit:cover;border-radius:inherit}
-.nav-item.active{box-shadow:inset 0 0 0 1px #a990ff10,0 5px 19px #7d63ff08}
-input,textarea,select{touch-action:pan-y}
-html,body,#app{overscroll-behavior:none;touch-action:pan-x pan-y}
-button,.nav-item,.chat-item,.quick-card{ -webkit-tap-highlight-color:transparent; }
-.license-timer{display:flex;align-items:center;gap:7px;padding:8px 10px;border:1px solid #6fceab35;border-radius:10px;background:#4cd6a00a;color:#9ce8cb;font-size:10px;font-weight:800;white-space:nowrap;letter-spacing:.02em}
-.license-timer:before{content:'';width:6px;height:6px;border-radius:50%;background:#4cd6a0;box-shadow:0 0 10px #4cd6a080;animation:timer-pulse 1.8s ease infinite}
-@keyframes timer-pulse{50%{opacity:.45;box-shadow:0 0 2px #4cd6a040}}
-.catalog-search-panel{margin:0 0 17px;padding:18px;border:1px solid #9672ff38;border-radius:17px;background:linear-gradient(115deg,#211b36e8,#13131ee8 58%,#142034cc);box-shadow:0 12px 35px #0002;position:relative;overflow:visible}
-.catalog-search-top{display:flex;align-items:center;gap:12px;margin-bottom:12px}.catalog-search-symbol{display:grid;place-items:center;width:38px;height:38px;flex:none;border-radius:13px;background:linear-gradient(145deg,#a18aff,#5c6fe2);box-shadow:0 6px 22px #8c72ff45}.catalog-search-symbol svg{width:18px;height:18px;stroke:white;fill:none;stroke-width:1.8}.catalog-search-title{font:800 14px Manrope,sans-serif}.catalog-search-sub{font-size:10px;color:var(--muted);margin-top:4px}.catalog-search-wrap{position:relative}.catalog-search-input{height:47px;width:100%;padding:0 15px 0 43px;border-radius:13px;border:1px solid #a48cff40;background:#0d0d18cc;font-size:13px;box-shadow:inset 0 1px 0 #ffffff08;transition:border-color .2s,box-shadow .2s}.catalog-search-input:focus{border-color:#a48cff9c;box-shadow:0 0 0 3px #9672ff1d}.catalog-search-wrap:before{content:'⌕';position:absolute;left:15px;top:7px;font-size:25px;line-height:30px;color:#b7a4ff;pointer-events:none}.catalog-results{display:grid;gap:6px;margin-top:10px;max-height:260px;overflow:auto}.catalog-result{display:flex;align-items:center;gap:11px;width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:11px;background:#ffffff05;text-align:left;transition:background .15s,border-color .15s,transform .15s}.catalog-result:hover{background:#9672ff13;border-color:#9672ff55;transform:translateX(2px)}.catalog-result-ico{width:31px;height:31px;display:grid;place-items:center;border-radius:10px;background:#9672ff1c;color:#b7a4ff;font-size:12px;font-weight:800;flex:none}.catalog-result-main{min-width:0;flex:1}.catalog-result-name{font-size:12px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.catalog-result-path{font-size:10px;color:var(--muted);margin-top:4px}.catalog-result-arrow{color:#a893ff;font-size:18px}
-.admin-key-table code{font-size:10px;white-space:nowrap}.license-status{display:inline-flex;padding:5px 8px;border-radius:8px;font-size:10px;font-weight:800}.license-status.active{color:#85e4bd;background:#4cd6a014;border:1px solid #4cd6a031}.license-status.expired{color:#ff9aaa;background:#ff718812;border:1px solid #ff71882c}
-@media(max-width:860px){.license-timer{padding:7px 8px;font-size:9px}.catalog-search-panel{padding:14px}}
-@media(max-width:600px){.license-timer{max-width:100px;overflow:hidden;text-overflow:ellipsis}.license-timer:before{display:none}.topbar{gap:7px;padding:0 10px}.live-label{display:none}.user-chip{padding-left:7px}.user-caption{display:none}.user-name{max-width:72px}.top-actions{gap:5px}.icon-btn{width:32px;height:32px}.catalog-search-title{font-size:12px}.catalog-search-sub{font-size:9px}}
-@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.01ms!important}}
-
-/* V4 — neon workspace concept (variant 2): compact spacing, glass edges, animated accent rails. */
-
-/* Compact trend lines echo the selected second concept without introducing fake historical statistics. */
-.stat-card{padding-bottom:48px}.stat-card:before{content:'';position:absolute;right:13px;bottom:15px;width:92px;height:28px;opacity:.78;pointer-events:none;background-repeat:no-repeat;background-size:100% 100%;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 30'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop stop-color='%2379d7ff' stop-opacity='.28'/%3E%3Cstop offset='1' stop-color='%2379d7ff' stop-opacity='0'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M0 26 L13 21 L24 23 L35 14 L48 19 L61 8 L71 12 L83 4 L100 2 L100 30 L0 30 Z' fill='url(%23g)'/%3E%3Cpath d='M0 26 L13 21 L24 23 L35 14 L48 19 L61 8 L71 12 L83 4 L100 2' stroke='%2379d7ff' stroke-width='1.8' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")}
-.stat-card:nth-child(2):before{filter:hue-rotate(42deg)}.stat-card:nth-child(3):before{filter:hue-rotate(120deg)}.stat-card:nth-child(4):before{filter:hue-rotate(220deg)}
-@media(max-width:520px){.stat-card{padding-bottom:42px}.stat-card:before{width:72px;height:23px;bottom:12px}}
-
-:root{--bg:#090a12;--panel:#111322;--panel2:#171a30;--panel3:#20243c;--text:#f7f7ff;--muted:#a2a7c3;--line:rgba(156,150,255,.17);--line2:rgba(167,156,255,.34);--accent:#8b5cf6;--accent2:#45c8ff;--r:18px;--shadow:0 24px 68px #02030b70}
-body:before{background:radial-gradient(42% 38% at 4% 0%,#7845ff30,transparent 76%),radial-gradient(38% 34% at 100% 8%,#1c8dff22,transparent 78%),radial-gradient(34% 30% at 60% 100%,#a12cff1c,transparent 80%);animation:ambient-shift 22s ease-in-out infinite alternate}
-@keyframes ambient-shift{from{transform:translate3d(-1%,0,0) scale(1)}to{transform:translate3d(1%,1%,0) scale(1.035)}}
-.brand-mark,.login-symbol,.catalog-search-symbol{background:linear-gradient(135deg,#8d5bff,#4c75ff 58%,#28c7ff);box-shadow:0 8px 26px #704fff40}
-.nav-item.active{background:linear-gradient(105deg,#7546ff38,#2789ff12);border-color:#906dff48;box-shadow:inset 0 0 0 1px #d5caff09,0 7px 25px #784cff12}
-.nav-item.active:before{background:linear-gradient(180deg,#a855f7,#40c6ff);box-shadow:0 0 17px #8b5cf6b0}
-.btn-primary{border-color:#9b7aff9c;background:linear-gradient(115deg,#8b5cf6,#6545d8 56%,#4278ef);box-shadow:0 8px 26px #6948e53b}
-.btn-primary:hover{background:linear-gradient(115deg,#a074ff,#7354e8 56%,#518bff)}
-.panel,.stat-card,.form-card,.settings-card,.preview-box{border-color:rgba(150,145,255,.19);background:linear-gradient(145deg,#16192beF,#101321f5);box-shadow:0 14px 38px #02030b2a}
-.panel{position:relative}
-.panel:before{content:'';position:absolute;inset:0 18% auto;height:1px;background:linear-gradient(90deg,transparent,#a48bff75,#40c6ff55,transparent);pointer-events:none;opacity:.65}
-.stat-card{background:linear-gradient(145deg,#171a30ef,#101321ee)}
-.stat-card:after{background:radial-gradient(circle,#7651ff30,transparent 70%)}
-.stat-icon,.quick-ico,.catalog-result-ico{background:linear-gradient(145deg,#8e5fff28,#31bfff15);border-color:#9c85ff2a;color:#bbaaff}
-.catalog-search-panel{border-color:#9877ff55;background:linear-gradient(115deg,#21183cef,#12172bf2 59%,#112439e8);box-shadow:0 15px 40px #0003,0 0 34px #6b48ff12}
-.catalog-search-input{border-color:#8c7cff56;background:#0a0e1cdd}
-.catalog-search-input:focus{border-color:#a78bfa;box-shadow:0 0 0 3px #8b5cf626,0 0 22px #7c5cff1b}
-.license-timer{max-width:none;border-color:#6e60c45f;background:linear-gradient(100deg,#6c45ee1d,#238ac01a);color:#d6caff;box-shadow:inset 0 0 0 1px #ffffff04}
-.license-timer:before{background:#61d9ff;box-shadow:0 0 10px #61d9ffb0}
-.chat-item.active{border-color:#9878ff5c;background:linear-gradient(100deg,#784dff24,#258bff10)}
-.chat-avatar,.user-avatar{border-radius:50%;border-color:#9b8aff50;box-shadow:0 0 0 2px #8b5cf619,0 6px 18px #0005}
-input:focus,textarea:focus,select:focus{border-color:#9878ffb3!important;box-shadow:0 0 0 3px #8b5cf61a}
-#fs{background:linear-gradient(135deg,#8b5cf6,#377ff3);box-shadow:0 8px 25px #744dff52}
-#page-admin{width:100%}.admin-create-panel{margin-bottom:16px}.admin-create-panel .panel-body{padding:20px}.admin-created{display:flex;align-items:center;gap:10px;flex-wrap:wrap;border:1px solid #4cd6a048;background:#4cd6a00d;padding:12px 14px;border-radius:12px}.admin-created code{font-size:12px;font-weight:800;letter-spacing:.035em;color:#aff5d9;overflow-wrap:anywhere}.admin-create-panel .field-hint{line-height:1.5}
-.stat-value{font-size:clamp(23px,2vw,30px)}.page-head{margin-bottom:21px}
-@media(min-width:1100px){.main{padding-left:clamp(20px,2vw,31px);padding-right:clamp(20px,2vw,31px)}.two-col{grid-template-columns:minmax(0,1.2fr) minmax(310px,.8fr)}}
-@media(max-width:860px){.license-timer{max-width:185px;font-size:9px;white-space:normal;line-height:1.25}.admin-create-panel .field-grid{grid-template-columns:1fr}}
-@media(max-width:600px){.license-timer{max-width:145px;padding:6px 7px;font-size:8px;white-space:normal}.license-timer:before{display:block;flex:none}.topbar{gap:6px}.user-chip{gap:5px}.user-avatar{width:29px;height:29px}.admin-create-panel .panel-body{padding:14px}.admin-create-panel .settings-foot{align-items:stretch;flex-direction:column}}
-/* Variant 2 dashboard: recent chats, plan rail, and a compact timer progress strip. */
-.dashboard-lower{grid-template-columns:minmax(0,1.13fr) minmax(280px,.87fr);margin-top:15px;align-items:stretch}
-.dashboard-chat-panel,.dashboard-access-panel{min-width:0}
-.dashboard-chat-list{display:grid;gap:0;padding:6px 14px 10px;min-height:180px}
-.dashboard-chat-row{width:100%;min-width:0;display:flex;align-items:center;gap:11px;text-align:left;padding:11px 5px;border:0;border-bottom:1px solid var(--line);background:transparent;cursor:pointer;transition:background .18s,transform .18s;border-radius:10px}
-.dashboard-chat-row:last-child{border-bottom:0}.dashboard-chat-row:hover{background:#8b5cf612;transform:translateX(2px)}
-.dashboard-chat-copy{display:flex;flex-direction:column;min-width:0;flex:1;gap:5px}.dashboard-chat-copy b{font-size:12px;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dashboard-chat-copy small{font-size:10px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
-.dashboard-chat-time{font-size:9px;color:#858ba8;white-space:nowrap}.dashboard-plan-list{display:grid;gap:2px}
-.dashboard-plan-row{display:grid;grid-template-columns:8px 74px minmax(0,1fr) auto;gap:8px;align-items:center;padding:9px 9px;border:1px solid transparent;border-radius:10px;font-size:11px;transition:background .18s,border-color .18s}
-.dashboard-plan-row:hover{background:#8b5cf60d;border-color:#8b5cf626}.plan-dot{width:7px;height:7px;border-radius:50%;background:linear-gradient(140deg,#b58bff,#46d5ff);box-shadow:0 0 10px #8b5cf650}.dashboard-plan-row b{font-size:11px;color:#e5dfff}.dashboard-plan-row>span:nth-of-type(2){color:var(--muted)}.plan-availability{font-size:9px;color:#8fe5c3;background:#46d6a012;border:1px solid #46d6a01d;border-radius:7px;padding:4px 6px}
-.dashboard-access-footer{display:flex;align-items:center;gap:9px;margin-top:11px;padding:12px 10px;border:1px solid #8b5cf625;border-radius:12px;background:linear-gradient(100deg,#8b5cf610,#31bfff08);font-size:10px;line-height:1.45;color:var(--muted)}.access-lock{display:grid;place-items:center;flex:none;width:28px;height:28px;border-radius:9px;background:#8b5cf61b;color:#c4b4ff;font-size:17px}.dashboard-admin-btn{width:100%;margin-top:10px;justify-content:space-between}
-.license-timer{position:relative;display:flex;flex-direction:column;align-items:stretch;gap:5px;min-width:155px;padding:7px 10px;border-radius:11px;white-space:normal;font-size:9px;line-height:1.2}
-.license-timer:before{position:absolute;left:10px;top:11px;margin:0}.license-timer .license-timer-line{display:block;padding-left:13px;font-weight:800;white-space:nowrap}.license-progress{display:block;overflow:hidden;height:3px;border-radius:99px;background:#b7b2ff18}.license-progress i{display:block;height:100%;width:100%;border-radius:99px;background:linear-gradient(90deg,#a855f7,#477dff,#4bd4ff);box-shadow:0 0 10px #8b5cf666;transition:width .6s linear}
-@media(max-width:1100px){.dashboard-lower{grid-template-columns:1fr}.dashboard-chat-list{min-height:0}}
-@media(max-width:600px){.dashboard-plan-row{grid-template-columns:7px 65px minmax(0,1fr) auto;gap:6px;padding:8px 6px}.license-timer{min-width:0;max-width:142px;font-size:8px;padding:6px 7px}.license-timer:before{left:7px;top:9px}.license-timer .license-timer-line{padding-left:10px}}
-
-/* V4 workspace layout, matched to the second reference: outline panels and a three-rail dashboard. */
-.dashboard-v2-grid{display:grid;grid-template-columns:minmax(0,1.62fr) minmax(164px,.48fr) minmax(220px,.67fr) minmax(196px,.61fr);gap:12px;align-items:stretch;max-width:none}
-.dashboard-search-v2{grid-column:1;grid-row:1;min-width:0;border:1px solid #8270ee52;background:linear-gradient(125deg,#21183ced,#12172bf5 58%,#112439ed);box-shadow:0 14px 34px #05051038,0 0 0 1px #7a5bff0c}
-.dashboard-search-v2 .panel-body{padding:16px}.dashboard-search-heading{display:flex;align-items:center;gap:11px;margin-bottom:13px}.dashboard-search-orb{width:38px;height:38px;border:1px solid #ab95ff3c;border-radius:12px;display:grid;place-items:center;background:linear-gradient(145deg,#8b5cf641,#2b97f527);box-shadow:0 7px 20px #704fff28;color:#d2c9ff;flex:none}.dashboard-search-orb svg{width:20px;height:20px;stroke:currentColor;stroke-width:1.5;fill:none}.dashboard-game-search{display:flex;align-items:center;gap:8px}.dashboard-game-search input{height:44px;min-width:0;flex:1;border:1px solid #8b7cff48;border-radius:11px;background:#090e1add;padding:0 13px;font-size:11px;box-shadow:inset 0 1px 0 #ffffff07}.dashboard-game-search .btn{height:44px;min-height:44px}.dashboard-game-chips{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:11px}.dashboard-game-chips>span{font-size:9px;color:var(--muted);margin-right:2px}.game-chip{height:28px;padding:0 9px;border:1px solid #ffffff12;border-radius:9px;background:#ffffff06;color:#b6bdd9;font-size:9px;white-space:nowrap}.game-chip:hover{background:#8b5cf625;border-color:#8b5cf65c;color:#fff}.dashboard-catalog-results{display:grid;gap:5px;margin-top:10px;max-height:220px;overflow:auto}.dashboard-catalog-results .catalog-result{padding:8px 10px}.dashboard-quick-v2{grid-column:2;grid-row:1;min-width:0}.dashboard-quick-v2 .panel-head{padding:14px 12px 10px}.dashboard-quick-v2 .panel-title{font-size:11px}.dashboard-quick-v2 .panel-sub{font-size:9px}.dashboard-quick-body{display:grid;gap:9px;padding:10px}.quick-action-v2{display:flex;align-items:center;gap:9px;width:100%;min-height:65px;padding:10px 9px;text-align:left;border:1px solid #9d99ff1a;border-radius:12px;background:linear-gradient(145deg,#ffffff09,#ffffff03);color:#eeedff;transition:transform .16s,border-color .2s,background .2s}.quick-action-v2:hover{transform:translateY(-1px);border-color:#9d88ff66;background:#8b5cf618}.quick-action-v2.primary{background:linear-gradient(125deg,#946dff,#6858dd 65%,#496eea);border-color:#a997ff80;box-shadow:0 8px 22px #7659fa31}.quick-action-v2>span:last-child{display:grid;gap:4px;min-width:0}.quick-action-v2 b{font-size:10px;line-height:1.25}.quick-action-v2 small{font-size:9px;line-height:1.2;color:#b8b9d8}.quick-action-v2.primary small{color:#e4dcff}.quick-action-icon{display:grid;place-items:center;width:31px;height:31px;flex:none;border-radius:9px;background:#0b112633;border:1px solid #ffffff22}.quick-action-icon svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
-.dashboard-stats-v2{grid-column:1 / span 2;grid-row:2;gap:10px;margin:0}.dashboard-stats-v2 .stat-card{padding:14px 13px 39px;border-radius:14px;min-height:105px}.dashboard-stats-v2 .stat-value{margin-top:9px;font-size:25px}.dashboard-stats-v2 .stat-header{font-size:10px}.dashboard-stats-v2 .stat-icon{width:27px;height:27px}.dashboard-stats-v2 .stat-foot{margin-top:5px;font-size:9px}.dashboard-activity-v2{grid-column:1 / span 2;grid-row:3;min-width:0}.dashboard-activity-v2 .panel-head{padding:13px 15px}.dashboard-activity-list{padding:3px 15px 9px}.dashboard-activity-row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #ffffff0b;min-width:0}.dashboard-activity-row:last-child{border-bottom:0}.dashboard-activity-row .activity-mark{width:8px;height:8px;border-radius:50%;flex:none;box-shadow:0 0 11px currentColor}.dashboard-activity-row>div{display:grid;gap:4px;min-width:0;flex:1}.dashboard-activity-row b{font-size:10px}.dashboard-activity-row small{font-size:9px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.activity-state{font-size:8px;padding:4px 6px;border:1px solid #ffffff14;border-radius:7px;color:#aeb1d3;white-space:nowrap}.activity-state.good{color:#85e4bd;border-color:#4cd6a02e;background:#4cd6a00c}
-.dashboard-chat-v2{grid-column:3;grid-row:1 / span 3;min-width:0;display:flex;flex-direction:column;align-self:stretch}.dashboard-chat-v2 .panel-head{padding:15px 13px}.dashboard-chat-v2 .dashboard-chat-list{padding:6px 11px 10px;flex:1}.dashboard-chat-v2 .dashboard-chat-row{gap:8px;padding:11px 3px}.dashboard-chat-v2 .chat-avatar{width:31px;height:31px}.dashboard-chat-v2 .dashboard-chat-copy b{font-size:10px}.dashboard-chat-v2 .dashboard-chat-copy small{font-size:9px}.dashboard-chat-footer{display:flex;align-items:center;gap:7px;padding:11px 13px;border-top:1px solid var(--line);color:var(--muted);font-size:9px}.dashboard-access-v2{grid-column:4;grid-row:1 / span 3;min-width:0}.dashboard-access-v2 .panel-head{padding:14px 12px}.dashboard-access-v2 .panel-title{font-size:11px}.dashboard-access-v2 .panel-sub{font-size:9px}.dashboard-access-v2 .panel-body{padding:10px}.dashboard-crown{width:30px;height:30px;display:grid;place-items:center;border-radius:10px;background:#facd4c14;color:#f2cc62}.dashboard-crown svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.7}.dashboard-admin-btn{margin:0 0 12px;min-height:35px;width:100%;justify-content:space-between;font-size:10px}.dashboard-access-caption{font-size:10px;font-weight:800;padding:7px 2px 5px;border-top:1px solid var(--line);margin-top:3px;color:#dcdaf3}.dashboard-plan-row{grid-template-columns:7px 52px minmax(0,1fr);gap:6px;padding:9px 3px;font-size:9px}.dashboard-plan-row .plan-availability{display:none}.dashboard-plan-row b{font-size:9px}.dashboard-access-footer{font-size:9px;padding:9px 7px;margin-top:9px}.dashboard-access-footer .access-lock{width:23px;height:23px;font-size:14px}
-.chat-composer{align-items:center}.chat-attach-btn{flex:none;width:39px;height:40px}.chat-composer input[type=text],.chat-composer input:not([type]){height:40px}.chat-composer #chat-send{height:40px;min-height:40px;padding:0 12px;gap:7px}.chat-composer #chat-send svg{width:14px;height:14px}.chat-image-preview{display:flex;align-items:center;gap:10px;padding:10px 14px;border-top:1px solid var(--line);background:#0d0f1b}.chat-image-preview img{width:52px;height:52px;object-fit:cover;border-radius:9px;border:1px solid #a58bff55}.chat-image-preview .preview-file-name{font-size:10px;color:#d9d7f5;min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chat-image-preview button{width:26px;height:26px;border-radius:8px;border:1px solid #ff718838;background:#ff718812;color:#ff9ca9}.message-image{display:block;max-width:min(100%,280px);max-height:300px;object-fit:contain;border-radius:9px;margin-top:3px}.message.pending{opacity:.78}.message.send-failed{border-color:#ff71885c}.dashboard-search-v2 .panel-body{position:relative}.dashboard-search-v2:before{z-index:1}
-@media(max-width:1250px){.dashboard-v2-grid{grid-template-columns:minmax(0,1.45fr) minmax(155px,.5fr) minmax(210px,.72fr)}.dashboard-access-v2{grid-column:1 / span 3;grid-row:4}.dashboard-access-v2 .panel-body{display:grid;grid-template-columns:1fr 2fr;gap:12px}.dashboard-access-caption{grid-column:1 / -1}.dashboard-access-v2 .dashboard-plan-list{grid-column:1 / -1;grid-template-columns:repeat(3,minmax(0,1fr))}.dashboard-access-footer{grid-column:1 / -1}.dashboard-admin-btn{grid-column:1 / -1}}
-@media(max-width:920px){.dashboard-v2-grid{grid-template-columns:minmax(0,1fr) minmax(210px,.7fr)}.dashboard-search-v2{grid-column:1;grid-row:1}.dashboard-quick-v2{grid-column:2;grid-row:1}.dashboard-stats-v2{grid-column:1 / span 2;grid-row:2}.dashboard-activity-v2{grid-column:1 / span 2;grid-row:3}.dashboard-chat-v2{grid-column:1;grid-row:4}.dashboard-access-v2{grid-column:2;grid-row:4}.dashboard-access-v2 .panel-body{display:block}.dashboard-access-v2 .dashboard-plan-list{display:grid;grid-template-columns:1fr}.dashboard-chat-v2 .dashboard-chat-list{min-height:150px}}
-@media(max-width:620px){.dashboard-v2-grid{grid-template-columns:minmax(0,1fr);gap:10px}.dashboard-search-v2,.dashboard-quick-v2,.dashboard-stats-v2,.dashboard-activity-v2,.dashboard-chat-v2,.dashboard-access-v2{grid-column:1;grid-row:auto}.dashboard-stats-v2{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-stats-v2 .stat-card{min-height:100px}.dashboard-quick-body{grid-template-columns:1fr}.dashboard-access-v2 .dashboard-plan-list{grid-template-columns:repeat(2,minmax(0,1fr))}.dashboard-plan-row{grid-template-columns:7px 48px minmax(0,1fr)}.dashboard-game-search{gap:6px}.dashboard-game-search input{font-size:10px;padding:0 8px}.dashboard-game-search .btn{padding:0 9px;font-size:10px}.dashboard-game-chips{gap:5px}.game-chip{padding:0 7px}.chat-composer{gap:6px;padding:9px}.chat-composer #chat-send{padding:0 9px;font-size:10px}.chat-attach-btn{width:36px;height:38px}}
-
-</style>
-</head>
-<body>
-<button id="fs" title="Полный экран (F)" aria-label="Полный экран">⛶</button>
-<div id="login-view">
-  <div class="login-card">
-    <div class="login-brand"><div class="login-symbol" id="login-mark"></div><div><h1 class="login-title">FunPay Auto Lister</h1><div class="brand-sub">CONTROL PANEL · V2</div></div></div>
-    <div class="eyebrow">ПАНЕЛЬ УПРАВЛЕНИЯ</div><div style="font:800 26px/1.22 Manrope,sans-serif;letter-spacing:-.04em">С возвращением</div>
-    <div class="login-sub">Войдите по ключу доступа, паролю администратора или откройте Mini App из Telegram для автоматического входа администратора.</div>
-    <form id="login-form"><div class="login-field"><label for="login-password">Пароль панели или лицензионный ключ</label><input id="login-password" type="password" autocomplete="current-password" placeholder="FREE PLAN / лицензионный ключ / пароль"></div><button class="btn btn-primary" type="submit">Войти в панель <span aria-hidden="true">→</span></button><div class="login-error" id="login-error"></div></form>
-    <div class="login-note">Ключ FREE PLAN/покупки вводится сюда. Администратор с Telegram ID 8357023784 входит автоматически внутри Telegram.</div>
-  </div>
-</div>
-<div class="scrim" id="scrim"></div>
-<div class="app hidden" id="app">
-  <aside class="sidebar" id="sidebar">
-    <div class="brand"><div class="brand-mark" id="brand-mark"></div><div><div class="brand-title">FUNPAY LISTER</div><div class="brand-sub">AUTO LISTING SYSTEM</div></div></div>
-    <div><div class="nav-label">Меню</div><nav class="nav" id="nav">
-      <button class="nav-item active" data-page="dashboard"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span class="label">Главная</span></button>
-      <button class="nav-item" data-page="lister"><svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h11M4 19h16"/><circle cx="19" cy="12" r="2"/></svg><span class="label">Auto Lister</span><span class="badge">NEW</span></button>
-      <button class="nav-item" data-page="search"><svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><span class="label">Поиск офферов</span></button>
-      <button class="nav-item" data-page="listings"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/><path d="M3 4h18v16H3z"/></svg><span class="label">Мои офферы</span><span class="badge" id="offers-badge">—</span></button>
-      <button class="nav-item" data-page="chats"><svg viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-6.5A7.5 7.5 0 1 1 20 11.5Z"/><path d="M8 10h8M8 13.5h5"/></svg><span class="label">Сообщения</span><span class="badge" id="chats-badge">—</span></button>
-      <button class="nav-item" data-page="orders"><svg viewBox="0 0 24 24"><path d="M7 3h10l3 4v14H4V7z"/><path d="M4 7h16M8 12h8M8 16h6"/></svg><span class="label">Заказы</span></button>
-      <button class="nav-item hidden" data-page="admin" id="admin-nav"><svg viewBox="0 0 24 24"><path d="M12 3 20 6v5c0 5-3.3 8-8 10-4.7-2-8-5-8-10V6z"/><path d="m8.5 12 2.3 2.3 4.7-5"/></svg><span class="label">Админ-панель</span><span class="badge">ROOT</span></button>
-      <button class="nav-item" data-page="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="m19.4 15 .1.1 1.1 1.8-1.8 3.1-2.1-.5a8 8 0 0 1-1.7 1l-.6 2h-3.6l-.6-2a8 8 0 0 1-1.7-1l-2.1.5-1.8-3.1 1.1-1.8a8 8 0 0 1 0-2l-1.1-1.8 1.8-3.1 2.1.5a8 8 0 0 1 1.7-1l.6-2h3.6l.6 2a8 8 0 0 1 1.7 1l2.1-.5 1.8 3.1-1.1 1.8a8 8 0 0 1 0 2Z" transform="translate(-1 -1) scale(1.08)"/></svg><span class="label">Настройки</span></button>
-    </nav></div>
-    <div class="sidebar-bottom"><div class="connection-card"><div class="connection-top"><span class="status-dot off" id="side-dot"></span><span id="side-status">FunPay не подключён</span></div><div class="connection-sub" id="side-account">Откройте настройки аккаунта</div></div><div class="side-footer">FUNPAY AUTO LISTER <span id="version">· 4.0.0</span></div></div>
-  </aside>
-  <header class="topbar"><button class="icon-btn mobile-menu" id="menu-toggle" aria-label="Открыть меню"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button><div class="crumb"><span>FunPay Auto Lister</span><span>/</span><strong id="crumb-label">Главная</strong></div><div class="top-spacer"></div><div class="live-label"><span class="status-dot" id="top-dot"></span><span id="top-status">Нет подключения</span></div><div class="license-timer" id="license-timer" title="Оставшееся время ключа">Ключ · проверка</div><div class="top-actions"><button class="icon-btn" id="sound-btn" title="Звуки уведомлений" aria-label="Звуки уведомлений"><svg viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15 9a4 4 0 0 1 0 6M17.5 6.5a7.5 7.5 0 0 1 0 11"/></svg></button><button class="icon-btn" id="refresh-btn" title="Обновить данные" aria-label="Обновить"><svg viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.5 9A7 7 0 0 1 18 6l2 6M4 12l2 6a7 7 0 0 0 12.5-3"/></svg></button><div class="user-chip"><div class="user-avatar" id="user-avatar">FP</div><div><div class="user-name" id="user-name">Панель</div><div class="user-caption">Личный кабинет</div></div></div></div></header>
-  <main class="main" id="main">
-    <section class="page" data-view="dashboard" id="page-dashboard">
-      <div class="dashboard-v2-grid">
-        <section class="panel dashboard-search-v2">
-          <div class="panel-body dashboard-search-body">
-            <div class="dashboard-search-heading"><span class="dashboard-search-orb"><svg viewBox="0 0 24 24"><path d="M12 3 20 7.5v9L12 21l-8-4.5v-9L12 3Z"/><path d="m4 7.5 8 4.7 8-4.7M12 12.2V21"/></svg></span><div><div class="panel-title">Поиск игр на FunPay</div><div class="panel-sub">Найдите нужную игру и откройте создание оффера</div></div></div>
-            <div class="dashboard-game-search"><input id="dashboard-catalog-search" type="search" maxlength="80" autocomplete="off" placeholder="Введите название игры… (например: Roblox, CS2, Genshin Impact)"><button class="btn btn-primary" id="dashboard-search-btn" type="button"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></svg>Найти</button></div>
-            <div class="dashboard-game-chips"><span>Популярные запросы:</span><button type="button" class="game-chip" data-game-query="Genshin Impact">Genshin Impact</button><button type="button" class="game-chip" data-game-query="Steam">Steam</button><button type="button" class="game-chip" data-game-query="CS2">CS2</button><button type="button" class="game-chip" data-game-query="Dota 2">Dota 2</button><button type="button" class="game-chip" data-game-query="Valorant">Valorant</button><button type="button" class="game-chip" data-game-query="Minecraft">Minecraft</button><button type="button" class="game-chip" data-game-query="Roblox">Roblox</button></div>
-            <div id="dashboard-catalog-results" class="dashboard-catalog-results hidden"></div>
-          </div>
-        </section>
-        <section class="panel dashboard-quick-v2"><div class="panel-head"><div><div class="panel-title">Быстрые действия</div><div class="panel-sub">Частые задачи</div></div></div><div class="panel-body dashboard-quick-body"><button class="quick-action-v2 primary" data-go="lister"><span class="quick-action-icon"><svg viewBox="0 0 24 24"><path d="M3 4h2l2.1 10.2a2 2 0 0 0 2 1.6h8.6a2 2 0 0 0 1.9-1.4L22 8H6"/><circle cx="10" cy="20" r="1.4"/><circle cx="18" cy="20" r="1.4"/></svg></span><span><b>Создать оффер</b><small>Продать товар</small></span></button><button class="quick-action-v2" data-go="search"><span class="quick-action-icon"><svg viewBox="0 0 24 24"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.7"/></svg></span><span><b>Посмотреть офферы</b><small>Поиск предложений</small></span></button><button class="quick-action-v2" data-go="chats"><span class="quick-action-icon"><svg viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-6.5A7.5 7.5 0 1 1 20 11.5Z"/></svg></span><span><b>Открыть сообщения</b><small>Чаты FunPay</small></span></button></div></section>
-        <div class="grid stats-grid dashboard-stats-v2">
-          <article class="stat-card"><div class="stat-header"><span class="stat-icon" data-ico="wallet"></span>Баланс FunPay</div><div class="stat-value" id="stat-balance">—</div><div class="stat-foot" id="stat-balance-sub">Подключите аккаунт</div></article>
-          <article class="stat-card"><div class="stat-header"><span class="stat-icon" data-ico="listing"></span>Мои офферы</div><div class="stat-value" id="stat-offers">—</div><div class="stat-foot">В выбранной категории</div></article>
-          <article class="stat-card"><div class="stat-header"><span class="stat-icon" data-ico="message"></span>Сообщения</div><div class="stat-value" id="stat-chats">—</div><div class="stat-foot" id="stat-unread">Непрочитанных: —</div></article>
-          <article class="stat-card"><div class="stat-header"><span class="stat-icon" data-ico="order"></span>Заказы</div><div class="stat-value" id="stat-orders">—</div><div class="stat-foot">Текущие продажи</div></article>
-        </div>
-        <section class="panel dashboard-activity-v2"><div class="panel-head"><div><div class="panel-title">Последние действия</div><div class="panel-sub">Состояние аккаунта и синхронизации</div></div><button class="btn btn-small" id="refresh-dashboard-data" type="button">Обновить →</button></div><div class="dashboard-activity-list"><div class="dashboard-activity-row"><span class="activity-mark" id="activity-fp-mark"></span><div><b>Аккаунт FunPay</b><small id="activity-fp-note">Подключите сессию в настройках, чтобы загружать реальные данные.</small></div><span class="activity-state" id="system-pill">ОЖИДАНИЕ</span></div><div class="dashboard-activity-row"><span class="activity-mark" style="background:var(--good)"></span><div><b>Панель управления</b><small>Сервис работает. Секреты не сохраняются в журнал приложения.</small></div><span class="activity-state good">ONLINE</span></div><div class="dashboard-activity-row"><span class="activity-mark" style="background:var(--accent2)"></span><div><b>Обновление чатов</b><small>История выбранного чата синхронизируется в фоне без индикатора загрузки.</small></div><span class="activity-state good">LIVE</span></div></div></section>
-        <section class="panel dashboard-chat-panel dashboard-chat-v2"><div class="panel-head"><div><div class="panel-title">Последние сообщения</div><div class="panel-sub">Недавняя активность чатов FunPay</div></div><button class="btn btn-small" data-go="chats">Все →</button></div><div id="dashboard-chat-preview" class="dashboard-chat-list"><div class="empty-state"><strong>Нет данных</strong><p>Подключите FunPay и откройте чаты.</p></div></div><div class="dashboard-chat-footer"><span class="status-dot on"></span><span>Список обновляется автоматически</span></div></section>
-        <section class="panel dashboard-access-v2"><div class="panel-head"><div><div class="panel-title">Админ-панель</div><div class="panel-sub">Управление доступом</div></div><span class="dashboard-crown"><svg viewBox="0 0 24 24"><path d="m3 8 5 4 4-7 4 7 5-4-2 12H5L3 8Z"/></svg></span></div><div class="panel-body"><button id="dashboard-admin-open" class="btn btn-primary dashboard-admin-btn hidden" data-go="admin" type="button">Перейти <span>→</span></button><div class="dashboard-access-caption">Тарифы доступа</div><div class="dashboard-plan-list"><div class="dashboard-plan-row"><span class="plan-dot"></span><b>15 ⭐</b><span>1 день</span><span class="plan-availability">Ключ</span></div><div class="dashboard-plan-row"><span class="plan-dot"></span><b>25 ⭐</b><span>1,5 дня</span><span class="plan-availability">Ключ</span></div><div class="dashboard-plan-row"><span class="plan-dot"></span><b>50 ⭐</b><span>3 дня</span><span class="plan-availability">Ключ</span></div><div class="dashboard-plan-row"><span class="plan-dot"></span><b>100 ⭐</b><span>1 неделя</span><span class="plan-availability">Ключ</span></div><div class="dashboard-plan-row"><span class="plan-dot"></span><b>400 ⭐</b><span>1 месяц</span><span class="plan-availability">Ключ</span></div><div class="dashboard-plan-row"><span class="plan-dot"></span><b>1000 ⭐</b><span>Навсегда</span><span class="plan-availability">Ключ</span></div></div><div class="dashboard-access-footer"><span class="access-lock">∞</span><span>История выданных ключей сохраняется в журнале.</span></div></div></section>
-      </div>
-    </section>
-    <section class="page hidden" data-view="lister" id="page-lister">
-      <div class="page-head"><div><div class="eyebrow">LISTING WORKFLOW</div><h1 class="h1">Auto Lister</h1><div class="page-desc">Выберите действие, игру и параметры оффера. Поля и категории подгружаются из FunPay.</div></div></div>
-      <section class="catalog-search-panel"><div class="catalog-search-top"><div class="catalog-search-symbol"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></svg></div><div><div class="catalog-search-title">Быстрый поиск игры на FunPay</div><div class="catalog-search-sub">Начните с одной буквы — ищем реальные категории и разделы каталога.</div></div></div><div class="catalog-search-wrap"><input id="catalog-search" class="catalog-search-input" type="search" maxlength="80" autocomplete="off" placeholder="Например: roblox, cs2, rust…"></div><div id="catalog-results" class="catalog-results"><div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">↗</span><span class="catalog-result-main"><span class="catalog-result-name">Подключите FunPay, чтобы искать категории</span><span class="catalog-result-path">Результаты будут загружены из каталога FunPay</span></span></div></div></section>
-      <div class="mode-switch" role="tablist"><button type="button" class="active" data-mode="sell">Продать · создать оффер</button><button type="button" data-mode="buy">Купить · найти офферы</button></div>
-      <div class="form-layout"><section class="panel form-card"><div class="section-label">01 / Категория и параметры</div><div class="field-grid"><div class="field full"><label for="game-select">Игра / категория</label><select id="game-select"><option value="">Сначала подключите FunPay</option></select><div class="field-hint">Список игр загружается из аккаунта FunPay.</div></div><div class="field full"><label for="subcategory-select">Раздел</label><select id="subcategory-select"><option value="">Выберите игру</option></select></div><div class="field full sell-only"><label for="lot-title">Название оффера</label><input id="lot-title" maxlength="200" placeholder="Например: 1 000 000 игровой валюты"></div><div class="field sell-only"><label for="lot-price">Цена</label><input id="lot-price" type="number" min="0.01" step="0.01" placeholder="150.00"></div><div class="field sell-only"><label for="lot-amount">Количество</label><input id="lot-amount" type="number" min="1" step="1" value="1"></div><div class="field full sell-only"><label for="lot-description">Описание</label><textarea id="lot-description" maxlength="5000" placeholder="Условия передачи, сроки и детали предложения"></textarea></div><div class="field full buy-only hidden"><label for="offer-query">Поиск по офферам</label><input id="offer-query" maxlength="180" placeholder="Введите предмет, сервер или ключевые слова"><div class="field-hint">Поиск выполняется в выбранной категории FunPay.</div></div></div><div class="settings-foot" style="margin-top:21px"><button class="btn btn-primary" id="lister-submit"><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg><span>Создать оффер</span></button><button class="btn" id="lister-reset">Очистить поля</button></div><div id="lister-result" style="margin-top:14px"></div></section>
-      <aside class="preview-box"><div class="preview-icon" data-ico="listing"></div><div class="eyebrow">LIVE PREVIEW</div><div class="preview-title" id="preview-title">Ваш оффер</div><div class="preview-desc" id="preview-desc">Название и описание отобразятся здесь по мере заполнения формы.</div><div class="preview-divider"></div><div class="preview-line"><span>Категория</span><strong id="preview-game">Не выбрана</strong></div><div class="preview-line"><span>Количество</span><strong id="preview-amount">1</strong></div><div class="preview-line"><span>Статус</span><strong>Готов к проверке</strong></div><div class="preview-divider"></div><div style="font-size:10px;color:var(--muted)">Цена предложения</div><div class="preview-price" id="preview-price">—</div><div style="margin-top:21px" class="notice">Проверьте выбранную категорию, цену и описание перед отправкой. Создание оффера выполняется через подключённую сессию FunPay.</div></aside></div>
-      <section class="panel hidden" id="search-results-panel" style="margin-top:17px"><div class="panel-head"><div><div class="panel-title">Результаты поиска</div><div class="panel-sub" id="search-result-sub">Публичные предложения FunPay</div></div><button class="btn btn-small" id="search-open-funpay">Открыть категорию на FunPay</button></div><div id="search-results"></div></section>
-    </section>
-    <section class="page hidden" data-view="search" id="page-search"><div class="page-head"><div><div class="eyebrow">MARKETPLACE EXPLORER</div><h1 class="h1">Поиск офферов</h1><div class="page-desc">Найдите предложения по игре и ключевым словам.</div></div></div><section class="panel"><div class="toolbar"><div class="field-inline"><label for="search-game">Игра</label><select id="search-game"><option value="">Выберите категорию</option></select></div><div class="field-inline"><label for="search-subcategory">Раздел</label><select id="search-subcategory"><option value="">Выберите раздел</option></select></div><input id="search-query" placeholder="Название, сервер или предмет" maxlength="180"><button class="btn btn-primary" id="search-run">Найти офферы</button><span class="toolbar-spacer"></span><button class="btn" id="search-clear">Сбросить</button></div><div id="search-table"><div class="empty-state"><svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><strong>Задайте параметры поиска</strong><p>Выберите игру и раздел — результаты появятся здесь.</p></div></div></section></section>
-    <section class="page hidden" data-view="listings" id="page-listings"><div class="page-head"><div><div class="eyebrow">YOUR INVENTORY</div><h1 class="h1">Мои офферы</h1><div class="page-desc">Просмотр, редактирование и поднятие ваших предложений.</div></div><div class="actions"><button class="btn" id="raise-selected">Поднять выбранные</button><button class="btn btn-primary" data-go="lister">Новый оффер</button></div></div><section class="panel"><div class="toolbar"><div class="field-inline"><label for="lots-game">Игра</label><select id="lots-game"><option value="">Выберите категорию</option></select></div><div class="field-inline"><label for="lots-subcategory">Раздел</label><select id="lots-subcategory"><option value="">Выберите раздел</option></select></div><span class="toolbar-spacer"></span><button class="btn btn-small" id="lots-refresh">Обновить</button></div><div id="my-lots-table"><div class="empty-state"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/><path d="M3 4h18v16H3z"/></svg><strong>Выберите категорию</strong><p>Список собственных офферов загрузится после выбора раздела.</p></div></div></section></section>
-    <section class="page hidden" data-view="chats" id="page-chats"><div class="page-head"><div><div class="eyebrow">CUSTOMER SUPPORT</div><h1 class="h1">Messages</h1><div class="page-desc">Чаты FunPay и история сообщений.</div></div><button class="btn" id="chats-refresh">Обновить чаты</button></div><section class="panel chat-layout"><aside class="chat-sidebar"><div class="toolbar"><input id="chat-filter" placeholder="Найти чат" style="min-width:0;width:100%"></div><div class="chat-list" id="chat-list"><div class="empty-state"><strong>Нет данных</strong><p>Подключите FunPay и загрузите чаты.</p></div></div></aside><section class="chat-main"><div class="chat-main-head" id="chat-main-head"><div class="panel-title">Выберите чат</div><div class="panel-sub">История сообщений отобразится здесь.</div></div><div class="chat-messages" id="chat-messages"><div class="empty-state"><svg viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-6.5A7.5 7.5 0 1 1 20 11.5Z"/></svg><strong>Нет выбранного чата</strong><p>Выберите собеседника слева.</p></div></div><div id="chat-image-preview" class="chat-image-preview hidden"></div><form class="chat-composer" id="chat-send-form"><input id="chat-image" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden><button class="icon-btn chat-attach-btn" id="chat-attach" title="Прикрепить фотографию" aria-label="Прикрепить фотографию" type="button" disabled><svg viewBox="0 0 24 24"><path d="m20.5 11.5-7.8 7.8a5.2 5.2 0 0 1-7.4-7.4l8.2-8.2a3.5 3.5 0 0 1 4.9 4.9l-8.2 8.2a1.8 1.8 0 0 1-2.5-2.5l7.4-7.4"/></svg></button><input id="chat-message" placeholder="Напишите сообщение..." autocomplete="off" disabled><button class="btn btn-primary" id="chat-send" type="submit" disabled><svg viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg><span>Отправить</span></button></form></section></section></section>
-    <section class="page hidden" data-view="orders" id="page-orders"><div class="page-head"><div><div class="eyebrow">SALES MONITOR</div><h1 class="h1">Заказы</h1><div class="page-desc">Текущие продажи в вашем аккаунте FunPay.</div></div><button class="btn" id="orders-refresh">Обновить заказы</button></div><section class="panel" id="orders-table"><div class="empty-state"><svg viewBox="0 0 24 24"><path d="M7 3h10l3 4v14H4V7zM4 7h16M8 12h8M8 16h6"/></svg><strong>Заказы ещё не загружены</strong><p>Подключите FunPay или нажмите «Обновить заказы».</p></div></section></section>
-    <section class="page hidden" data-view="settings" id="page-settings"><div class="page-head"><div><div class="eyebrow">ACCOUNT CONFIGURATION</div><h1 class="h1">Настройки</h1><div class="page-desc">Подключение FunPay и параметры интерфейса.</div></div></div><div class="settings-grid"><section class="panel settings-card"><h3>Аккаунт FunPay</h3><p>Подключите действующую сессию FunPay. В интерфейс вставляется cookie <span class="mono">golden_key</span> и User-Agent того же браузера, где вы вошли в FunPay.</p><form id="fp-connect-form"><div class="field settings-field"><label for="fp-golden-key">golden_key</label><input type="password" id="fp-golden-key" autocomplete="off" placeholder="Значение cookie golden_key" required></div><div class="field settings-field"><label for="fp-user-agent">User-Agent</label><textarea id="fp-user-agent" style="min-height:76px" placeholder="Mozilla/5.0 ... Chrome/... Safari/..."></textarea><div class="field-hint">Используйте User-Agent из того же браузера. После успешного подключения поле ключа очищается.</div></div><div class="settings-foot"><button class="btn btn-primary" id="fp-connect-btn" type="submit">Подключить аккаунт</button><button class="btn btn-danger" id="fp-disconnect" type="button">Отключить</button><span class="pill" id="fp-connection-pill">Не подключён</span></div><div id="fp-connect-result" style="margin-top:13px"></div></form></section><section class="panel settings-card"><h3>Интерфейс</h3><p>Параметры сохраняются в этом браузере.</p><div class="toggle-row"><div><div class="toggle-label">Звуки интерфейса</div><div class="toggle-help">Тихий сигнал на действия и уведомления.</div></div><label class="switch"><input type="checkbox" id="sound-toggle"><span></span></label></div><div class="toggle-row"><div><div class="toggle-label">Автообновление данных</div><div class="toggle-help">Периодическая проверка чатов и статистики.</div></div><label class="switch"><input type="checkbox" id="auto-refresh-toggle" checked><span></span></label></div><div class="toggle-row"><div><div class="toggle-label">Выход из панели</div><div class="toggle-help">Завершить текущую веб-сессию.</div></div><button class="btn btn-small" id="logout-btn">Выйти</button></div><div class="security-note" style="margin-top:18px">Безопасность: <span class="mono">golden_key</span>, введённый здесь, хранится только в памяти процесса. После перезапуска подключитесь снова либо задайте защищённую переменную <span class="mono">FUNPAY_GOLDEN_KEY</span> в Render для автоматического подключения. Пароль панели <span class="mono">DASHBOARD_PASSWORD</span> необязателен для входа по ключу/Telegram.</div></section></div></section>
-<section class="page hidden" data-view="admin" id="page-admin"><div class="page-head"><div><div class="eyebrow">RESTRICTED / TELEGRAM ADMIN</div><h1 class="h1">Панель администратора</h1><div class="page-desc">История всех выданных ключей. Записи не удаляются после окончания срока.</div></div><div class="actions"><button class="btn" id="admin-refresh">Обновить журнал</button><span class="pill" id="admin-license-total">— ключей</span></div></div><section class="panel admin-create-panel"><div class="panel-head"><div><div class="panel-title">Создать лицензионный ключ</div><div class="panel-sub">Выберите срок — готовый ключ появится сразу после сохранения.</div></div><span class="pill good">ADMIN</span></div><form id="admin-create-form" class="panel-body"><div class="field-grid"><div class="field"><label for="admin-duration">Срок действия</label><select id="admin-duration"><option value="1h">1 час</option><option value="6h">6 часов</option><option value="12h">12 часов</option><option value="24h" selected>1 день</option><option value="36h">1,5 дня</option><option value="3d">3 дня</option><option value="7d">7 дней</option><option value="30d">30 дней</option><option value="forever">Навсегда</option></select></div><div class="field"><label for="admin-user-id">Telegram ID для журнала (необязательно)</label><input id="admin-user-id" type="number" min="1" step="1" placeholder="Только пометка в журнале"><div class="field-hint">ID фиксируется для учёта; сам ключ пока не ограничивается конкретным аккаунтом.</div></div></div><div class="settings-foot" style="margin-top:16px"><button class="btn btn-primary" id="admin-create-btn" type="submit">＋ Сгенерировать ключ</button><span class="field-hint">Ключ сохранится в журнале, включая после истечения срока.</span></div><div id="admin-created-key" style="margin-top:12px"></div></form></section><section class="panel"><div class="panel-head"><div><div class="panel-title">Журнал лицензий</div><div class="panel-sub">FREE PLAN и покупки через Telegram Stars · сортировка от новых к старым</div></div><input id="admin-key-filter" style="max-width:230px;height:35px;padding:0 10px;border:1px solid var(--line);border-radius:10px;background:#0d0d16;font-size:11px" placeholder="Фильтр по ключу / Telegram ID"></div><div id="admin-license-list"><div class="empty-state"><strong>Загрузка журнала…</strong></div></div></section><div class="notice" style="margin-top:14px">Доступ администратора определяется подписанными данными Telegram Mini App и фиксированным Telegram ID в коде. Не открывайте WebApp через обычную браузерную ссылку, если ожидаете автоматический вход администратора.</div></section>
-  </main>
-</div>
-<div class="toast-stack" id="toasts" aria-live="polite"></div>
-
-<div class="modal-backdrop hidden" id="edit-modal" style="position:fixed;inset:0;z-index:300;background:#000a;backdrop-filter:blur(5px);display:grid;place-items:center;padding:17px"><div class="panel" style="width:min(580px,100%);padding:22px"><div class="panel-head" style="padding:0 0 15px"><div><div class="panel-title">Редактировать оффер</div><div class="panel-sub" id="edit-subtitle">Изменение выбранного предложения</div></div><button class="icon-btn" id="edit-close">×</button></div><form id="edit-form"><div class="field-grid" style="margin-top:18px"><div class="field full"><label for="edit-title">Название</label><input id="edit-title" required maxlength="200"></div><div class="field"><label for="edit-price">Цена</label><input id="edit-price" required type="number" min=".01" step=".01"></div><div class="field"><label for="edit-amount">Количество</label><input id="edit-amount" required type="number" min="0" step="1"></div><div class="field full"><label for="edit-description">Описание</label><textarea id="edit-description" maxlength="5000"></textarea></div><div class="field full"><label style="display:flex;gap:8px;align-items:center"><input id="edit-active" type="checkbox" style="width:16px;height:16px"> Оффер активен</label></div></div><div class="settings-foot"><button class="btn btn-primary" type="submit">Сохранить изменения</button><button class="btn" type="button" id="edit-cancel">Отмена</button></div></form></div></div>
-<script>
-(()=>{'use strict';
-const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
-const state={session:sessionStorage.getItem('fpal.session')||'',page:'dashboard',mode:'sell',connected:false,profile:null,categories:[],subcats:new Map(),chats:[],activeChat:null,orders:[],selectedLots:new Set(),editingLot:null,chatTimer:null,isAdmin:false,catalogResults:[],licenseRemaining:null};
-let soundEnabled=localStorage.getItem('fpal.sound')!=='off';let autoRefresh=localStorage.getItem('fpal.refresh')!=='off';let audioCtx=null;let firstGestureDone=false;
-const ICONS={brand:'<svg viewBox="0 0 24 24"><path d="M12 2.5 20 7v10l-8 4.5L4 17V7z"/><path d="m4 7 8 5 8-5M12 12v9.5M8 4.7l8 4.5v5.6l-8 4.5"/></svg>',wallet:'<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="15" rx="2"/><path d="M3 8h18M16 14h2"/><path d="M6 5V3h12v2"/></svg>',listing:'<svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h10M4 19h16"/><circle cx="19" cy="12" r="2"/></svg>',message:'<svg viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-6.5A7.5 7.5 0 1 1 20 11.5Z"/><path d="M8 10h8M8 13.5h5"/></svg>',order:'<svg viewBox="0 0 24 24"><path d="M7 3h10l3 4v14H4V7zM4 7h16M8 12h8M8 16h6"/></svg>',search:'<svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg>',layers:'<svg viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/></svg>'};
-$('#brand-mark').innerHTML=ICONS.brand;$('#login-mark').innerHTML=ICONS.brand;$$('[data-ico]').forEach(el=>el.innerHTML=ICONS[el.dataset.ico]||ICONS.listing);
-const defaultUserAgent=(navigator.userAgent&&navigator.userAgent.trim())||'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
-const uaInput=$('#fp-user-agent');if(uaInput)uaInput.value=localStorage.getItem('fpal.user-agent')||defaultUserAgent;
-uaInput?.addEventListener('change',()=>localStorage.setItem('fpal.user-agent',uaInput.value.trim()));
-
-function hashSeed(value){let h=2166136261;for(const ch of String(value??'')){h^=ch.charCodeAt(0);h=Math.imul(h,16777619)}return h>>>0}
-function avatarUrl(seed,label=''){const h=hashSeed(seed||label||'FunPay'),h1=h%360,h2=(h1+72+(h%61))%360,skin=['#f2c7b7','#ffd5be','#d9a184','#f0c0a4'][h%4],hair=['#15172c','#382642','#172332','#4c2840'][((h>>>4)%4)],eye=['#68e3ff','#c9b4ff','#72ffc9','#ffdb8a'][((h>>>8)%4)],bang=(h%3);const svg=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="hsl(${h1} 84% 69%)"/><stop offset=".55" stop-color="hsl(${h2} 74% 48%)"/><stop offset="1" stop-color="#12172e"/></linearGradient><linearGradient id="coat" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f7f3ff"/><stop offset="1" stop-color="#9fa6d8"/></linearGradient><radialGradient id="shine"><stop stop-color="#fff" stop-opacity=".6"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient></defs><rect width="96" height="96" rx="28" fill="url(#bg)"/><circle cx="14" cy="13" r="39" fill="url(#shine)"/><path d="M2 65 25 48 43 61 72 35 98 49V99H0Z" fill="#080c20" opacity=".35"/><path d="M13 96Q15 65 36 62L48 68 61 61Q83 66 85 96Z" fill="url(#coat)"/><path d="M34 64 48 79 62 63 69 96H26Z" fill="#262844"/><path d="M39 56h18v18q-9 13-18 0Z" fill="${skin}"/><path d="M26 39Q22 15 48 13Q75 15 70 43L65 60 31 60Z" fill="${hair}"/><path d="M29 39Q28 24 39 21Q54 15 66 28L68 45Q64 59 48 62Q31 58 29 39Z" fill="${skin}"/><path d="M28 39Q23 21 40 17Q58 8 70 26L70 39Q62 31 55 28Q46 39 29 40Z" fill="${hair}"/><path d="M30 36Q${bang===0?'37 39 43 30':bang===1?'39 27 47 35':'34 32 43 37'}L${bang===1?'54 34 68 29':'57 30 69 36'}L68 43Q60 36 54 37Q43 43 29 43Z" fill="${hair}"/><path d="M35 42q5-4 9 0M53 42q5-4 9 0" stroke="#28223e" stroke-width="2.3" fill="none" stroke-linecap="round"/><ellipse cx="40" cy="44" rx="2.6" ry="3.4" fill="${eye}"/><ellipse cx="58" cy="44" rx="2.6" ry="3.4" fill="${eye}"/><circle cx="41" cy="43" r="1" fill="#fff"/><circle cx="59" cy="43" r="1" fill="#fff"/><path d="M45 53q3 2 6 0" stroke="#a15e68" stroke-width="1.6" fill="none" stroke-linecap="round"/><path d="M18 24 24 17M75 66l7-8M12 52l6-3" stroke="#fff" stroke-opacity=".55" stroke-width="2" stroke-linecap="round"/><circle cx="77" cy="18" r="4" fill="#fff" opacity=".55"/><circle cx="19" cy="77" r="2.5" fill="#7af6ff"/><path d="M8 88 20 80M75 84 88 73" stroke="#77eaff" stroke-width="1.3" stroke-opacity=".7"/></svg>`;return 'data:image/svg+xml;charset=UTF-8,'+encodeURIComponent(svg)}
-function avatarMarkup(seed,label,cls='chat-avatar'){return `<span class="${cls}"><img alt="" loading="lazy" src="${avatarUrl(seed,label)}"></span>`}
-function sound(kind='click'){if(!soundEnabled)return;try{audioCtx=audioCtx||new(window.AudioContext||window.webkitAudioContext)();if(audioCtx.state==='suspended')audioCtx.resume();const osc=audioCtx.createOscillator(),gain=audioCtx.createGain();osc.type='sine';const freqs=kind==='ok'?[660,880]:kind==='error'?[220,165]:[420,560];osc.frequency.setValueAtTime(freqs[0],audioCtx.currentTime);osc.frequency.linearRampToValueAtTime(freqs[1],audioCtx.currentTime+.075);gain.gain.setValueAtTime(.0001,audioCtx.currentTime);gain.gain.exponentialRampToValueAtTime(.045,audioCtx.currentTime+.012);gain.gain.exponentialRampToValueAtTime(.0001,audioCtx.currentTime+.14);osc.connect(gain);gain.connect(audioCtx.destination);osc.start();osc.stop(audioCtx.currentTime+.15)}catch{}}
-function toast(message,type='info',ms=4000){const el=document.createElement('div');el.className='toast '+(type==='ok'?'ok':type==='error'?'error':type==='warn'?'warn':'');const span=document.createElement('span');span.textContent=message;const close=document.createElement('button');close.type='button';close.textContent='×';close.addEventListener('click',()=>el.remove());el.append(span,close);$('#toasts').append(el);sound(type==='error'?'error':type==='ok'?'ok':'click');setTimeout(()=>el.remove(),ms)}
-function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-async function api(path,opts={}){const headers={'Accept':'application/json','Cache-Control':'no-cache',...(opts.headers||{})};if(state.session)headers['X-Dashboard-Session']=state.session;if(opts.body!==undefined){headers['Content-Type']='application/json';opts={...opts,body:JSON.stringify(opts.body)}}let res;const controller=opts.signal?null:new AbortController();const timeout=controller?setTimeout(()=>controller.abort(),20000):null;try{res=await fetch(path,{...opts,headers,cache:'no-store',signal:opts.signal||controller?.signal})}catch(e){if(e.name==='AbortError')throw new Error('Сервер не ответил за 20 секунд. Проверьте статус Render и подключение.');throw new Error('Сервер недоступен: проверьте, что Render запущен и страница открыта по актуальному адресу.')}finally{if(timeout)clearTimeout(timeout)}let payload=null;const text=await res.text();try{payload=text?JSON.parse(text):null}catch{payload=text}if(res.status===401&&path!='/api/login'){logoutLocal();throw new Error('Сессия истекла. Войдите снова.')}if(!res.ok){throw new Error(typeof payload?.detail==='string'?payload.detail:`Ошибка ${res.status}${typeof payload==='string'&&payload?': '+payload.slice(0,180):''}`)}return {data:payload,res}}
-function setPage(page){const valid=['dashboard','lister','search','listings','chats','orders','settings','admin'];if(!valid.includes(page)||(page==='admin'&&!state.isAdmin))page='dashboard';state.page=page;$$('[data-view]').forEach(el=>el.classList.toggle('hidden',el.dataset.view!==page));$$('.nav-item').forEach(el=>el.classList.toggle('active',el.dataset.page===page));$('#crumb-label').textContent=({dashboard:'Главная',lister:'Auto Lister',search:'Поиск офферов',listings:'Мои офферы',chats:'Сообщения',orders:'Заказы',settings:'Настройки',admin:'Админ-панель'})[page];$('#sidebar').classList.remove('open');$('#scrim').classList.remove('show');if(page==='settings')refreshConnectionStatus();if(page==='chats'&&state.connected)loadChats(true);if(page==='orders'&&state.connected)loadOrders();if(page==='listings'&&state.categories.length)populateAllCategorySelects();if(page==='lister'){refreshConnectionStatus().then(()=>{if(state.connected){loadCategories();if($('#catalog-search')?.value.trim())runCatalogSearch()}else{state.categories=[];populateAllCategorySelects();renderDashboardChats();renderCatalogIdleMessage()}})}if(page==='search'&&state.categories.length)populateAllCategorySelects();if(page==='admin')loadAdminLicenses();}
-function logoutLocal(){state.session='';state.connected=false;sessionStorage.removeItem('fpal.session');$('#app').classList.add('hidden');$('#login-view').classList.remove('hidden');$('#login-password').value='';$('#login-error').textContent='';}
-async function performLogin(){const btn=$('#login-form button[type=submit]');$('#login-error').textContent='';btn.disabled=true;btn.textContent='Проверка доступа…';try{const tg=window.Telegram&&window.Telegram.WebApp;const {data}=await api('/api/login',{method:'POST',body:{password:$('#login-password').value.trim(),init_data:tg?.initData||''}});state.session=data.token;state.isAdmin=!!data.is_admin;sessionStorage.setItem('fpal.session',state.session);$('#login-view').classList.add('hidden');$('#app').classList.remove('hidden');$('#login-password').value='';await bootApp();sound('ok')}catch(err){$('#login-error').textContent=err.message;sound('error')}finally{btn.disabled=false;btn.innerHTML='Войти в панель <span aria-hidden="true">→</span>'}}
-$('#login-form').addEventListener('submit',async e=>{e.preventDefault();await performLogin()});
-function logout(){if(state.session)api('/api/logout',{method:'POST'}).catch(()=>{});logoutLocal();toast('Вы вышли из панели','info')}
-function updateConnection(connected,username=''){state.connected=connected;$('#side-dot').className='status-dot '+(connected?'on':'off');$('#top-dot').className='status-dot '+(connected?'on':'off');$('#side-status').textContent=connected?'FunPay подключён':'FunPay не подключён';$('#top-status').textContent=connected?'Аккаунт активен':'Нет подключения';$('#side-account').textContent=connected?(username?'@'+username:'Сессия активна'):'Откройте настройки аккаунта';$('#user-name').textContent=username?'@'+username:'Панель';$('#user-avatar').innerHTML=`<img alt="" src="${avatarUrl(state.profile?.id||username||'funpay-account',username||'FP')}">`;$('#fp-connection-pill').textContent=connected?'Подключён':'Не подключён';$('#fp-connection-pill').className='pill '+(connected?'good':'');$('#system-pill').textContent=connected?'ПОДКЛЮЧЕНО':'ОЖИДАНИЕ';$('#system-pill').className='pill '+(connected?'good':'');$('#activity-fp-mark').style.background=connected?'var(--good)':'var(--warn)';$('#activity-fp-note').textContent=connected?'Сессия активна'+(username?' · @'+username:'')+'. Данные берутся из аккаунта FunPay.':'Подключите сессию в настройках, чтобы загружать реальные данные.';renderDashboardChats();renderCatalogIdleMessage()}
-async function refreshConnectionStatus(){try{const {data}=await api('/api/funpay/status');updateConnection(!!data.connected,data.profile?.username||'');if(data.connected){state.profile=data;$('#stat-balance').textContent=formatBalance(data.balance||{});$('#stat-balance-sub').textContent='Баланс аккаунта';}else{$('#stat-balance').textContent='—';$('#stat-balance-sub').textContent='Подключите аккаунт'}}catch(e){if(e.message.includes('Сессия'))return;updateConnection(false)}}
-function formatBalance(b){const val=Number(b.available_rub??b.total_rub??0);return Number.isFinite(val)?val.toLocaleString('ru-RU',{maximumFractionDigits:2})+' ₽':'—'}
-function renderCatalogIdleMessage(){const target=$('#catalog-results');if(!target||($('#catalog-search')?.value.trim()))return;if(!state.connected){target.innerHTML='<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">!</span><span class="catalog-result-main"><span class="catalog-result-name">FunPay не подключён</span><span class="catalog-result-path">Настройки → подключите golden_key и User-Agent</span></span></div>';return}target.innerHTML=`<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">✓</span><span class="catalog-result-main"><span class="catalog-result-name">Каталог готов к поиску</span><span class="catalog-result-path">${state.categories.length} категорий загружено · начните вводить название игры</span></span></div>`}
-async function loadCategories(){if(!state.connected){state.categories=[];state.subcats.clear();populateAllCategorySelects();renderCatalogIdleMessage();return}try{const {data}=await api('/api/funpay/categories');state.categories=Array.isArray(data)?data:[];state.subcats.clear();for(const c of state.categories){if(Array.isArray(c.subcategories))state.subcats.set(String(c.id),c.subcategories)}populateAllCategorySelects();renderCatalogIdleMessage()}catch(e){renderCatalogIdleMessage();toast(e.message,'error')}}
-function populateAllCategorySelects(){const pairs=[['#game-select','#subcategory-select'],['#search-game','#search-subcategory'],['#lots-game','#lots-subcategory']];for(const [gameSel,subSel] of pairs){const g=$(gameSel),s=$(subSel);if(!g||!s)continue;const storedGame=gameSel==='#game-select'?localStorage.getItem('fpal.category.game')||'':'';const storedSub=gameSel==='#game-select'?localStorage.getItem('fpal.category.sub')||'':'';const priorG=g.value||storedGame,priorS=s.value||storedSub;g.innerHTML='<option value="">'+(state.connected?'Выберите игру / категорию':'Подключите FunPay')+'</option>'+state.categories.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('');if(state.categories.some(c=>String(c.id)===String(priorG)))g.value=String(priorG);else if(state.categories.length===1)g.value=String(state.categories[0].id);fillSubcategories(gameSel,subSel,priorS)}}
-function persistCategory(){if($('#game-select')?.value)localStorage.setItem('fpal.category.game',$('#game-select').value);if($('#subcategory-select')?.value)localStorage.setItem('fpal.category.sub',$('#subcategory-select').value)}
-async function fillSubcategories(gameSelector,subSelector,keep=''){const gameId=$(gameSelector)?.value;const sub=$(subSelector);if(!sub)return;sub.innerHTML='<option value="">Загрузка разделов…</option>';if(!gameId){sub.innerHTML='<option value="">Выберите игру</option>';return}let values=state.subcats.get(String(gameId));if(!Array.isArray(values)||!values.length){try{const {data}=await api('/api/funpay/subcategories/'+encodeURIComponent(gameId));values=data;state.subcats.set(String(gameId),values)}catch(e){sub.innerHTML='<option value="">Не удалось загрузить</option>';toast(e.message,'error');return}}sub.innerHTML='<option value="">Выберите раздел</option>'+values.map(s=>`<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('');if(values.some(s=>String(s.id)===String(keep)))sub.value=String(keep);else if(values.length===1)sub.value=String(values[0].id);if(gameSelector==='#game-select')updatePreview();}
-function selectedCategoryName(gameSel,subSel){const c=state.categories.find(x=>String(x.id)===$(gameSel)?.value);const s=(state.subcats.get(String(c?.id))||[]).find(x=>String(x.id)===$(subSel)?.value);return s?.name||c?.name||'Не выбрана'}
-function updatePreview(){const title=$('#lot-title').value.trim();$('#preview-title').textContent=title||'Ваш оффер';$('#preview-desc').textContent=$('#lot-description').value.trim()||'Название и описание отобразятся здесь по мере заполнения формы.';$('#preview-game').textContent=selectedCategoryName('#game-select','#subcategory-select');$('#preview-amount').textContent=$('#lot-amount').value||'1';const price=Number($('#lot-price').value);$('#preview-price').textContent=price>0?price.toLocaleString('ru-RU',{maximumFractionDigits:2})+' ₽':'—'}
-let sessionInfo=null;let licenseTimerInterval=null;
-function formatRemaining(seconds){if(seconds===null||seconds===undefined)return '∞';seconds=Math.max(0,Math.floor(seconds));const d=Math.floor(seconds/86400),h=Math.floor(seconds%86400/3600),m=Math.floor(seconds%3600/60),sec=seconds%60;if(d)return `${d}д ${h}ч ${m}м ${sec}с`;if(h)return `${h}ч ${m}м ${sec}с`;if(m)return `${m}м ${sec}с`;return `${sec}с`}
-function renderLicenseTimer(){const el=$('#license-timer');if(!el)return;if(!sessionInfo){el.textContent='Ключ · проверка';return}if(sessionInfo.is_admin){el.innerHTML='<span class="license-timer-line">ADMIN ACCESS</span><span class="license-progress"><i style="width:100%"></i></span>';el.style.color='#d6caff';el.style.borderColor='#9672ff55';return}if(sessionInfo.remaining_seconds===null){el.innerHTML='<span class="license-timer-line">Ключ · ∞</span><span class="license-progress"><i style="width:100%"></i></span>';return}const remaining=Math.max(0,Number(sessionInfo.remaining_seconds)||0);const total=sessionInfo.expires_at&&sessionInfo.created_at?Math.max(1,Number(sessionInfo.expires_at)-Number(sessionInfo.created_at)):remaining;const percent=Math.max(0,Math.min(100,remaining/total*100));if(remaining<=0){el.innerHTML='<span class="license-timer-line">Ключ истёк</span><span class="license-progress"><i style="width:0%"></i></span>';el.style.color='#ff9aaa';if(!sessionInfo.expiryHandled){sessionInfo.expiryHandled=true;setTimeout(()=>{logoutLocal();toast('Срок действия ключа завершён. Получите новый ключ.','warn',6000)},700)}return}el.innerHTML=`<span class="license-timer-line">Осталось · ${esc(formatRemaining(remaining))}</span><span class="license-progress"><i style="width:${percent.toFixed(3)}%"></i></span>`;sessionInfo.remaining_seconds=Math.max(0,remaining-1)}
-async function loadSessionInfo(){try{const {data}=await api('/api/session/info');sessionInfo=data;state.isAdmin=!!data.is_admin;$('#admin-nav').classList.toggle('hidden',!state.isAdmin);$('#dashboard-admin-open')?.classList.toggle('hidden',!state.isAdmin);renderLicenseTimer();if(licenseTimerInterval)clearInterval(licenseTimerInterval);licenseTimerInterval=setInterval(renderLicenseTimer,1000);if(state.isAdmin&&state.page==='admin')loadAdminLicenses()}catch{}}
-async function loadAdminLicenses(){if(!state.isAdmin)return;const target=$('#admin-license-list');target.innerHTML='<div class="empty-state"><strong>Загружаем журнал лицензий…</strong></div>';try{const {data}=await api('/api/admin/licenses');const items=data.items||[];$('#admin-license-total').textContent=`${data.total} ключей`;const filter=($('#admin-key-filter').value||'').trim().toLowerCase();const filtered=items.filter(x=>`${x.key} ${x.telegram_user_id||''} ${x.plan_id}`.toLowerCase().includes(filter));if(!filtered.length){target.innerHTML='<div class="empty-state"><strong>Ключи не найдены</strong><p>Попробуйте изменить фильтр.</p></div>';return}const planName=x=>({'free':'FREE PLAN','day':'1 день','day_half':'1,5 дня','three_days':'3 дня','week':'1 неделя','month':'1 месяц','forever':'Навсегда'}[x.plan_id]||String(x.plan_id||'').replace(/^admin_/, 'Ручной ключ · '));target.innerHTML=`<div class="table-wrap admin-key-table"><table><thead><tr><th>Ключ</th><th>Telegram ID</th><th>Тариф</th><th>Создан</th><th>Истекает</th><th>Статус</th></tr></thead><tbody>${filtered.map(x=>`<tr><td><code>${esc(x.key)}</code></td><td class="mono">${esc(x.telegram_user_id||'—')}</td><td>${esc(planName(x))}</td><td>${x.created_at?new Date(Number(x.created_at)*1000).toLocaleString('ru-RU'):'—'}</td><td>${x.expires_at?new Date(Number(x.expires_at)*1000).toLocaleString('ru-RU'):'Навсегда'}</td><td><span class="license-status ${x.active?'active':'expired'}">${x.active?'АКТИВЕН':'ИСТЁК'}</span></td></tr>`).join('')}</tbody></table></div>`}catch(e){target.innerHTML=`<div class="empty-state"><strong>Не удалось загрузить журнал</strong><p>${esc(e.message)}</p></div>`;toast(e.message,'error')}}
-$('#admin-create-form')?.addEventListener('submit',async e=>{e.preventDefault();if(!state.isAdmin){toast('Действие доступно только администратору','error');return}const btn=$('#admin-create-btn');const result=$('#admin-created-key');btn.disabled=true;btn.textContent='Создаём ключ…';result.innerHTML='';const rawId=$('#admin-user-id').value.trim();try{const {data}=await api('/api/admin/licenses',{method:'POST',body:{duration:$('#admin-duration').value,telegram_user_id:rawId?Number(rawId):null}});result.innerHTML=`<div class="admin-created"><span>✓</span><div style="flex:1;min-width:160px"><div class="field-hint">Ключ создан · ${esc(data.duration_title)}${data.expires_at?' · до '+esc(new Date(Number(data.expires_at)*1000).toLocaleString('ru-RU')):' · бессрочный'}</div><code id="admin-new-key">${esc(data.key)}</code></div><button class="btn btn-small" id="admin-copy-key" type="button">Копировать</button></div>`;$('#admin-copy-key').addEventListener('click',async()=>{try{await navigator.clipboard.writeText(data.key);toast('Ключ скопирован','ok')}catch{toast('Выделите и скопируйте ключ вручную','warn')}});await loadAdminLicenses();toast('Ключ сохранён в журнале','ok')}catch(err){result.innerHTML=`<div class="notice" style="border-color:#ff71884a;color:#ff9aa9">${esc(err.message)}</div>`;toast(err.message,'error')}finally{btn.disabled=false;btn.textContent='＋ Сгенерировать ключ'}});
-$('#admin-refresh')?.addEventListener('click',loadAdminLicenses);$('#admin-key-filter')?.addEventListener('input',loadAdminLicenses);
-$('#admin-refresh')?.addEventListener('click',loadAdminLicenses);$('#admin-key-filter')?.addEventListener('input',()=>loadAdminLicenses());
-async function bootApp(){await loadSessionInfo();await refreshConnectionStatus();await loadCategories();if(state.connected){await loadDashboardData();}setPage('dashboard');$('#sound-toggle').checked=soundEnabled;$('#sound-btn').style.color=soundEnabled?'#c5b4ff':'#77778b';$('#auto-refresh-toggle').checked=autoRefresh;}
-function renderDashboardChats(){const target=$('#dashboard-chat-preview');if(!target)return;if(!state.connected){target.innerHTML='<div class="empty-state"><strong>FunPay не подключён</strong><p>Откройте настройки и подключите свой аккаунт.</p><button class="btn btn-primary" data-go="settings">Открыть настройки →</button></div>';return}const rows=(state.chats||[]).slice().sort((a,b)=>String(b.last_message_date||b.last_message_timestamp||'').localeCompare(String(a.last_message_date||a.last_message_timestamp||''))).slice(0,4);if(!rows.length){target.innerHTML='<div class="empty-state"><strong>Пока нет сообщений</strong><p>Новые диалоги появятся здесь, когда они поступят в FunPay.</p></div>';return}target.innerHTML=rows.map(c=>`<button class="dashboard-chat-row" data-chat-id="${esc(c.id)}">${avatarMarkup(c.interlocutor_id||c.id,c.name||'FP')}<span class="dashboard-chat-copy"><b>${esc(c.name||'Пользователь')}</b><small>${esc(c.last_message_text||'Нет сообщений')}</small></span>${Number(c.unread_count)>0?`<span class="unread">${esc(c.unread_count)}</span>`:''}</button>`).join('')}
-async function loadDashboardData(){try{const [{data:chats},{data:orders}]=await Promise.all([api('/api/funpay/chats'),api('/api/funpay/orders?limit=100')]);state.chats=Array.isArray(chats)?chats:[];state.orders=Array.isArray(orders)?orders:[];lastChatsRefresh=Date.now();renderDashboardChats();$('#stat-chats').textContent=state.chats.length;const unread=state.chats.reduce((n,c)=>n+Number(c.unread_count||0),0);$('#stat-unread').textContent='Непрочитанных: '+unread;$('#chats-badge').textContent=unread||'0';$('#stat-orders').textContent=state.orders.length;$('#stat-offers').textContent='—';$('#offers-badge').textContent='—';}catch(e){renderDashboardChats();if(!e.message.includes('Сессия'))toast(e.message,'warn')}}
-async function listerSubmit(){if(!state.connected){toast('Сначала подключите аккаунт FunPay в настройках.','warn');setPage('settings');return}const subcategoryId=Number($('#subcategory-select').value);if(!subcategoryId){toast('Выберите игру и раздел.','warn');return}if(state.mode==='buy'){await runOfferSearch('lister');return}const title=$('#lot-title').value.trim(),description=$('#lot-description').value.trim(),price=Number($('#lot-price').value),amount=Number($('#lot-amount').value||1);if(!title){toast('Введите название оффера.','warn');$('#lot-title').focus();return}if(!Number.isFinite(price)||price<=0){toast('Укажите цену больше нуля.','warn');$('#lot-price').focus();return}const btn=$('#lister-submit');btn.disabled=true;btn.querySelector('span').textContent='Создание…';$('#lister-result').innerHTML='';try{const {data}=await api('/api/funpay/lots/create',{method:'POST',body:{subcategory_id:subcategoryId,title,description,price,amount,active:true}});$('#lister-result').innerHTML='<div class="notice">Операция передана FunPay. Ответ сервера получен; обновите собственные офферы, чтобы проверить публикацию.</div>';toast('Запрос на создание оффера выполнен.','ok');$('#lot-title').value='';$('#lot-description').value='';$('#lot-price').value='';$('#lot-amount').value='1';updatePreview();if(data.result?.offer_id)$('#lister-result').innerHTML+=`<div class="field-hint" style="margin-top:9px">ID: ${esc(data.result.offer_id)}</div>`}catch(e){$('#lister-result').innerHTML=`<div class="notice" style="border-color:#ff71884a;color:#ff9aa9">${esc(e.message)}</div>`;toast(e.message,'error')}finally{btn.disabled=false;btn.querySelector('span').textContent='Создать оффер'}}
-async function runOfferSearch(source='search'){if(!state.connected){toast('Подключите FunPay в настройках.','warn');setPage('settings');return}const subId=Number(source==='lister'?$('#subcategory-select').value:$('#search-subcategory').value);const q=source==='lister'?$('#offer-query').value.trim():$('#search-query').value.trim();if(!subId){toast('Выберите игру и раздел.','warn');return}const target=source==='lister'?$('#search-results'):$('#search-table');target.innerHTML='<div class="empty-state"><strong>Поиск офферов…</strong><p>Получаем результаты из FunPay.</p></div>';if(source==='lister')$('#search-results-panel').classList.remove('hidden');try{const {data}=await api(`/api/funpay/offers?subcategory_id=${encodeURIComponent(subId)}&q=${encodeURIComponent(q)}`);renderOfferTable(target,data);if(source==='lister')$('#search-result-sub').textContent=`Найдено предложений: ${data.length}`;else toast(`Найдено предложений: ${data.length}`,'ok');const catId=source==='lister'?$('#game-select').value:$('#search-game').value;const game=state.categories.find(c=>String(c.id)===catId);$('#search-open-funpay').onclick=()=>window.open(`https://funpay.com/lots/${subId}/?query=${encodeURIComponent(q)}`,'_blank','noopener');}catch(e){target.innerHTML=`<div class="empty-state"><strong>Поиск не выполнен</strong><p>${esc(e.message)}</p></div>`;toast(e.message,'error')}}
-function renderOfferTable(target,offers){if(!offers.length){target.innerHTML='<div class="empty-state"><svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><strong>Офферы не найдены</strong><p>Попробуйте сократить запрос или выбрать другой раздел.</p></div>';return}target.innerHTML=`<div class="table-wrap"><table><thead><tr><th>Предложение</th><th>Продавец</th><th>Количество</th><th>Цена</th><th></th></tr></thead><tbody>${offers.map(o=>`<tr><td><div class="cell-main">${esc(o.title)}</div>${o.server?`<div class="cell-sub">${esc(o.server)}</div>`:''}</td><td>${esc(o.seller)}</td><td>${esc(o.amount||'—')}</td><td class="price">${esc(o.price_text||'—')}</td><td><a class="btn btn-small" href="${esc(o.url)}" target="_blank" rel="noopener noreferrer" style="text-decoration:none">Открыть</a></td></tr>`).join('')}</tbody></table></div>`}
-async function loadMyLots(){if(!state.connected){toast('Подключите FunPay.','warn');return}const subId=Number($('#lots-subcategory').value);if(!subId){$('#my-lots-table').innerHTML='<div class="empty-state"><strong>Выберите раздел</strong><p>Укажите игру и раздел, чтобы загрузить собственные офферы.</p></div>';return}$('#my-lots-table').innerHTML='<div class="empty-state"><strong>Загружаем офферы…</strong></div>';try{const {data}=await api('/api/funpay/lots?subcategory_id='+encodeURIComponent(subId));$('#stat-offers').textContent=data.length;$('#offers-badge').textContent=data.length;renderMyLots(data)}catch(e){$('#my-lots-table').innerHTML=`<div class="empty-state"><strong>Не удалось загрузить офферы</strong><p>${esc(e.message)}</p></div>`;toast(e.message,'error')}}
-function renderMyLots(lots){if(!lots.length){$('#my-lots-table').innerHTML='<div class="empty-state"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/><path d="M3 4h18v16H3z"/></svg><strong>Офферов в этом разделе нет</strong><p>Создайте первое предложение через Auto Lister.</p><button class="btn btn-primary" data-go="lister">Создать оффер</button></div>';return}$('#my-lots-table').innerHTML=`<div class="toolbar"><span class="pill">${lots.length} офферов</span><span class="toolbar-spacer"></span><span class="field-hint">Выберите предложения для массового поднятия.</span></div><div class="table-wrap"><table><thead><tr><th><input id="lot-check-all" type="checkbox" aria-label="Выбрать все"></th><th>ID</th><th>Название</th><th>Количество</th><th>Цена</th><th>Действия</th></tr></thead><tbody>${lots.map(o=>`<tr><td><input type="checkbox" class="lot-check" data-id="${esc(o.id)}" ${state.selectedLots.has(Number(o.id))?'checked':''}></td><td class="mono">#${esc(o.id)}</td><td><div class="cell-main">${esc(o.description||o.title||'Без названия')}</div><div class="cell-sub">${esc(o.subcategory_name||'FunPay')}</div></td><td>${esc(o.amount??'—')}</td><td class="price">${Number(o.price||0).toLocaleString('ru-RU',{maximumFractionDigits:2})} ${esc(o.currency||'RUB')}</td><td><div style="display:flex;gap:5px"><button class="btn btn-small" data-lot-edit="${esc(o.id)}">Изменить</button><button class="btn btn-small btn-danger" data-lot-delete="${esc(o.id)}">Удалить</button></div></td></tr>`).join('')}</tbody></table></div>`}
-async function openEdit(lotId){try{const {data}=await api(`/api/funpay/lots/${lotId}/fields`);state.editingLot=lotId;$('#edit-subtitle').textContent='Оффер #'+lotId;$('#edit-title').value=data.title||'';$('#edit-description').value=data.description||'';$('#edit-price').value=data.price||'';$('#edit-amount').value=data.amount||'1';$('#edit-active').checked=!!data.active;$('#edit-modal').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
-function closeEdit(){$('#edit-modal').classList.add('hidden');state.editingLot=null}
-$('#edit-form').addEventListener('submit',async e=>{e.preventDefault();if(!state.editingLot)return;const submit=e.submitter;submit.disabled=true;try{await api(`/api/funpay/lots/${state.editingLot}`,{method:'PUT',body:{title:$('#edit-title').value.trim(),description:$('#edit-description').value,price:Number($('#edit-price').value),amount:Number($('#edit-amount').value),active:$('#edit-active').checked}});toast('Оффер обновлён','ok');closeEdit();loadMyLots()}catch(err){toast(err.message,'error')}finally{submit.disabled=false}});
-async function deleteMyLot(id){if(!confirm(`Удалить оффер #${id} на FunPay?`))return;try{await api(`/api/funpay/lots/${id}`,{method:'DELETE'});state.selectedLots.delete(Number(id));toast('Оффер удалён','ok');loadMyLots()}catch(e){toast(e.message,'error')}}
-async function raiseSelected(){const ids=[...state.selectedLots];if(!ids.length){toast('Сначала отметьте офферы в таблице.','warn');return}if(!confirm(`Поднять ${ids.length} выбранных офферов? FunPay может ограничивать частоту операции.`))return;try{const {data}=await api('/api/funpay/lots/raise',{method:'POST',body:{ids}});toast(data.error?'FunPay не поднял офферы':`Запрос на поднятие отправлен: ${ids.length}` ,data.error?'warn':'ok');}catch(e){toast(e.message,'error')}}
-let chatsLoading=false;let lastChatsRefresh=0;let renderedHistorySignature='';let activeHistoryPollBusy=false;let lastActiveHistoryPoll=0;let chatSendBusy=false;let selectedChatImage=null;let selectedChatImageUrl=null;
-async function loadChats(silent=false){if(!state.connected){renderDashboardChats();return}if(chatsLoading)return;chatsLoading=true;if(!silent)$('#chat-list').innerHTML='<div class="empty-state"><strong>Загрузка чатов…</strong></div>';try{const {data}=await api('/api/funpay/chats');state.chats=Array.isArray(data)?data:[];lastChatsRefresh=Date.now();const unread=state.chats.reduce((n,c)=>n+Number(c.unread_count||0),0);$('#chats-badge').textContent=unread||'0';$('#stat-chats').textContent=state.chats.length;$('#stat-unread').textContent='Непрочитанных: '+unread;renderChats();renderDashboardChats()}catch(e){if(!silent)$('#chat-list').innerHTML=`<div class="empty-state"><strong>Ошибка загрузки</strong><p>${esc(e.message)}</p></div>`;if(!silent)toast(e.message,'error')}finally{chatsLoading=false}}
-function renderChats(){const filter=($('#chat-filter')?.value||'').toLowerCase();const chats=state.chats.filter(c=>((c.name||'')+' '+(c.last_message_text||'')).toLowerCase().includes(filter));if(!chats.length){$('#chat-list').innerHTML='<div class="empty-state"><strong>Чаты не найдены</strong><p>Попробуйте изменить запрос.</p></div>';return}$('#chat-list').innerHTML=chats.map(c=>`<button class="chat-item ${String(state.activeChat?.id)===String(c.id)?'active':''}" data-chat-id="${esc(c.id)}">${avatarMarkup(c.interlocutor_id||c.id,c.name||'FP')}<span class="chat-meta"><span class="chat-name"><span>${esc(c.name||'Пользователь')}</span>${Number(c.unread_count)>0?`<span class="unread">${esc(c.unread_count)}</span>`:''}</span><span class="chat-preview">${esc(c.last_message_text||'Нет сообщений')}</span></span></button>`).join('')}
-let chatHistoryRequest=0;
-function renderChatHistory(messages, keepText=''){
- const list=Array.isArray(messages)?messages.slice():[];
- if(keepText&&!list.some(m=>!m.is_incoming&&String(m.text||'')===keepText)){list.push({id:'optimistic-'+hashSeed(keepText),text:keepText,author:'Вы',is_incoming:false,timestamp:'Только что',local_pending:true})}
- const signature=JSON.stringify(list.map(m=>[String(m.id??''),String(m.text??''),String(m.image_link??''),!!m.is_incoming,String(m.timestamp??''),!!m.local_pending]));
- if(signature===renderedHistorySignature)return;renderedHistorySignature=signature;
- const box=$('#chat-messages');const wasNearBottom=box.scrollHeight-box.scrollTop-box.clientHeight<75;const previousScroll=box.scrollTop;
- if(!list.length){box.innerHTML='<div class="empty-state"><strong>История пока пуста</strong><p>Новые сообщения появятся здесь автоматически.</p></div>';return}
- box.innerHTML=list.map(m=>`<div class="message ${m.is_incoming?'':'outgoing'} ${m.local_pending?'pending':''}" data-message-id="${esc(m.id??'')}">${m.image_link?`<a href="${esc(m.image_link)}" target="_blank" rel="noopener noreferrer"><img class="message-image" src="${esc(m.image_link)}" alt="Фотография" loading="lazy"></a>`:''}${m.text?`<div>${esc(m.text)}</div>`:(!m.image_link?'<div>Изображение</div>':'') }<div class="message-meta">${esc(m.author||(m.is_incoming?'Собеседник':'Вы'))}${m.timestamp?' · '+esc(m.timestamp):''}${m.local_pending?' · ожидается подтверждение…':''}</div></div>`).join('');
- if(wasNearBottom)box.scrollTop=box.scrollHeight;else box.scrollTop=previousScroll;
+:root{
+  --bg:#070708;--panel:#0f0f11;--panel2:#15151a;--panel3:#1c1c22;--field:#0b0b0d;
+  --text:#ededf0;--muted:#8e8e97;--faint:#5b5b64;
+  --line:rgba(255,255,255,.12);--line2:rgba(255,255,255,.2);--line3:rgba(255,255,255,.34);
+  --white:#fff;--danger:#ff8f8f;
+  --r:14px;--r2:11px;--kb:0px;--vh:100dvh;--bg-opacity:.2;--bg-image:none;
+  --shadow:0 22px 70px rgba(0,0,0,.6);
+  --font:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+  color-scheme:dark;
 }
-async function openChat(id){const c=state.chats.find(x=>String(x.id)===String(id));if(!c)return;state.activeChat=c;renderChats();const requestId=++chatHistoryRequest;renderedHistorySignature='';$('#chat-main-head').innerHTML=`<div class="panel-title">${esc(c.name||'Пользователь')}</div><div class="panel-sub">Чат FunPay · #${esc(c.id)} · история в реальном времени</div>`;$('#chat-messages').innerHTML='<div class="empty-state"><strong>Открываем чат…</strong></div>';$('#chat-message').disabled=false;$('#chat-send').disabled=false;$('#chat-attach').disabled=false;try{const {data}=await api('/api/funpay/chats/'+encodeURIComponent(id));if(requestId!==chatHistoryRequest||String(state.activeChat?.id)!==String(id))return;renderChatHistory(data)}catch(e){if(requestId===chatHistoryRequest)$('#chat-messages').innerHTML=`<div class="empty-state"><strong>Не удалось загрузить</strong><p>${esc(e.message)}</p></div>`}}
-function showSelectedImage(file){clearSelectedImage(false);if(!file)return;selectedChatImage=file;selectedChatImageUrl=URL.createObjectURL(file);const target=$('#chat-image-preview');target.classList.remove('hidden');target.innerHTML=`<img src="${selectedChatImageUrl}" alt="Предпросмотр фото"><span class="preview-file-name">${esc(file.name)} · ${(file.size/1024/1024).toFixed(2)} МБ</span><button type="button" id="chat-image-remove" aria-label="Убрать фотографию">×</button>`;$('#chat-image-remove').addEventListener('click',()=>clearSelectedImage())}
-function clearSelectedImage(clearInput=true){selectedChatImage=null;if(selectedChatImageUrl){URL.revokeObjectURL(selectedChatImageUrl);selectedChatImageUrl=null}const target=$('#chat-image-preview');if(target){target.classList.add('hidden');target.innerHTML=''}if(clearInput&&$('#chat-image'))$('#chat-image').value=''}
-$('#chat-attach').addEventListener('click',()=>$('#chat-image').click());$('#chat-image').addEventListener('change',e=>{const file=e.target.files?.[0];if(!file)return;if(!/^image\/(jpeg|png|webp|gif)$/i.test(file.type)){toast('Выберите JPG, PNG, WEBP или GIF.','warn');clearSelectedImage();return}if(file.size>8*1024*1024){toast('Максимальный размер фотографии — 8 МБ.','warn');clearSelectedImage();return}showSelectedImage(file)});
-function fileToBase64(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onerror=()=>reject(new Error('Не удалось прочитать фотографию'));reader.onload=()=>{const result=String(reader.result||'');const comma=result.indexOf(',');if(comma<0)reject(new Error('Не удалось подготовить фотографию'));else resolve(result.slice(comma+1))};reader.readAsDataURL(file)})}
-function appendPendingImage(file){const box=$('#chat-messages');const bubble=document.createElement('div');bubble.className='message outgoing pending';const img=document.createElement('img');img.className='message-image';img.alt='Отправляемая фотография';img.src=selectedChatImageUrl||URL.createObjectURL(file);bubble.append(img);const meta=document.createElement('div');meta.className='message-meta';meta.textContent='Отправка фотографии…';bubble.append(meta);box.append(bubble);box.scrollTop=box.scrollHeight;return {bubble,meta}}
-function appendPendingText(text){const box=$('#chat-messages');const bubble=document.createElement('div');bubble.className='message outgoing pending';const copy=document.createElement('div');copy.textContent=text;bubble.append(copy);const meta=document.createElement('div');meta.className='message-meta';meta.textContent='Отправка…';bubble.append(meta);box.append(bubble);box.scrollTop=box.scrollHeight;return {bubble,meta}}
-$('#chat-send-form').addEventListener('submit',async e=>{
- e.preventDefault();if(chatSendBusy||!state.activeChat)return;const text=$('#chat-message').value.trim();const file=selectedChatImage;if(!text&&!file)return;const chatId=state.activeChat.id;const btn=$('#chat-send'),input=$('#chat-message'),attach=$('#chat-attach');chatSendBusy=true;btn.disabled=true;input.disabled=true;attach.disabled=true;
- try{
-  if(file){const pending=appendPendingImage(file);try{const base64=await fileToBase64(file);const {data}=await api(`/api/funpay/chats/${encodeURIComponent(chatId)}/send-image`,{method:'POST',body:{filename:file.name,mime_type:file.type||'image/jpeg',data:base64}});if(data?.ok!==true||!data.message_id)throw new Error('FunPay не подтвердил отправку фотографии');pending.meta.textContent='Фотография отправлена';pending.bubble.classList.remove('pending');const sentPreviewUrl=selectedChatImageUrl;const sentImg=pending.bubble.querySelector('img');if(data.image_link&&sentImg)sentImg.src=data.image_link;selectedChatImageUrl=null;if(!data.image_link&&sentImg&&sentPreviewUrl)sentImg.addEventListener('load',()=>URL.revokeObjectURL(sentPreviewUrl),{once:true});else if(sentPreviewUrl)URL.revokeObjectURL(sentPreviewUrl);toast('Фотография отправлена','ok',1800);const c=state.chats.find(x=>String(x.id)===String(chatId));if(c){c.last_message_text='[Фотография]';c.last_message_author='Вы';c.last_message_date=data.timestamp||new Date().toISOString()}clearSelectedImage();renderChats();renderDashboardChats()}catch(photoErr){pending.bubble.classList.add('send-failed');pending.meta.textContent='Не отправлено · '+photoErr.message;toast(photoErr.message,'error');return}}
-  if(text){const pending=appendPendingText(text);try{const {data}=await api(`/api/funpay/chats/${encodeURIComponent(chatId)}/send`,{method:'POST',body:{text}});if(data?.ok!==true||!data.message_id)throw new Error('FunPay не подтвердил отправку сообщения');pending.meta.textContent='Отправлено · '+(data.timestamp||'подтверждено FunPay');pending.bubble.classList.remove('pending');input.value='';toast('Сообщение отправлено','ok',1500);const c=state.chats.find(x=>String(x.id)===String(chatId));if(c){c.last_message_text=text;c.last_message_author='Вы';c.last_message_date=data.timestamp||new Date().toISOString()}renderChats();renderDashboardChats()}catch(sendErr){pending.bubble.classList.add('send-failed');pending.meta.textContent='Не отправлено · '+sendErr.message;toast(sendErr.message,'error')}}
-  setTimeout(()=>pollActiveChat(true),650);
- }finally{chatSendBusy=false;btn.disabled=!state.activeChat;input.disabled=!state.activeChat;attach.disabled=!state.activeChat;input.focus()}
-});
-async function pollActiveChat(force=false){if(activeHistoryPollBusy||!state.session||!state.connected||!state.activeChat||state.page!=='chats'||document.hidden)return;const now=Date.now();if(!force&&now-lastActiveHistoryPoll<950)return;activeHistoryPollBusy=true;lastActiveHistoryPoll=now;const chatId=state.activeChat.id;try{const {data}=await api('/api/funpay/chats/'+encodeURIComponent(chatId));if(String(state.activeChat?.id)===String(chatId))renderChatHistory(data)}catch(e){if(e.message.includes('Сессия'))return;/* Silent refresh: no spinner/toast for transient errors. */}finally{activeHistoryPollBusy=false}}
-async function loadOrders(){if(!state.connected){toast('Подключите FunPay.','warn');return}$('#orders-table').innerHTML='<div class="empty-state"><strong>Загрузка заказов…</strong></div>';try{const {data}=await api('/api/funpay/orders?limit=100');state.orders=data;$('#stat-orders').textContent=data.length;if(!data.length){$('#orders-table').innerHTML='<div class="empty-state"><svg viewBox="0 0 24 24"><path d="M7 3h10l3 4v14H4V7zM4 7h16"/></svg><strong>Активных заказов нет</strong><p>Когда появятся продажи, они будут отображаться в этом разделе.</p></div>';return}$('#orders-table').innerHTML=`<div class="toolbar"><span class="pill">${data.length} заказов</span></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>Заказ</th><th>Покупатель</th><th>Статус</th><th>Дата</th><th>Сумма</th></tr></thead><tbody>${data.map(o=>`<tr><td class="mono">#${esc(o.id)}</td><td><div class="cell-main">${esc(o.description||'Заказ FunPay')}</div><div class="cell-sub">${esc([o.game,o.server].filter(Boolean).join(' · '))}</div></td><td>${esc(o.buyer_username||'—')}</td><td><span class="pill ${o.status==='paid'?'good':''}">${esc(o.status||'—')}</span></td><td>${esc(o.date||'—')}</td><td class="price">${Number(o.price||0).toLocaleString('ru-RU',{maximumFractionDigits:2})} ${esc(o.currency||'RUB')}</td></tr>`).join('')}</tbody></table></div>`}catch(e){$('#orders-table').innerHTML=`<div class="empty-state"><strong>Не удалось загрузить заказы</strong><p>${esc(e.message)}</p></div>`;toast(e.message,'error')}}
-$('#fp-connect-form').addEventListener('submit',async e=>{e.preventDefault();const btn=$('#fp-connect-btn');btn.disabled=true;btn.textContent='Подключение…';$('#fp-connect-result').innerHTML='';try{const {data}=await api('/api/funpay/connect',{method:'POST',body:{golden_key:$('#fp-golden-key').value.trim(),user_agent:($('#fp-user-agent').value.trim()||defaultUserAgent)}});$('#fp-golden-key').value='';state.profile=data.profile||null;updateConnection(true,data.profile?.username||'');localStorage.setItem('fpal.user-agent',$('#fp-user-agent').value.trim()||defaultUserAgent);$('#fp-connect-result').innerHTML='<div class="notice">Аккаунт подключён. Сессионный ключ не сохраняется в файлы, но остаётся в памяти процесса до отключения или перезапуска.</div>';await loadCategories();await loadDashboardData();toast('FunPay подключён','ok')}catch(err){$('#fp-connect-result').innerHTML=`<div class="notice" style="border-color:#ff71884a;color:#ff9aa9">${esc(err.message)}</div>`;toast(err.message,'error')}finally{btn.disabled=false;btn.textContent='Подключить аккаунт'}});
-$('#fp-disconnect').addEventListener('click',async()=>{try{await api('/api/funpay/disconnect',{method:'POST'});state.categories=[];state.subcats.clear();state.chats=[];state.orders=[];updateConnection(false);populateAllCategorySelects();$('#stat-balance').textContent='—';$('#stat-offers').textContent='—';$('#stat-chats').textContent='—';$('#stat-orders').textContent='—';toast('Аккаунт отключён','ok')}catch(e){toast(e.message,'error')}});
-$$('[data-page]').forEach(btn=>btn.addEventListener('click',()=>setPage(btn.dataset.page)));document.addEventListener('click',e=>{const go=e.target.closest('[data-go]');if(go){setPage(go.dataset.go);return}const ce=e.target.closest('[data-chat-id]');if(ce){if(state.page!=='chats')setPage('chats');openChat(ce.dataset.chatId);return}const edit=e.target.closest('[data-lot-edit]');if(edit)openEdit(edit.dataset.lotEdit);const del=e.target.closest('[data-lot-delete]');if(del)deleteMyLot(del.dataset.lotDelete)});
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+html{-webkit-text-size-adjust:100%;touch-action:manipulation}
+body{background:var(--bg);color:var(--text);font:400 15px/1.45 var(--font);-webkit-font-smoothing:antialiased;overflow:hidden;overscroll-behavior:none}
+body::before{content:"";position:fixed;inset:0;z-index:-2;background:var(--bg-image) center/cover no-repeat;opacity:var(--bg-opacity);filter:grayscale(.55) brightness(.8);pointer-events:none}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;background:radial-gradient(1100px 620px at 18% -12%,rgba(255,255,255,.07),transparent 62%),linear-gradient(180deg,rgba(7,7,8,.25),rgba(7,7,8,.93) 72%)}
+button,input,textarea,select{font:inherit;color:inherit}
+button{cursor:pointer;-webkit-tap-highlight-color:transparent}
+a{color:inherit}
+[hidden]{display:none!important}
+:focus-visible{outline:2px solid var(--white);outline-offset:2px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.mono{font-variant-numeric:tabular-nums}
+.muted{color:var(--muted)}.faint{color:var(--faint)}.small{font-size:13px}.tiny{font-size:12px}
+.row{display:flex;align-items:center;gap:10px;min-width:0}
+.between{justify-content:space-between}.grow{flex:1 1 auto;min-width:0}.wrap-row{flex-wrap:wrap}
+.stack{display:flex;flex-direction:column;gap:12px;min-width:0}
+.grid{display:grid;gap:12px;min-width:0}
+.g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+@media(max-width:640px){.g3{grid-template-columns:repeat(2,minmax(0,1fr))}.g3>:last-child:nth-child(odd){grid-column:1/-1}}
+@media(max-width:380px){.g2{grid-template-columns:minmax(0,1fr)}}
+.ellipsis{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 
-let catalogSearchTimer=null;let catalogSearchAbort=null;let currentCatalogTarget=null;let currentCatalogInput=null;
-async function runCatalogSearch(inputSelector='#catalog-search',targetSelector='#catalog-results'){
- const input=$(inputSelector),target=$(targetSelector);if(!input||!target)return;const q=input.value.trim();currentCatalogTarget=targetSelector;currentCatalogInput=inputSelector;
- if(!state.connected){target.innerHTML='<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">!</span><span class="catalog-result-main"><span class="catalog-result-name">Сначала подключите FunPay</span><span class="catalog-result-path">Откройте Настройки и подключите сессию</span></span></div>';return}
- if(catalogSearchAbort)catalogSearchAbort.abort();catalogSearchAbort=new AbortController();target.classList.remove('hidden');target.innerHTML='<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">⌕</span><span class="catalog-result-main"><span class="catalog-result-name">Ищем в каталоге FunPay…</span><span class="catalog-result-path">Каталог кешируется; запрос не блокирует интерфейс</span></span></div>';
- try{const {data}=await api('/api/funpay/catalog/search?q='+encodeURIComponent(q),{signal:catalogSearchAbort.signal});state.catalogResults=data||[];
- if(!state.catalogResults.length){target.innerHTML='<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">⌕</span><span class="catalog-result-main"><span class="catalog-result-name">Ничего не найдено</span><span class="catalog-result-path">Попробуйте другое слово или выберите категорию в Auto Lister</span></span></div>';return}
- target.innerHTML=state.catalogResults.map((x,i)=>`<button type="button" class="catalog-result" data-catalog-index="${i}" data-catalog-source="${inputSelector==='#dashboard-catalog-search'?'dashboard':'lister'}"><span class="catalog-result-ico">${x.type==='category'?'G':'↳'}</span><span class="catalog-result-main"><span class="catalog-result-name">${esc(x.name)}</span><span class="catalog-result-path">${x.type==='category'?'Категория':esc(x.category_name)+' · раздел'}</span></span><span class="catalog-result-arrow">›</span></button>`).join('')
- }catch(e){if(e.name==='AbortError')return;target.innerHTML=`<div class="catalog-result"><span class="catalog-result-ico">!</span><span class="catalog-result-main"><span class="catalog-result-name">Поиск недоступен</span><span class="catalog-result-path">${esc(e.message)}</span></span></div>`}
-}
-$('#catalog-search')?.addEventListener('input',()=>{clearTimeout(catalogSearchTimer);catalogSearchTimer=setTimeout(()=>runCatalogSearch('#catalog-search','#catalog-results'),240)});
-$('#dashboard-catalog-search')?.addEventListener('input',()=>{clearTimeout(catalogSearchTimer);catalogSearchTimer=setTimeout(()=>runCatalogSearch('#dashboard-catalog-search','#dashboard-catalog-results'),260)});
-$('#dashboard-search-btn')?.addEventListener('click',()=>runCatalogSearch('#dashboard-catalog-search','#dashboard-catalog-results'));
-$('#dashboard-catalog-search')?.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();runCatalogSearch('#dashboard-catalog-search','#dashboard-catalog-results')}});
-$$('[data-game-query]').forEach(button=>button.addEventListener('click',()=>{const input=$('#dashboard-catalog-search');input.value=button.dataset.gameQuery||'';runCatalogSearch('#dashboard-catalog-search','#dashboard-catalog-results')}));
-document.addEventListener('click',async e=>{const button=e.target.closest('[data-catalog-index]');if(!button)return;const item=state.catalogResults[Number(button.dataset.catalogIndex)];if(!item)return;const fromDashboard=button.dataset.catalogSource==='dashboard';if(fromDashboard)setPage('lister');$('#game-select').value=String(item.category_id);await fillSubcategories('#game-select','#subcategory-select');if(item.subcategory_id!==null&&item.subcategory_id!==undefined){$('#subcategory-select').value=String(item.subcategory_id)}persistCategory();updatePreview();$('#catalog-search').value=item.type==='subcategory'?`${item.category_name} / ${item.name}`:item.name;$('#catalog-results').innerHTML=`<div class="catalog-result" style="pointer-events:none"><span class="catalog-result-ico">✓</span><span class="catalog-result-main"><span class="catalog-result-name">${esc(item.name)} выбрано</span><span class="catalog-result-path">Категория запомнена для следующих запусков</span></span></div>`;$('#dashboard-catalog-results').classList.add('hidden');toast('Категория выбрана','ok',1800)});
-$('#game-select').addEventListener('change',()=>{localStorage.setItem('fpal.category.game',$('#game-select').value);localStorage.removeItem('fpal.category.sub');fillSubcategories('#game-select','#subcategory-select').then(()=>{persistCategory();updatePreview()})});$('#search-game').addEventListener('change',()=>fillSubcategories('#search-game','#search-subcategory'));$('#lots-game').addEventListener('change',()=>fillSubcategories('#lots-game','#lots-subcategory').then(loadMyLots));$('#subcategory-select').addEventListener('change',()=>{persistCategory();updatePreview()});['#lot-title','#lot-description','#lot-price','#lot-amount'].forEach(id=>$(id).addEventListener('input',updatePreview));
-$$('[data-mode]').forEach(btn=>btn.addEventListener('click',()=>{state.mode=btn.dataset.mode;$$('[data-mode]').forEach(b=>b.classList.toggle('active',b===btn));$$('.sell-only').forEach(el=>el.classList.toggle('hidden',state.mode!=='sell'));$$('.buy-only').forEach(el=>el.classList.toggle('hidden',state.mode!=='buy'));$('#lister-submit').querySelector('span').textContent=state.mode==='sell'?'Создать оффер':'Найти офферы';$('#preview-title').textContent=state.mode==='sell'?'Ваш оффер':'Поиск предложений';}));$('#lister-submit').addEventListener('click',listerSubmit);$('#lister-reset').addEventListener('click',()=>{$('#lot-title').value='';$('#lot-description').value='';$('#lot-price').value='';$('#lot-amount').value='1';$('#offer-query').value='';updatePreview()});$('#search-run').addEventListener('click',()=>runOfferSearch('search'));$('#search-query').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();runOfferSearch('search')}});$('#offer-query').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();runOfferSearch('lister')}});$('#search-clear').addEventListener('click',()=>{$('#search-query').value='';$('#search-table').innerHTML='<div class="empty-state"><strong>Задайте параметры поиска</strong><p>Выберите игру и раздел — результаты появятся здесь.</p></div>'});$('#lots-refresh').addEventListener('click',loadMyLots);$('#raise-selected').addEventListener('click',raiseSelected);$('#lot-check-all')?.addEventListener('change',e=>$$('.lot-check').forEach(ch=>{ch.checked=e.target.checked;const id=Number(ch.dataset.id);e.target.checked?state.selectedLots.add(id):state.selectedLots.delete(id)}));$('#my-lots-table').addEventListener('change',e=>{if(e.target.classList.contains('lot-check')){const id=Number(e.target.dataset.id);e.target.checked?state.selectedLots.add(id):state.selectedLots.delete(id)}});$('#chats-refresh').addEventListener('click',loadChats);$('#chat-filter').addEventListener('input',renderChats);$('#orders-refresh').addEventListener('click',loadOrders);$('#refresh-btn').addEventListener('click',async()=>{sound('click');if(state.connected){await refreshConnectionStatus();await loadDashboardData();if(state.page==='chats')loadChats();if(state.page==='orders')loadOrders();if(state.page==='listings')loadMyLots()}else toast('Подключите аккаунт FunPay в настройках.','warn')});$('#menu-toggle').addEventListener('click',()=>{$('#sidebar').classList.toggle('open');$('#scrim').classList.toggle('show')});$('#scrim').addEventListener('click',()=>{$('#sidebar').classList.remove('open');$('#scrim').classList.remove('show')});$('#edit-close').addEventListener('click',closeEdit);$('#edit-cancel').addEventListener('click',closeEdit);$('#edit-modal').addEventListener('click',e=>{if(e.target.id==='edit-modal')closeEdit()});$('#logout-btn').addEventListener('click',logout);
-function setSound(value){soundEnabled=value;localStorage.setItem('fpal.sound',value?'on':'off');$('#sound-toggle').checked=value;$('#sound-btn').style.color=value?'#c5b4ff':'#77778b';if(value)sound('ok')}$('#sound-toggle').addEventListener('change',e=>setSound(e.target.checked));$('#sound-btn').addEventListener('click',()=>setSound(!soundEnabled));$('#auto-refresh-toggle').addEventListener('change',e=>{autoRefresh=e.target.checked;localStorage.setItem('fpal.refresh',autoRefresh?'on':'off');toast(autoRefresh?'Автообновление включено':'Автообновление выключено','info')});
-$('#my-lots-table').addEventListener('click',e=>{const all=e.target.closest('#lot-check-all');if(all)$$('.lot-check').forEach(ch=>{ch.checked=all.checked;const id=Number(ch.dataset.id);all.checked?state.selectedLots.add(id):state.selectedLots.delete(id)})});
-async function refreshTick(){if(!state.session||!autoRefresh||document.hidden||!state.connected)return;const now=Date.now();if(state.page==='chats'&&state.activeChat){pollActiveChat();if(now-lastChatsRefresh>6500)loadChats(true);return}if((state.page==='chats'||state.page==='dashboard')&&now-lastChatsRefresh>4000)loadChats(true)}
-// Fast local scheduler; upstream history requests are rate-limited to about once per second.
-setInterval(refreshTick,250);setInterval(()=>{if(state.session&&autoRefresh&&!document.hidden)pollActiveChat()},1000);
-$('#refresh-dashboard-data')?.addEventListener('click',async()=>{if(state.connected){await refreshConnectionStatus();await loadDashboardData();await loadChats(true);toast('Данные обновлены','ok',1400)}else{toast('Подключите FunPay в настройках.','warn');setPage('settings')}});
-$('#sidebar').addEventListener('click',e=>{const b=e.target.closest('.nav-item');if(b)sound('click')});
-document.addEventListener('keydown',e=>{const tag=document.activeElement?.tagName;if(e.key==='Escape'){$('#sidebar').classList.remove('open');$('#scrim').classList.remove('show');closeEdit()}if(e.key.toLowerCase()==='f'&&!e.ctrlKey&&!e.metaKey&&!e.altKey&&!['INPUT','TEXTAREA','SELECT'].includes(tag)){e.preventDefault();toggleFs()}});
-// Telegram Mini App fullscreen first; browser fullscreen is only a fallback outside Telegram.
-const fsBtn=$('#fs');const tgApp=window.Telegram&&window.Telegram.WebApp;
-const telegramFs=()=>!!(tgApp&&typeof tgApp.requestFullscreen==='function'&&typeof tgApp.isVersionAtLeast==='function'&&tgApp.isVersionAtLeast('8.0'));
-const isFs=()=>telegramFs()?!!tgApp.isFullscreen:!!(document.fullscreenElement||document.webkitFullscreenElement||document.msFullscreenElement);
-async function toggleFs(){
- try{
-  if(telegramFs()){
-   if(tgApp.isFullscreen&&typeof tgApp.exitFullscreen==='function')tgApp.exitFullscreen();
-   else tgApp.requestFullscreen();
-   return;
-  }
-  if(tgApp&&typeof tgApp.expand==='function'){tgApp.expand();return;}
-  if(document.fullscreenElement){if(document.exitFullscreen)await document.exitFullscreen();return;}
-  const el=document.documentElement;
-  if(el.requestFullscreen)await el.requestFullscreen();else if(el.webkitRequestFullscreen)el.webkitRequestFullscreen();else throw new Error('Полноэкранный режим недоступен в этом браузере');
- }catch(e){console.warn('Fullscreen request failed:',e);if(tgApp&&tgApp.expand)tgApp.expand();}
-}
-function syncFullscreenButton(){fsBtn.textContent=isFs()?'✕':'⛶';document.body.classList.toggle('is-fs',isFs());}
-fsBtn.addEventListener('click',toggleFs);
-['fullscreenchange','webkitfullscreenchange','msfullscreenchange'].forEach(ev=>document.addEventListener(ev,syncFullscreenButton));
-if(tgApp&&typeof tgApp.onEvent==='function'){
- try{tgApp.onEvent('fullscreenChanged',syncFullscreenButton);tgApp.onEvent('fullscreenFailed',()=>{syncFullscreenButton();console.warn('Telegram declined fullscreen request')});}catch{}
-}
-async function init(){const tg=window.Telegram&&window.Telegram.WebApp;if(tg){try{tg.ready();tg.expand();if(typeof tg.setHeaderColor==='function')tg.setHeaderColor('#101018');if(typeof tg.setBackgroundColor==='function')tg.setBackgroundColor('#0c0c13');if(typeof tg.disableVerticalSwipes==='function')tg.disableVerticalSwipes();if(typeof tg.requestFullscreen==='function'&&typeof tg.isVersionAtLeast==='function'&&tg.isVersionAtLeast('8.0')&&!tg.isFullscreen)tg.requestFullscreen();}catch{}}if(state.session){$('#login-view').classList.add('hidden');$('#app').classList.remove('hidden');try{await bootApp()}catch(e){if(!e.message.includes('Сессия'))toast(e.message,'error')}}syncFullscreenButton();if(tg?.initData&&Number(tg.initDataUnsafe?.user?.id)===8357023784){setTimeout(()=>{if($('#login-view').classList.contains('hidden'))return;performLogin()},0)}}init();
-// Block browser pinch/double-tap zoom while preserving scrolling inside the app.
-document.addEventListener('gesturestart',e=>e.preventDefault(),{passive:false});document.addEventListener('gesturechange',e=>e.preventDefault(),{passive:false});document.addEventListener('wheel',e=>{if(e.ctrlKey)e.preventDefault()},{passive:false});let lastTouchEnd=0;document.addEventListener('touchend',e=>{const now=Date.now();if(now-lastTouchEnd<=280)e.preventDefault();lastTouchEnd=now},{passive:false});
-})();
-</script>
-</body></html>'''
+/* ---- shell ---- */
+#app{height:var(--vh);display:grid;grid-template-columns:248px minmax(0,1fr);overflow:hidden}
+.side{display:flex;flex-direction:column;gap:18px;padding:18px 12px;min-height:0;overflow:auto;border-right:1px solid var(--line);background:rgba(9,9,11,.93)}
+.brand{display:flex;align-items:center;gap:11px;padding:4px 8px}
+.brand-name{font-weight:800;letter-spacing:.01em}
+.mark{width:36px;height:36px;flex:none;border-radius:11px;border:1px solid var(--line3);display:grid;place-items:center;background:linear-gradient(145deg,#25252c,#0b0b0d);box-shadow:inset 0 1px 0 rgba(255,255,255,.12)}
+.mark svg{width:19px;height:19px}
+.nav{display:flex;flex-direction:column;gap:4px}
+.nav button{display:flex;align-items:center;gap:11px;width:100%;padding:10px 11px;border-radius:var(--r2);border:1px solid transparent;background:none;color:var(--muted);text-align:left;font-weight:600}
+.nav button:hover{color:var(--text);border-color:var(--line)}
+.nav button[aria-current="page"]{color:#fff;border-color:var(--line3);background:rgba(255,255,255,.07)}
+.side-foot{display:flex;flex-direction:column;gap:10px}
+.main{display:flex;flex-direction:column;min-width:0;min-height:0}
+.topbar{display:flex;align-items:center;gap:8px;padding:12px 22px;min-height:66px;border-bottom:1px solid var(--line);background:rgba(7,7,8,.72);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+.title{font-weight:800;font-size:17px;letter-spacing:.01em;margin-right:auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.view{flex:1 1 auto;min-height:0;overflow:auto;padding:22px;display:flex;flex-direction:column;min-width:0;overscroll-behavior:contain}
+.view-inner{width:100%;max-width:1120px;margin:0 auto;display:flex;flex-direction:column;gap:16px;min-width:0}
+.iconbtn{position:relative;width:42px;height:42px;flex:none;display:grid;place-items:center;border-radius:12px;border:1px solid var(--line2);background:rgba(255,255,255,.025);color:var(--text)}
+.iconbtn:hover{border-color:var(--line3);background:rgba(255,255,255,.07)}
+.iconbtn svg,.btn svg,.chip svg{width:20px;height:20px}
+svg{flex:none}
+.li>svg,.nav button svg,.row>svg{width:20px;height:20px}
+.badge{position:absolute;top:-6px;right:-6px;min-width:20px;height:20px;padding:0 5px;border-radius:999px;background:#fff;color:#000;font-size:11px;font-weight:800;display:grid;place-items:center;border:2px solid var(--bg)}
+.chip{display:inline-flex;align-items:center;gap:8px;height:42px;padding:0 13px;border-radius:12px;border:1px solid var(--line2);background:rgba(255,255,255,.025);color:var(--text);font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.chip svg{width:17px;height:17px;color:var(--muted)}
+.chip.low{border-color:#fff;animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{50%{box-shadow:0 0 0 4px rgba(255,255,255,.12)}}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info", proxy_headers=True, forwarded_allow_ips="*")
+/* ---- bottom nav (mobile) ---- */
+.bottomnav{display:none}
+
+/* ---- cards and text ---- */
+.card{background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.01)),var(--panel);border:1px solid var(--line2);border-radius:var(--r);padding:16px;box-shadow:inset 0 1px 0 rgba(255,255,255,.05);min-width:0}
+.card-h{font-size:12px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:700;margin:0 0 10px}
+.kpi{font-size:28px;font-weight:800;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1.1}
+.h1{font-size:22px;font-weight:800;letter-spacing:-.01em;margin:0}
+.h2{font-size:17px;font-weight:800;margin:0}
+.notice{padding:12px 14px;border-radius:var(--r2);border:1px dashed var(--line3);color:var(--muted);font-size:14px}
+.empty{text-align:center;padding:34px 18px;border:1px dashed var(--line2);border-radius:var(--r);color:var(--muted)}
+.empty b{display:block;color:var(--text);font-size:16px;margin-bottom:6px}
+.error{color:var(--danger);font-size:13px;min-height:18px}
+.loading{display:flex;align-items:center;gap:10px;color:var(--muted);padding:14px 2px}
+.spin{width:17px;height:17px;flex:none;border-radius:50%;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.hr{height:1px;background:var(--line);border:0;margin:4px 0}
+
+/* ---- controls ---- */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:0 16px;border-radius:12px;border:1px solid var(--line3);background:transparent;color:var(--text);font-weight:700;white-space:nowrap;transition:background .15s,border-color .15s,transform .05s}
+.btn:hover{background:rgba(255,255,255,.07);border-color:#fff}
+.btn:active{transform:translateY(1px)}
+.btn[disabled]{opacity:.45;cursor:not-allowed;transform:none}
+.btn-solid{background:#fff;color:#000;border-color:#fff}
+.btn-solid:hover{background:#e7e7ec;color:#000}
+.btn-ghost{border-color:var(--line2)}
+.btn-danger{border-color:rgba(255,143,143,.55);color:#ffb7b7}
+.btn-danger:hover{background:rgba(255,143,143,.09);border-color:#ff8f8f}
+.btn-sm{min-height:36px;padding:0 12px;font-size:13px;border-radius:10px}
+.btn-block{width:100%}
+.input,.textarea,.select{width:100%;min-width:0;min-height:44px;padding:10px 13px;border-radius:12px;border:1px solid var(--line2);background:var(--field);color:var(--text);outline:none;transition:border-color .15s,box-shadow .15s}
+.textarea{min-height:96px;resize:vertical;line-height:1.45}
+.input:focus,.textarea:focus,.select:focus{border-color:#fff;box-shadow:0 0 0 3px rgba(255,255,255,.12)}
+.input::placeholder,.textarea::placeholder{color:var(--faint)}
+.field{display:flex;flex-direction:column;gap:7px;min-width:0}
+.field>label,.label{font-size:12px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);font-weight:700}
+.hint{font-size:12px;color:var(--faint);line-height:1.45}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;border:1px solid var(--line2);font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap}
+.pill.on{color:#fff;border-color:var(--line3)}
+.switch{position:relative;width:46px;height:27px;flex:none}
+.switch input{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer;z-index:1}
+.switch .track{position:absolute;inset:0;border-radius:999px;border:1px solid var(--line3);background:#0b0b0d;transition:background .2s,border-color .2s}
+.switch .track::after{content:"";position:absolute;top:3px;left:3px;width:19px;height:19px;border-radius:50%;background:#9a9aa3;transition:transform .2s,background .2s}
+.switch input:checked+.track{background:#fff;border-color:#fff}
+.switch input:checked+.track::after{transform:translateX(19px);background:#000}
+.switch input:focus-visible+.track{outline:2px solid #fff;outline-offset:2px}
+.check{width:20px;height:20px;accent-color:#fff;margin:0;flex:none}
+.tabs{display:flex;gap:6px;padding:4px;border:1px solid var(--line2);border-radius:14px;background:rgba(255,255,255,.02);overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tabs button{flex:1 0 auto;min-height:38px;padding:0 12px;border-radius:10px;border:1px solid transparent;background:none;color:var(--muted);font-weight:700;white-space:nowrap}
+.tabs button[aria-selected="true"]{background:#fff;color:#000}
+
+/* ---- tiles and lists ---- */
+.tile{position:relative;width:46px;height:46px;flex:none;border-radius:13px;border:1px solid var(--line2);background:linear-gradient(145deg,#2b2b33,#0f0f12);display:grid;place-items:center;overflow:hidden;font-weight:800;font-size:15px;letter-spacing:.03em;color:#e9e9ef}
+.tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#0b0b0d;opacity:0;transition:opacity .2s}
+.tile img.ok{opacity:1}
+.tile.lg{width:64px;height:64px;border-radius:17px;font-size:20px}
+.game-grid{display:grid;grid-template-columns:repeat(auto-fill,minm
