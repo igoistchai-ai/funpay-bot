@@ -658,7 +658,7 @@ def _library():
     except ImportError as exc:
         raise HTTPException(
             status_code=503,
-            detail="Библиотека FunPay не установлена. Добавьте funpay-api-python в requirements.txt.",
+            detail="FunPay-клиент не установлен на сервере. Разделы FunPay недоступны, остальное работает.",
         ) from exc
     return FunPayClient, FunPayAccount
 
@@ -1985,6 +1985,10 @@ async def lifespan(app_: FastAPI):
             TG_APP = TG_BOT = None
     else:
         log.warning("TELEGRAM_BOT_TOKEN is not set; the web panel still starts.")
+    try:
+        _library()
+    except HTTPException:
+        log.warning("FunPay client library is not installed; FunPay features are disabled, the rest of the app runs.")
     if FUNPAY_GOLDEN_KEY_ENV and not FP_CONNS.get("admin") and not load_fp_account("admin"):
         tasks.append(asyncio.create_task(_bootstrap_admin_account(), name="fp-bootstrap"))
     if not DASHBOARD_PASSWORD:
@@ -2179,7 +2183,4 @@ svg{flex:none}
 
 /* ---- tiles and lists ---- */
 .tile{position:relative;width:46px;height:46px;flex:none;border-radius:13px;border:1px solid var(--line2);background:linear-gradient(145deg,#2b2b33,#0f0f12);display:grid;place-items:center;overflow:hidden;font-weight:800;font-size:15px;letter-spacing:.03em;color:#e9e9ef}
-.tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#0b0b0d;opacity:0;transition:opacity .2s}
-.tile img.ok{opacity:1}
-.tile.lg{width:64px;height:64px;border-radius:17px;font-size:20px}
-.game-grid{display:grid;grid-template-columns:repeat(auto-fill,minm
+.tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#0b0b0d;opacity:0;tra
