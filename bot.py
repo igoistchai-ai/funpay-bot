@@ -268,6 +268,11 @@ def init_db() -> None:
             updated_at INTEGER NOT NULL,
             PRIMARY KEY(owner, chat_id)
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS ai_owner_prompt (
+            owner TEXT PRIMARY KEY,
+            prompt TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS ai_message_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner TEXT NOT NULL,
@@ -1392,11 +1397,18 @@ class TelegramPasswordBody(BaseModel):
     password: str = Field(min_length=1, max_length=300)
 
 class TelegramSendBody(BaseModel):
-    text: str = Field(min_length=1, max_length=4000)
+    text: str = Field(default="", max_length=4000)
+    image: str | None = Field(default=None, max_length=12_000_000)
+    mime_type: str = Field(default="image/jpeg", max_length=100)
+    filename: str = Field(default="photo.jpg", max_length=180)
 
 class ChatAISettingsBody(BaseModel):
     enabled: bool = False
     mode: str = Field(default="friendly", min_length=1, max_length=40)
+
+class AIPromptBody(BaseModel):
+    prompt: str = Field(default="", max_length=4000)
+
 
 class AIDraftBody(BaseModel):
     chat_id: str = Field(min_length=1, max_length=80)
@@ -1422,7 +1434,7 @@ AI_SYSTEM_PROMPT = """Ты — NEZZX AI, ассистент для состав�
 Пиши естественно, коротко и по делу; подстраивайся под язык и стиль собеседника без чрезмерных эмодзи.
 Не выдавай себя за реального человека: если собеседник спрашивает, прямо скажи, что сообщения помогает готовить ИИ. Не выдумывай возраст, опыт, инвентарь, оценки предметов, гарантии, отзывы, наличие посредника или чужое согласие. Используй сведения владельца аккаунта только если они явно указаны в настройках/контексте.
 Не дави на собеседника, уважай отказ и просьбу больше не писать. Не запрашивай пароли, коды входа, 2FA, cookie, токены, платёжные данные или личные данные, не нужные для игры. Не предлагай обходить правила платформы, фальшивого гаранта, фишинговые ссылки, передачу аккаунтов или схемы с сокрытием риска. Для обмена в MM2 помогай согласовать предметы и условия честно; не обещай стоимость Robux без подтверждённой информации.
-Если человек отказался или просит прекратить общение, ответь вежливо один раз и рекомендуй выключить автоматические ответы для этого чата. Никаких массовых первых сообщений: генерируй только ответ на полученное входящее сообщение в чате, который пользователь явно включил для AI.
+Если человек отказался или просит прекратить общение, ответь вежливо один раз и рекомендуй выключить автоматические ответы для этого чата. Никаких массовых первых сообщений: генерируй только ответ на полученное входящее сообщение в чате, который пользователь явно включил для AI. Перед ответом внимательно прочитай всю переписку: если собеседник написал несколько сообщений подряд, ответь на них все сразу, а не только на первое или последнее. Ты не знаешь инвентарь владельца, если он не указан в контексте. Не перечисляй предметы, редкость и цены, которых нет в контексте. Если спрашивают, что есть в саб или в наличии, скажи, что уточнишь у владельца, и спроси, что собеседник хочет получить взамен.
 Язык: определи язык собеседника по его последним сообщениям и всегда отвечай на нём (русский, английский, украинский и любой другой). Если язык смешанный, отвечай на языке его последнего сообщения. Язык выбирает собеседник, а не режим: режим задаёт только стиль."""
 
 
@@ -1454,6 +1466,13 @@ def _ai_settings(owner: str, chat_id: str) -> dict[str, Any]:
             "mode_label": AI_MODE_LABELS[mode]}
 
 
+def _ai_owner_prompt(owner: str) -> str:
+    init_db()
+    with db() as conn:
+        row = conn.execute("SELECT prompt FROM ai_owner_prompt WHERE owner=?", (owner,)).fetchone()
+    return str(row["prompt"] or "") if row else ""
+
+
 def _log_ai(owner: str, chat_id: str, direction: str, mode: str) -> None:
     with db() as conn:
         conn.execute("INSERT INTO ai_message_log(owner,chat_id,direction,mode,created_at) VALUES(?,?,?,?,?)",
@@ -1466,6 +1485,38 @@ def _telethon_client(session_string: str = ""):
                           **_tg_device_kwargs())
 
 
+AI_PENDING: dict[str, int] = {}
+AI_TASKS: set = set()
+# wait for the other side to stop typing, then read the whole conversation once and answer
+AI_DEBOUNCE_SECONDS = 5
+AI_HISTORY_MESSAGES = 40
+
+
+async def _ai_reply_after_pause(owner: str, client: Any, chat_id: str, token: int, peer: Any, reply_to: int) -> None:
+    key = f"{owner}:{chat_id}"
+    await asyncio.sleep(AI_DEBOUNCE_SECONDS)
+    if AI_PENDING.get(key) != token:
+        return  # a newer message arrived; its own task answers the whole conversation
+    try:
+        settings = _ai_settings(owner, chat_id)
+        if not settings["enabled"]:
+            return
+        history = await _load_tg_messages(client, chat_id, AI_HISTORY_MESSAGES)
+        if history and history[-1].get("is_out"):
+            return  # the owner already answered by hand; nothing to add
+        variants, lang = await _generate_ai_reply(history, settings["mode"], _ai_owner_prompt(owner))
+        reply = variants[0] if variants else ""
+        if not reply or AI_PENDING.get(key) != token:
+            return  # nothing to send, or the other side wrote again while the model was thinking
+        sent = await client.send_message(peer, reply, reply_to=reply_to)
+        CHATS_CACHE.pop(owner, None)
+        _sse_publish(owner, {"type": "message", "chat_id": chat_id, "message": _tg_message_item(sent, "Вы", chat_id)})
+        _sse_publish(owner, {"type": "ai_sent", "chat_id": chat_id, "language": lang, "text": reply[:200]})
+        _log_ai(owner, chat_id, "auto_sent", settings["mode"])
+    except Exception as exc:
+        log.warning("AI reply failed (%s)", type(exc).__name__)
+
+
 async def _install_ai_listener(owner: str, client: Any) -> None:
     marker = f"{owner}:{id(client)}"
     if marker in TG_LISTENERS:
@@ -1476,31 +1527,15 @@ async def _install_ai_listener(owner: str, client: Any) -> None:
         if not event.is_private or not event.message or not (event.raw_text or "").strip():
             return
         chat_id = str(event.chat_id)
-        settings = _ai_settings(owner, chat_id)
-        if not settings["enabled"]:
+        if not _ai_settings(owner, chat_id)["enabled"]:
             return
         key = f"{owner}:{chat_id}"
-        current = time.time()
-        if current - TG_SEND_GUARD.get(key, 0) < 20:
-            return
-        # Safety brake: at most 30 automated replies per owner per rolling process-day.
-        day_key = f"{owner}:day:{datetime.now(timezone.utc).date().isoformat()}"
-        sent_today = TG_SEND_GUARD.get(day_key, 0)
-        if sent_today >= 30:
-            return
-        TG_SEND_GUARD[key] = current
-        try:
-            history = await _load_tg_messages(client, chat_id, 12)
-            variants, lang = await _generate_ai_reply(history, settings["mode"])
-            reply = variants[0]
-            if not reply:
-                return
-            await client.send_message(event.chat_id, reply, reply_to=event.message.id)
-            _sse_publish(owner, {"type": "ai_sent", "chat_id": chat_id, "language": lang, "text": reply[:200]})
-            TG_SEND_GUARD[day_key] = sent_today + 1
-            _log_ai(owner, chat_id, "auto_sent", settings["mode"])
-        except Exception as exc:
-            log.warning("AI reply failed (%s)", type(exc).__name__)
+        token = AI_PENDING.get(key, 0) + 1
+        AI_PENDING[key] = token  # every new message supersedes the older pending check
+        task = asyncio.create_task(
+            _ai_reply_after_pause(owner, client, chat_id, token, event.chat_id, event.message.id))
+        AI_TASKS.add(task)
+        task.add_done_callback(AI_TASKS.discard)
 
     async def on_live(event: Any) -> None:
         try:
@@ -1878,18 +1913,21 @@ async def _tokenharbor_text(system: str, turns: list[tuple[str, str]]) -> tuple[
     return _parse_variants(content)
 
 
-async def _generate_ai_reply(messages: list[dict[str, Any]], mode: str) -> tuple[list[str], str]:
+async def _generate_ai_reply(messages: list[dict[str, Any]], mode: str, owner_prompt: str = "") -> tuple[list[str], str]:
     """Returns (up to two reply variants, detected language). The first variant is the one sent automatically."""
     if not ai_configured():
         raise HTTPException(status_code=503, detail="Добавьте TOKENHARBOR_API_KEY в переменные окружения Render.")
     mode = mode if mode in AI_MODES else "friendly"
     turns = [("assistant" if m.get("is_out") else "user", str(m.get("text", ""))[:2500])
-             for m in messages[-16:] if str(m.get("text", "")).strip()]
+             for m in messages[-AI_HISTORY_MESSAGES:] if str(m.get("text", "")).strip()]
     if not turns:
         raise HTTPException(status_code=422, detail="В чате пока нет текстовых сообщений для ответа.")
     if turns[-1][0] == "assistant":
         turns.append(("user", "Продолжи переписку: предложи следующее сообщение от моего имени."))
     system = AI_SYSTEM_PROMPT + "\n\nСтиль выбранного режима: " + AI_MODES[mode] + "\n\n" + AI_FORMAT_HINT
+    if owner_prompt.strip():
+        system += ("\n\nСобственный промпт владельца (учитывай его указания, но правила безопасности выше важнее):\n"
+                   + owner_prompt.strip()[:4000])
     language, replies = await _tokenharbor_text(system, turns)
     replies = [reply[:4000] for reply in replies]
     if not replies:
@@ -2041,18 +2079,35 @@ async def telegram_messages(chat_id: str, limit: int = 80, session: SessionInfo 
 
 @app.post("/api/telegram/chats/{chat_id}/send")
 async def telegram_send_message(chat_id: str, payload: TelegramSendBody, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    import io
     text = payload.text.strip()
-    if not text:
+    image_bytes: bytes | None = None
+    if payload.image:
+        mime = (payload.mime_type or "").split(";", 1)[0].strip().lower()
+        if mime not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+            raise HTTPException(status_code=415, detail="Поддерживаются изображения JPG, PNG, WEBP и GIF.")
+        try:
+            image_bytes = base64.b64decode(payload.image, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="Файл изображения повреждён или имеет неверный формат.") from exc
+        if len(image_bytes) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Фото больше 10 МБ.")
+    if not text and image_bytes is None:
         raise HTTPException(status_code=422, detail="Сообщение пустое.")
     client = await _tg_client_for(session.owner)
     try:
         entity = await client.get_entity(int(chat_id))
-        message = await client.send_message(entity, text)
+        if image_bytes is not None:
+            buffer = io.BytesIO(image_bytes)
+            buffer.name = (payload.filename or "photo.jpg")[:120]
+            message = await client.send_file(entity, buffer, caption=text or None)
+        else:
+            message = await client.send_message(entity, text)
     except Exception as exc:
         log.warning("Telegram send failed (%s)", type(exc).__name__)
         raise HTTPException(status_code=502, detail="Не удалось отправить сообщение в Telegram.") from exc
     CHATS_CACHE.pop(session.owner, None)
-    _sse_publish(session.owner, {"type": "message", "chat_id": str(chat_id), "message": _tg_message_item(message, "Вы")})
+    _sse_publish(session.owner, {"type": "message", "chat_id": str(chat_id), "message": _tg_message_item(message, "Вы", chat_id)})
     return {"ok": True, "id": message.id, "text": message.message or text}
 
 
@@ -2076,7 +2131,7 @@ async def ai_draft(payload: AIDraftBody, session: SessionInfo = Depends(get_sess
         raise HTTPException(status_code=422, detail="Неизвестный режим ИИ.")
     client = await _tg_client_for(session.owner)
     history = await _load_tg_messages(client, payload.chat_id, 20)
-    variants, lang = await _generate_ai_reply(history, payload.mode)
+    variants, lang = await _generate_ai_reply(history, payload.mode, _ai_owner_prompt(session.owner))
     draft = variants[0]
     _log_ai(session.owner, payload.chat_id, "draft", payload.mode)
     return {"draft": draft, "variants": variants, "mode": payload.mode, "language": lang}
@@ -2090,6 +2145,22 @@ async def ai_status(session: SessionInfo = Depends(get_session)) -> dict[str, An
             (session.owner, now_ts()-86400)).fetchone()
     return {"configured": ai_configured(), "provider": ai_provider(), "model": ai_model_name(), "modes": AI_MODE_LABELS,
             "today": {"total": int(row["total"] or 0), "auto_sent": int(row["auto_sent"] or 0), "drafts": int(row["drafts"] or 0)}}
+
+
+@app.get("/api/ai/prompt")
+async def ai_prompt_get(session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    return {"prompt": _ai_owner_prompt(session.owner)}
+
+
+@app.put("/api/ai/prompt")
+async def ai_prompt_put(payload: AIPromptBody, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    init_db()
+    text = payload.prompt.strip()
+    with db() as conn:
+        conn.execute("""INSERT INTO ai_owner_prompt(owner,prompt,updated_at) VALUES(?,?,?)
+            ON CONFLICT(owner) DO UPDATE SET prompt=excluded.prompt, updated_at=excluded.updated_at""",
+            (session.owner, text, now_ts()))
+    return {"ok": True, "prompt": text}
 
 
 # ---------------------------------------------------------------- real Telegram avatars (cached, bounded)
@@ -4059,6 +4130,7 @@ html.calm *,html.calm *::before,html.calm *::after{
 
         <section class="view" data-view="music"><div class="page" id="musicPage"></div></section>
         <section class="view" data-view="ai"><div class="page" id="aiPage"></div></section>
+        <section class="view" data-view="prompt"><div class="page" id="promptPage"></div></section>
         <section class="view" data-view="overview"><div class="page" id="overviewPage"></div></section>
         <section class="view" data-view="settings"><div class="page" id="settingsPage"></div></section>
         <section class="view" data-view="admin"><div class="page" id="adminPage"></div></section>
@@ -4127,14 +4199,16 @@ const TABS = [
   {id: 'chats',    label: 'Чаты',      icon: 'chat'},
   {id: 'music',    label: 'Музыка',    icon: 'music'},
   {id: 'ai',       label: 'AI',        icon: 'spark'},
+  {id: 'prompt',   label: 'Промпт',    icon: 'sliders'},
   {id: 'overview', label: 'Обзор',     icon: 'grid'},
   {id: 'settings', label: 'Настройки', icon: 'sliders'},
   {id: 'admin',    label: 'Админ',     icon: 'shield', admin: true},
 ];
-const TAB_TITLE = {chats: 'Чаты', music: 'Музыка', ai: 'AI Conv', overview: 'Обзор', settings: 'Настройки', admin: 'Админка'};
+const TAB_TITLE = {chats: 'Чаты', music: 'Музыка', ai: 'AI Conv', prompt: 'Системный промпт', overview: 'Обзор', settings: 'Настройки', admin: 'Админка'};
 const TAB_SUB = {
   music: 'Плейлист: Spotify, SoundCloud и свои файлы',
   ai: 'Четыре стиля общения · tokenharbor',
+  prompt: 'Ваши указания для ИИ',
   overview: 'Статистика вашего Inbox',
   settings: 'Подключения и доступ',
   admin: 'Ключи доступа',
@@ -4361,6 +4435,7 @@ function go(tab) {
   renderTopActions();
   if (tab === 'chats') { renderChatList(); renderChatPane(); }
   else if (tab === 'ai') renderAI();
+  else if (tab === 'prompt') renderPrompt();
   else if (tab === 'overview') renderOverview();
   else if (tab === 'settings') renderSettings();
   else if (tab === 'music') { renderMusic(); loadPlaylist(true); }
@@ -4397,6 +4472,7 @@ document.addEventListener('click', ev => {
   else if (a === 'fullscreen') toggleFullscreen();
   else if (a === 'pick-bg') $('#bgFile')?.click();
   else if (a === 'reset-bg') resetBackground();
+  else if (a === 'save-prompt') savePrompt();
 });
 
 // links open in Telegram's own browser when the app runs inside Telegram; in a normal browser they open as usual
@@ -4685,6 +4761,8 @@ function onAISent(evt) {
   haptic('success');
   const lang = evt.language ? ' · ' + evt.language : '';
   toast('ИИ ответил' + (chat ? ' в чате «' + chat.name + '»' : '') + lang, 'ok');
+  if (state.selected && state.selected.id === String(evt.chat_id)) loadMessages(true);
+  scheduleChatsRefresh(0);
 }
 
 function appendLiveMessage(m) {
@@ -5766,7 +5844,10 @@ function renderChatPane() {
       <div class="skel"></div>
       <div class="skel" style="width:70%;margin-left:auto"></div>
     </div>
+    <div class="attach-chip" id="attachChip" hidden></div>
     <form class="composer glass" id="sendForm">
+      <button class="icon-btn" type="button" id="attachBtn" aria-label="Прикрепить фото" title="Прикрепить фото">${icon('image')}</button>
+      <input type="file" id="attachFile" accept="image/*" hidden>
       <textarea id="messageText" rows="1" maxlength="4000" placeholder="Написать сообщение" aria-label="Текст сообщения"></textarea>
       <button class="send" type="submit" aria-label="Отправить">${icon('send')}</button>
     </form>`;
@@ -5776,6 +5857,9 @@ function renderChatPane() {
   $('#chatMode').addEventListener('change', e => saveAI(state.chatAI.enabled, e.target.value));
   $('#draftBtn').addEventListener('click', makeDraft);
   form.addEventListener('submit', sendMessage);
+  $('#attachBtn').addEventListener('click', () => $('#attachFile').click());
+  $('#attachFile').addEventListener('change', e => setAttachment(e.target.files?.[0]));
+  if (state.attachmentChat !== c.id) { state.attachment = null; state.attachmentChat = c.id; }
   ta.addEventListener('input', autoGrow);
   ta.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && matchMedia('(min-width:900px)').matches) {
@@ -5784,6 +5868,7 @@ function renderChatPane() {
     }
   });
   renderChatTools();
+  renderAttachChip();
 }
 
 function renderChatTools() {
@@ -6043,12 +6128,21 @@ async function sendMessage(ev) {
   const chat = state.selected;
   const input = $('#messageText');
   const text = input.value.trim();
-  if (!chat || !text) return;
+  const att = state.attachment;
+  if (!chat || (!text && !att)) return;
   const btn = ev.submitter || ev.target.querySelector('button[type="submit"]');
   if (btn) btn.disabled = true;
   try {
-    await api(`/telegram/chats/${encodeURIComponent(chat.id)}/send`, {method: 'POST', body: {text}});
+    const body = {text};
+    if (att) {
+      body.image = att.dataUrl.slice(att.dataUrl.indexOf(',') + 1);
+      body.mime_type = 'image/jpeg';
+      body.filename = 'photo.jpg';
+    }
+    await api(`/telegram/chats/${encodeURIComponent(chat.id)}/send`, {method: 'POST', body});
     input.value = '';
+    state.attachment = null;
+    renderAttachChip();
     autoGrow({target: input});
     SFX.sent();
     haptic('soft');
@@ -6062,6 +6156,83 @@ async function sendMessage(ev) {
   } finally {
     if (btn) btn.disabled = false;
     input.focus();
+  }
+}
+
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(new Error('Не удалось прочитать фото'));
+    r.readAsDataURL(blob);
+  });
+}
+
+async function setAttachment(file) {
+  if (!file) return;
+  if (!/^image\//.test(file.type || '')) { toast('Выберите изображение'); return; }
+  try {
+    const blob = await resizeImage(file, 1600, 0.86);
+    state.attachment = {dataUrl: await blobToDataURL(blob)};
+    renderAttachChip();
+  } catch (e) {
+    toast(e.message, 'bad');
+  } finally {
+    const input = $('#attachFile');
+    if (input) input.value = '';
+  }
+}
+
+function renderAttachChip() {
+  const chip = $('#attachChip');
+  if (!chip) return;
+  if (!state.attachment) { chip.style.display = 'none'; chip.innerHTML = ''; return; }
+  chip.style.cssText = 'display:flex;align-items:center;gap:10px;margin:0 12px 8px;padding:6px 8px;border-radius:14px;background:rgba(0,0,0,.3)';
+  chip.innerHTML = `<img alt="" src="${state.attachment.dataUrl}" style="width:44px;height:44px;object-fit:cover;border-radius:10px"><span style="flex:1;font-size:12.5px">Фото прикреплено</span><button type="button" class="variants-x" id="attachRemove" aria-label="Убрать фото">×</button>`;
+  $('#attachRemove').addEventListener('click', () => { state.attachment = null; renderAttachChip(); });
+}
+
+/* ---------- system prompt tab ---------- */
+async function renderPrompt() {
+  const page = $('#promptPage');
+  if (!state.promptLoaded) {
+    try {
+      const d = await api('/ai/prompt');
+      state.promptText = d.prompt || '';
+    } catch (e) {
+      toast(e.message, 'bad');
+    }
+    state.promptLoaded = true;
+  }
+  const value = state.promptText || '';
+  page.innerHTML = `
+    <section class="card">
+      <h2>Системный промпт</h2>
+      <p class="lead">Ваши указания для ИИ: тон, стиль, что можно и нельзя говорить, как представляться. Они добавляются к правилам безопасности, которые ИИ не отменяет.</p>
+      <textarea id="promptText" maxlength="4000" placeholder="Например: отвечай коротко, без эмодзи, не называй цены, предлагай созвониться" style="width:100%;min-height:240px;padding:12px;border-radius:14px;border:1px solid var(--line);background:transparent;color:inherit;font:inherit;resize:vertical;box-sizing:border-box">${esc(value)}</textarea>
+      <div class="btn-row" style="margin-top:12px">
+        <span class="muted" id="promptCount">${value.length}/4000</span>
+        <button class="btn primary" data-action="save-prompt" type="button">Сохранить</button>
+      </div>
+    </section>`;
+  stagger(page);
+  $('#promptText').addEventListener('input', e => {
+    state.promptText = e.target.value;
+    $('#promptCount').textContent = e.target.value.length + '/4000';
+  });
+}
+
+async function savePrompt() {
+  const text = (state.promptText || '').trim();
+  try {
+    await api('/ai/prompt', {method: 'PUT', body: {prompt: text}});
+    state.promptText = text;
+    SFX.ai();
+    haptic('success');
+    toast('Промпт сохранён', 'ok');
+  } catch (e) {
+    SFX.error();
+    toast(e.message, 'bad');
   }
 }
 
