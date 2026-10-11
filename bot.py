@@ -1924,10 +1924,10 @@ async def _generate_ai_reply(messages: list[dict[str, Any]], mode: str, owner_pr
         raise HTTPException(status_code=422, detail="В чате пока нет текстовых сообщений для ответа.")
     if turns[-1][0] == "assistant":
         turns.append(("user", "Продолжи переписку: предложи следующее сообщение от моего имени."))
-    system = AI_SYSTEM_PROMPT + "\n\nСтиль выбранного режима: " + AI_MODES[mode] + "\n\n" + AI_FORMAT_HINT
     if owner_prompt.strip():
-        system += ("\n\nСобственный промпт владельца (учитывай его указания, но правила безопасности выше важнее):\n"
-                   + owner_prompt.strip()[:4000])
+        system = owner_prompt.strip()[:4000] + "\n\n" + AI_FORMAT_HINT
+    else:
+        system = AI_SYSTEM_PROMPT + "\n\nСтиль выбранного режима: " + AI_MODES[mode] + "\n\n" + AI_FORMAT_HINT
     language, replies = await _tokenharbor_text(system, turns)
     replies = [reply[:4000] for reply in replies]
     if not replies:
