@@ -1718,9 +1718,9 @@ async def _load_tg_messages(client: Any, chat_id: str, limit: int = 80) -> list[
 
 # ---------------------------------------------------------------- AI provider: tokenharbor (OpenAI-compatible gateway)
 # Built in: the key and model below work with no environment setup. TOKENHARBOR_API_KEY and TOKENHARBOR_MODEL override them.
-TOKENHARBOR_API_KEY = os.getenv("TOKENHARBOR_API_KEY", "").strip() or "thk_live_6_EBKwjvLGL2UFSgHN4qdrFha3T61LvggZ6oNVKszbhTSlrG7Q9k7QrVtSDasNPV"
-TOKENHARBOR_MODEL = os.getenv("TOKENHARBOR_MODEL", "").strip() or "claude-haiku-5.5:free"
-TOKENHARBOR_URL = "https://tokenharbor.ai/v1/chat/completions"
+TOKENHARBOR_API_KEY = os.getenv("TOKENHARBOR_API_KEY", "").strip() or "cc_GQagkzQGWrTOYzy3sp4kVNATz0dk3oiOWnoDO1adTJsyJulF"
+TOKENHARBOR_MODEL = os.getenv("TOKENHARBOR_MODEL", "").strip() or "claude-opus-4.8"
+TOKENHARBOR_URL = "https://cleanapis.com/v1/chat/completions"
 TOKENHARBOR_USER_AGENT = "NEZZX-Telegram-Conv/4.0"
 # the newest chat turns sent to the model, counted in characters
 TOKENHARBOR_HISTORY_CHARS = 8000
@@ -6072,7 +6072,7 @@ function renderAI(fromRefresh) {
   page.innerHTML = `
     <div class="stats">
       <div class="stat">
-        <div class="k" style="font:600 15px/1.3 var(--f-body);letter-spacing:0;overflow-wrap:anywhere">${esc(d.model || 'claude-haiku-5.5:free')}</div>
+        <div class="k" style="font:600 15px/1.3 var(--f-body);letter-spacing:0;overflow-wrap:anywhere">${esc(d.model || 'claude-opus-4.8')}</div>
         <div class="l">${d.configured ? `${esc(AI_NAMES[d.provider] || 'tokenharbor')} API подключён` : 'Добавьте TOKENHARBOR_API_KEY'}</div>
       </div>
       <div class="stat"><div class="k">${d.today?.auto_sent || 0}</div><div class="l">Автоответов за 24 ч</div></div>
@@ -6123,7 +6123,7 @@ function renderOverview() {
       <h2>Подключения</h2>
       <div class="kv"><span>Telegram-аккаунт</span>${pill(st.connected, st.connected ? 'Подключён' : 'Не подключён')}</div>
       <div class="kv"><span>tokenharbor API</span>${pill(st.ai_configured, st.ai_configured ? 'Готов' : 'Нужен ключ')}</div>
-      <div class="kv"><span>Модель</span><b>${esc(ai.model || 'claude-haiku-5.5:free')}</b></div>
+      <div class="kv"><span>Модель</span><b>${esc(ai.model || 'claude-opus-4.8')}</b></div>
     </section>
     <section class="card">
       <h2>Быстрый старт</h2>
@@ -6208,7 +6208,7 @@ function renderAICard(st) {
   $('#aiCard').innerHTML = `
     <h2>tokenharbor API</h2>
     <div class="kv"><span>Подключение</span>${pill(st.ai_configured, st.ai_configured ? 'Подключено' : 'Не настроено')}</div>
-    <p class="hint" style="margin:12px 0 0">Адрес tokenharbor.ai/v1, модель claude-haiku-5.5:free. Ключ встроен в сервер и может быть переопределён через TOKENHARBOR_API_KEY в Render → Environment, модель через TOKENHARBOR_MODEL. Лимиты тарифа смотрите на tokenharbor.ai/pricing. Ключ хранится на сервере и в браузер не попадает.</p>`;
+    <p class="hint" style="margin:12px 0 0">Адрес cleanapis.com/v1, модель claude-opus-4.8. Ключ встроен в сервер и может быть переопределён через TOKENHARBOR_API_KEY в Render → Environment, модель через TOKENHARBOR_MODEL. Лимиты тарифа смотрите на tokenharbor.ai/pricing. Ключ хранится на сервере и в браузер не попадает.</p>`;
 }
 
 function bindTelegramForms() {
