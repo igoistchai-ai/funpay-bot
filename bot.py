@@ -1398,8 +1398,7 @@ AI_SYSTEM_PROMPT = """Ты — NEZZX AI, ассистент для состав�
 Не выдавай себя за реального человека: если собеседник спрашивает, прямо скажи, что сообщения помогает готовить ИИ. Не выдумывай возраст, опыт, инвентарь, оценки предметов, гарантии, отзывы, наличие посредника или чужое согласие. Используй сведения владельца аккаунта только если они явно указаны в настройках/контексте.
 Не дави на собеседника, уважай отказ и просьбу больше не писать. Не запрашивай пароли, коды входа, 2FA, cookie, токены, платёжные данные или личные данные, не нужные для игры. Не предлагай обходить правила платформы, фальшивого гаранта, фишинговые ссылки, передачу аккаунтов или схемы с сокрытием риска. Для обмена в MM2 помогай согласовать предметы и условия честно; не обещай стоимость Robux без подтверждённой информации.
 Если человек отказался или просит прекратить общение, ответь вежливо один раз и рекомендуй выключить автоматические ответы для этого чата. Никаких массовых первых сообщений: генерируй только ответ на полученное входящее сообщение в чате, который пользователь явно включил для AI.
-Язык: определи язык собеседника по его последним сообщениям и всегда отвечай на нём (русский, английский, украинский и любой другой). Если язык смешанный, отвечай на языке его последнего сообщения. Язык выбирает собеседник, а не режим: режим задаёт только стиль.
-Возвращай только текст предполагаемого ответа — без кавычек, пояснений и markdown."""
+Язык: определи язык собеседника по его последним сообщениям и всегда отвечай на нём (русский, английский, украинский и любой другой). Если язык смешанный, отвечай на языке его последнего сообщения. Язык выбирает собеседник, а не режим: режим задаёт только стиль."""
 
 
 def _telethon_imports():
@@ -1467,7 +1466,8 @@ async def _install_ai_listener(owner: str, client: Any) -> None:
         TG_SEND_GUARD[key] = current
         try:
             history = await _load_tg_messages(client, chat_id, 12)
-            reply, lang = await _generate_ai_reply(history, settings["mode"])
+            variants, lang = await _generate_ai_reply(history, settings["mode"])
+            reply = variants[0]
             if not reply:
                 return
             await client.send_message(event.chat_id, reply, reply_to=event.message.id)
@@ -1528,10 +1528,48 @@ def _sse_publish(owner: str, payload: dict[str, Any]) -> None:
         SSE_LOOP.call_soon_threadsafe(push)
 
 
-def _tg_message_item(message: Any, author: str) -> dict[str, Any]:
-    return {"id": int(message.id), "text": message.message or ("[Медиа]" if message.media else "[Сообщение]"),
+# ---------------------------------------------------------------- Telegram messages: text, media metadata, links
+# Photos and videos up to this size are fetched through the media endpoint; bigger files only show a note.
+TG_MEDIA_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _tg_media_kind(message: Any) -> str:
+    """photo, video, gif, sticker, voice, audio, file or other. Empty when there is nothing to show as media."""
+    media = getattr(message, "media", None)
+    if not media or type(media).__name__ == "MessageMediaWebPage":  # a link preview stays text, the link is clickable
+        return ""
+    if getattr(message, "photo", None):
+        return "photo"
+    if getattr(message, "sticker", None):
+        return "sticker"
+    if getattr(message, "gif", None):
+        return "gif"
+    if getattr(message, "video", None) or getattr(message, "video_note", None):
+        return "video"
+    if getattr(message, "voice", None):
+        return "voice"
+    if getattr(message, "audio", None):
+        return "audio"
+    if getattr(message, "document", None):
+        return "file"
+    return "other"
+
+
+def _tg_message_item(message: Any, author: str, chat_id: Any = None) -> dict[str, Any]:
+    kind = _tg_media_kind(message)
+    cid = str(chat_id) if chat_id is not None else str(getattr(message, "chat_id", "") or "")
+    info = getattr(message, "file", None) if kind else None
+    size = int(getattr(info, "size", 0) or 0) if info else 0
+    url = ""
+    if kind and cid and size <= TG_MEDIA_MAX_BYTES:
+        url = f"/api/telegram/chats/{cid}/messages/{int(message.id)}/media"
+    return {"id": int(message.id),
+            "text": message.message or ("" if kind else "[Сообщение]"),
             "author": author, "is_out": bool(message.out),
-            "timestamp": message.date.isoformat() if message.date else "", "media": bool(message.media)}
+            "timestamp": message.date.isoformat() if message.date else "",
+            "media": kind, "media_url": url, "media_size": size,
+            "media_mime": str(getattr(info, "mime_type", "") or "")[:80] if info else "",
+            "media_name": str(getattr(info, "name", "") or "")[:120] if info else ""}
 
 
 async def _push_telegram_message(owner: str, event: Any) -> None:
@@ -1653,39 +1691,75 @@ async def _load_tg_messages(client: Any, chat_id: str, limit: int = 80) -> list[
     return list(reversed(out))
 
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-# Groq's free tier allows about 8,000 tokens a minute, so the history sent to it is cut to this many characters
-GROQ_HISTORY_CHARS = 4000
-# parameters the Groq call may drop and retry without, if the model rejects them
-GROQ_OPTIONAL_PARAMS = ("reasoning_effort", "response_format", "max_completion_tokens", "max_tokens", "temperature")
-# Groq's JSON mode needs the word "json" in the prompt
-GROQ_JSON_HINT = 'Верни ответ в формате json: объект с полями "language" и "reply".'
+# ---------------------------------------------------------------- AI provider: tokenharbor (OpenAI-compatible gateway)
+# Built in: the key and model below work with no environment setup. TOKENHARBOR_API_KEY and TOKENHARBOR_MODEL override them.
+TOKENHARBOR_API_KEY = os.getenv("TOKENHARBOR_API_KEY", "").strip() or "thk_live_6_EBKwjvLGL2UFSgHN4qdrFha3T61LvggZ6oNVKszbhTSlrG7Q9k7QrVtSDasNPV"
+TOKENHARBOR_MODEL = os.getenv("TOKENHARBOR_MODEL", "").strip() or "claude-haiku-5.5:free"
+TOKENHARBOR_URL = "https://tokenharbor.ai/v1/chat/completions"
+TOKENHARBOR_USER_AGENT = "NEZZX-Telegram-Conv/4.0"
+# the newest chat turns sent to the model, counted in characters
+TOKENHARBOR_HISTORY_CHARS = 8000
+# optional parameters the gateway may reject; a rejected one is dropped or renamed and the call is retried
+TOKENHARBOR_OPTIONAL_PARAMS = ("temperature", "max_tokens", "max_completion_tokens")
+# the model answers in this shape: a language and two reply variants
+AI_FORMAT_HINT = ('Формат ответа: только JSON-объект без пояснений и markdown: '
+                  '{"language": "<язык собеседника, например Русский>", "replies": ["<первый вариант>", "<второй вариант>"]}. '
+                  'Оба варианта пишутся на языке собеседника, отвечают на его последнее сообщение и отличаются формулировкой или тоном.')
 
 
 def ai_provider() -> str:
-    return "groq" if GROQ_API_KEY else ""
+    return "tokenharbor" if TOKENHARBOR_API_KEY else ""
 
 
 def ai_configured() -> bool:
-    return bool(GROQ_API_KEY)
+    return bool(TOKENHARBOR_API_KEY)
 
 
 def ai_model_name() -> str:
-    return GROQ_MODEL if GROQ_API_KEY else ""
+    return TOKENHARBOR_MODEL if TOKENHARBOR_API_KEY else ""
 
 
-def _parse_language_reply(content: str) -> tuple[str, str]:
-    """Structured output is {"language": ..., "reply": ...}. Anything else is treated as plain reply text."""
+def _scrub(text: str) -> str:
+    """Keeps the API key out of anything that reaches a log or the browser."""
+    if TOKENHARBOR_API_KEY:
+        text = text.replace(TOKENHARBOR_API_KEY, "***")
+    return text[:160]
+
+
+def _extract_json_object(text: str) -> Optional[dict[str, Any]]:
+    """Finds the JSON object in an answer, also when it sits in a code fence or has words around it."""
+    candidates = []
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S | re.I)
+    if fence:
+        candidates.append(fence.group(1))
+    candidates.append(text)
+    start, end = text.find("{"), text.rfind("}")
+    if 0 <= start < end:
+        candidates.append(text[start:end + 1])
+    for raw in candidates:
+        try:
+            data = json.loads(raw.strip())
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _parse_variants(content: str) -> tuple[str, list[str]]:
+    """Returns (language, up to two replies). A plain-text answer is one reply; a JSON answer keeps its own list."""
     text = (content or "").strip()
-    try:
-        data = json.loads(text)
-    except (ValueError, TypeError):
-        return "", text
-    if isinstance(data, dict) and str(data.get("reply", "")).strip():
-        return str(data.get("language", "") or "").strip()[:40], str(data["reply"]).strip()
-    return "", text
+    data = _extract_json_object(text)
+    if data is None:
+        return "", ([text] if text else [])
+    language = str(data.get("language") or "").strip()[:40]
+    replies = data.get("replies", data.get("reply"))
+    if isinstance(replies, str):
+        replies = [replies]
+    if not isinstance(replies, list):
+        return language, []
+    variants = [str(item).strip() for item in replies if str(item).strip()]
+    return language, variants[:2]
 
 
 async def _post_json(url: str, body: dict[str, Any], headers: dict[str, str], timeout: int = 40) -> Any:
@@ -1710,65 +1784,79 @@ def _trim_turns(turns: list[tuple[str, str]], budget: int) -> list[tuple[str, st
     return list(reversed(kept))
 
 
-async def _groq_text(system: str, turns: list[tuple[str, str]]) -> tuple[str, str]:
-    """Groq serves open models through the common chat-completions format. Its free tier is rate limited, so the history is trimmed first."""
-    messages: list[dict[str, str]] = [{"role": "system", "content": system + "\n\n" + GROQ_JSON_HINT}]
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    try:
+        payload = json.loads(exc.read().decode("utf-8", "replace"))
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    error = payload.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or "")
+    if isinstance(error, str):
+        return error
+    return str(payload.get("message") or payload.get("detail") or "")
+
+
+def _tokenharbor_error(code: int, detail: str) -> str:
+    if code in (401, 403):
+        return f"tokenharbor не принял ключ (HTTP {code}). Проверьте TOKENHARBOR_API_KEY."
+    if code == 402:
+        return "На аккаунте tokenharbor закончился баланс или лимит (HTTP 402)."
+    if code == 404:
+        return f"tokenharbor не знает модель {TOKENHARBOR_MODEL} (HTTP 404). Укажите рабочую в TOKENHARBOR_MODEL."
+    if code == 413:
+        return "Запрос слишком большой для tokenharbor (HTTP 413)."
+    if code == 429:
+        return "Лимит запросов tokenharbor исчерпан (HTTP 429). Подождите минуту и попробуйте снова."
+    tail = f": {_scrub(detail)}" if detail else ""
+    return f"tokenharbor ответил ошибкой (HTTP {code}){tail}"
+
+
+async def _tokenharbor_text(system: str, turns: list[tuple[str, str]]) -> tuple[str, list[str]]:
+    """One chat-completions call. Returns (language, replies)."""
+    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
     messages += [{"role": ("assistant" if role == "assistant" else "user"), "content": text}
-                 for role, text in _trim_turns(turns, GROQ_HISTORY_CHARS)]
-    body: dict[str, Any] = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "response_format": {"type": "json_object"},
-        "max_completion_tokens": 900,
-        "temperature": 0.8,
-        "reasoning_effort": "low",
-    }
-    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + GROQ_API_KEY}
+                 for role, text in _trim_turns(turns, TOKENHARBOR_HISTORY_CHARS)]
+    body: dict[str, Any] = {"model": TOKENHARBOR_MODEL, "messages": messages, "max_tokens": 900, "temperature": 0.8}
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "Authorization": "Bearer " + TOKENHARBOR_API_KEY, "User-Agent": TOKENHARBOR_USER_AGENT}
     content = ""
-    for _ in range(5):  # a rejected parameter is dropped or renamed and retried; an empty reply is retried too
+    for _ in range(4):  # a rejected parameter is dropped or renamed and retried; an empty answer is retried too
         try:
-            data = await _post_json(GROQ_URL, body, headers)
+            data = await _post_json(TOKENHARBOR_URL, body, headers)
         except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = str(json.loads(exc.read().decode("utf-8")).get("error", {}).get("message", ""))
-            except Exception:
-                pass
-            if exc.code == 400 and "max_completion_tokens" in body and "max_completion_tokens" in detail:
-                body["max_tokens"] = body.pop("max_completion_tokens")
-                continue
-            dropped = next((key for key in GROQ_OPTIONAL_PARAMS if key in body and key in detail), "")
-            if exc.code == 400 and not dropped and "response_format" in body and "json" in detail.lower():
-                dropped = "response_format"  # no valid JSON came back: take the reply as plain text instead
-            if exc.code in (400, 422) and dropped:
-                body.pop(dropped)
-                continue
-            log.warning("Groq request failed (HTTP %s)", exc.code)
-            if exc.code in (401, 403):
-                raise HTTPException(status_code=502, detail="Groq не принял GROQ_API_KEY. Проверьте ключ в Render → Environment.") from exc
-            if exc.code == 429:
-                if any(word in detail.lower() for word in ("per day", "tpd", "rpd")):
-                    raise HTTPException(status_code=502, detail="Дневной лимит бесплатного Groq исчерпан. Попробуйте завтра.") from exc
-                raise HTTPException(status_code=502, detail="Лимит бесплатного Groq на минуту исчерпан. Попробуйте через минуту.") from exc
-            if exc.code == 413:
-                raise HTTPException(status_code=502, detail="Запрос слишком большой для бесплатного Groq. Попробуйте другую модель в GROQ_MODEL.") from exc
-            raise HTTPException(status_code=502, detail="Groq не ответил. Проверьте GROQ_API_KEY, GROQ_MODEL и доступность модели.") from exc
+            detail = _http_error_detail(exc)
+            log.warning("tokenharbor request failed (HTTP %s): %s", exc.code, _scrub(detail))
+            if exc.code in (400, 422):
+                if "max_tokens" in body and "max_tokens" in detail.lower():
+                    body["max_completion_tokens"] = body.pop("max_tokens")
+                    continue
+                dropped = next((key for key in TOKENHARBOR_OPTIONAL_PARAMS if key in body and key in detail), "")
+                if dropped:
+                    body.pop(dropped)
+                    continue
+            raise HTTPException(status_code=502, detail=_tokenharbor_error(exc.code, detail)) from exc
         except Exception as exc:
-            log.warning("Groq request failed (%s)", type(exc).__name__)
-            raise HTTPException(status_code=502, detail="Groq не ответил. Попробуйте ещё раз.") from exc
+            log.warning("tokenharbor request failed (%s)", type(exc).__name__)
+            raise HTTPException(status_code=502, detail="tokenharbor не ответил. Попробуйте ещё раз.") from exc
         try:
-            content = str(data["choices"][0]["message"]["content"] or "")
+            raw = data["choices"][0]["message"]["content"]
         except Exception as exc:
-            raise HTTPException(status_code=502, detail="Groq вернул неожиданный ответ.") from exc
+            raise HTTPException(status_code=502, detail="tokenharbor вернул ответ в неожиданном формате.") from exc
+        if isinstance(raw, list):  # some gateways send the content as parts
+            raw = "".join(str(part.get("text", "")) for part in raw if isinstance(part, dict))
+        content = str(raw or "")
         if content.strip():
-            break  # an empty reply is worth one more try
-    return _parse_language_reply(content)
+            break  # only an empty answer is retried; a filled one is parsed below
+    return _parse_variants(content)
 
 
-async def _generate_ai_reply(messages: list[dict[str, Any]], mode: str) -> tuple[str, str]:
-    """Returns (reply text, detected language)."""
+async def _generate_ai_reply(messages: list[dict[str, Any]], mode: str) -> tuple[list[str], str]:
+    """Returns (up to two reply variants, detected language). The first variant is the one sent automatically."""
     if not ai_configured():
-        raise HTTPException(status_code=503, detail="Добавьте GROQ_API_KEY в переменные окружения Render.")
+        raise HTTPException(status_code=503, detail="Добавьте TOKENHARBOR_API_KEY в переменные окружения Render.")
     mode = mode if mode in AI_MODES else "friendly"
     turns = [("assistant" if m.get("is_out") else "user", str(m.get("text", ""))[:2500])
              for m in messages[-16:] if str(m.get("text", "")).strip()]
@@ -1776,11 +1864,14 @@ async def _generate_ai_reply(messages: list[dict[str, Any]], mode: str) -> tuple
         raise HTTPException(status_code=422, detail="В чате пока нет текстовых сообщений для ответа.")
     if turns[-1][0] == "assistant":
         turns.append(("user", "Продолжи переписку: предложи следующее сообщение от моего имени."))
-    system = AI_SYSTEM_PROMPT + "\n\nСтиль выбранного режима: " + AI_MODES[mode]
-    language, text = await _groq_text(system, turns)
-    if not text:
+    system = AI_SYSTEM_PROMPT + "\n\nСтиль выбранного режима: " + AI_MODES[mode] + "\n\n" + AI_FORMAT_HINT
+    language, replies = await _tokenharbor_text(system, turns)
+    replies = [reply[:4000] for reply in replies]
+    if not replies:
         raise HTTPException(status_code=502, detail="ИИ вернул пустой ответ.")
-    return text[:4000], language
+    return replies, language
+
+
 @app.get("/api/telegram/status")
 async def telegram_status(session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
     init_db()
@@ -1945,7 +2036,7 @@ async def telegram_chat_ai(chat_id: str, payload: ChatAISettingsBody, session: S
     if payload.mode not in AI_MODES:
         raise HTTPException(status_code=422, detail="Неизвестный режим ИИ.")
     if payload.enabled and not ai_configured():
-        raise HTTPException(status_code=503, detail="Добавьте GROQ_API_KEY в переменные окружения Render.")
+        raise HTTPException(status_code=503, detail="Добавьте TOKENHARBOR_API_KEY в переменные окружения Render.")
     with db() as conn:
         conn.execute("""INSERT INTO ai_chat_settings(owner,chat_id,enabled,mode,updated_at) VALUES(?,?,?,?,?)
             ON CONFLICT(owner,chat_id) DO UPDATE SET enabled=excluded.enabled, mode=excluded.mode, updated_at=excluded.updated_at""",
@@ -1960,9 +2051,10 @@ async def ai_draft(payload: AIDraftBody, session: SessionInfo = Depends(get_sess
         raise HTTPException(status_code=422, detail="Неизвестный режим ИИ.")
     client = await _tg_client_for(session.owner)
     history = await _load_tg_messages(client, payload.chat_id, 20)
-    draft, lang = await _generate_ai_reply(history, payload.mode)
+    variants, lang = await _generate_ai_reply(history, payload.mode)
+    draft = variants[0]
     _log_ai(session.owner, payload.chat_id, "draft", payload.mode)
-    return {"draft": draft, "mode": payload.mode, "language": lang}
+    return {"draft": draft, "variants": variants, "mode": payload.mode, "language": lang}
 
 
 @app.get("/api/ai/status")
@@ -2080,6 +2172,93 @@ async def ui_background_delete(session: SessionInfo = Depends(get_session)) -> d
     with db() as conn:
         conn.execute("DELETE FROM user_backgrounds WHERE owner=?", (session.owner,))
     return {"ok": True, "custom": False, "version": 0}
+
+
+# ---------------------------------------------------------------- Telegram media on demand, read receipts
+# Photos and videos are downloaded only when a browser asks for them, cached in memory with a byte budget,
+# and always fetched through the owner's own Telegram client, so one owner never sees another's files.
+TG_MEDIA_CACHE: dict[tuple[str, str, int], tuple[str, bytes]] = {}
+TG_MEDIA_CACHE_BYTES = 64 * 1024 * 1024
+TG_MEDIA_SEM: Any = None
+
+
+async def _tg_entity(client: Any, chat_id: str) -> Any:
+    try:
+        return await client.get_entity(int(chat_id))
+    except Exception:
+        return await client.get_entity(chat_id)
+
+
+def _tg_media_put(key: tuple[str, str, int], value: tuple[str, bytes]) -> None:
+    TG_MEDIA_CACHE.pop(key, None)
+    TG_MEDIA_CACHE[key] = value
+    total = sum(len(item[1]) for item in TG_MEDIA_CACHE.values())
+    while total > TG_MEDIA_CACHE_BYTES and len(TG_MEDIA_CACHE) > 1:
+        total -= len(TG_MEDIA_CACHE.pop(next(iter(TG_MEDIA_CACHE)))[1])
+
+
+def _tg_media_response(request: Request, mime: str, data: bytes) -> Response:
+    """The whole file, or only the byte range a video player asks for (Safari plays video only with ranges)."""
+    total = len(data)
+    headers = {"Cache-Control": "private, max-age=3600", "Accept-Ranges": "bytes"}
+    match = re.match(r"bytes=(\d*)-(\d*)$", request.headers.get("range", "").strip())
+    if not match or not total or not (match.group(1) or match.group(2)):
+        return Response(content=data, media_type=mime, headers=headers)
+    first, last = match.group(1), match.group(2)
+    if first:
+        start = int(first)
+        end = min(int(last), total - 1) if last else total - 1
+    else:
+        start, end = max(0, total - int(last)), total - 1
+    if start >= total or start > end:
+        return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{total}"})
+    headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    return Response(content=data[start:end + 1], status_code=206, media_type=mime, headers=headers)
+
+
+@app.get("/api/telegram/chats/{chat_id}/messages/{message_id}/media")
+async def telegram_media(chat_id: str, message_id: int, request: Request, session: SessionInfo = Depends(get_session)) -> Response:
+    global TG_MEDIA_SEM
+    key = (session.owner, str(chat_id), int(message_id))
+    hit = TG_MEDIA_CACHE.get(key)
+    if hit is None:
+        if TG_MEDIA_SEM is None:
+            TG_MEDIA_SEM = asyncio.Semaphore(3)
+        client = await _tg_client_for(session.owner)
+        try:
+            entity = await _tg_entity(client, chat_id)
+            message = await client.get_messages(entity, ids=int(message_id))
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail="Сообщение не найдено.") from exc
+        if not message or not _tg_media_kind(message):
+            raise HTTPException(status_code=404, detail="В этом сообщении нет фото или видео.")
+        info = message.file
+        if int(getattr(info, "size", 0) or 0) > TG_MEDIA_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Файл больше 25 МБ. Откройте его в Telegram.")
+        try:
+            async with TG_MEDIA_SEM:
+                data = await asyncio.wait_for(client.download_media(message, file=bytes), timeout=60)
+        except Exception as exc:
+            log.warning("Telegram media download failed (%s)", type(exc).__name__)
+            raise HTTPException(status_code=502, detail="Не удалось загрузить медиа из Telegram.") from exc
+        if not data:
+            raise HTTPException(status_code=404, detail="Медиа пустое.")
+        hit = (str(getattr(info, "mime_type", "") or "application/octet-stream"), data)
+        _tg_media_put(key, hit)
+    return _tg_media_response(request, hit[0], hit[1])
+
+
+# marking a chat read on Telegram too, so its unread badge stays cleared on every device
+@app.post("/api/telegram/chats/{chat_id}/read")
+async def telegram_mark_read(chat_id: str, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    client = await _tg_client_for(session.owner)
+    try:
+        await client.send_read_acknowledge(await _tg_entity(client, chat_id))
+    except Exception as exc:
+        log.warning("Telegram read receipt failed (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Не удалось отметить чат прочитанным.") from exc
+    CHATS_CACHE.pop(session.owner, None)
+    return {"ok": True, "chat_id": str(chat_id), "unread_count": 0}
 
 
 # ---------------------------------------------------------------- music playlist: Spotify and SoundCloud links
@@ -2893,7 +3072,7 @@ async def lifespan(app_: FastAPI):
     if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
         log.warning("TELEGRAM_API_ID / TELEGRAM_API_HASH not set; personal Telegram login is disabled.")
     if not ai_configured():
-        log.warning("No AI key set (GROQ_API_KEY); AI replies and drafts are disabled.")
+        log.warning("No AI key set (TOKENHARBOR_API_KEY); AI replies and drafts are disabled.")
     if not DASHBOARD_PASSWORD:
         log.warning("DASHBOARD_PASSWORD is not set; sign-in works with license keys only.")
     try:
@@ -3299,6 +3478,53 @@ textarea{resize:none}
   white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;-webkit-user-select:text;
 }
 .msg.out .bubble{background:linear-gradient(160deg,#ffc58f,#ff9f6a);color:#24130a;border-color:transparent;border-radius:19px 19px 6px 19px}
+
+/* links in messages */
+.bubble a{color:inherit;text-decoration:underline;text-underline-offset:3px;text-decoration-thickness:1px;overflow-wrap:anywhere;user-select:text;-webkit-user-select:text}
+
+/* photos, videos and files inside a bubble */
+.bubble.has-media{display:flex;flex-direction:column;gap:6px;padding:5px}
+.bubble.has-media .msg-text{padding:4px 8px 3px}
+.media{display:block;position:relative;max-width:min(270px,64vw);border-radius:15px;overflow:hidden;background:rgba(0,0,0,.22)}
+button.media{padding:0;border:0;font:inherit;color:inherit;cursor:zoom-in}
+.media img,.media video{display:block;width:100%;height:auto;max-height:360px;object-fit:contain;border-radius:15px}
+.media-sticker{background:none;max-width:170px}
+.media-sticker img{width:auto;max-width:100%;max-height:170px}
+.media-audio{background:none;max-width:none}
+.media-audio audio{display:block;width:min(250px,62vw);height:40px}
+.media-note{max-width:250px;padding:12px 13px;font-size:12.5px;line-height:1.45;color:var(--muted)}
+.media.broken img,.media.broken video,.media.broken audio{display:none}
+.media.broken::after{content:"Медиа не открылось. Откройте его в Telegram";display:block;padding:12px 13px;font-size:12.5px;line-height:1.45;color:var(--muted)}
+.file-chip{display:flex;flex-direction:column;gap:2px;max-width:250px;padding:9px 12px;border-radius:14px;background:rgba(255,255,255,.06);color:inherit;text-decoration:none;font-size:13px;font-weight:600;overflow-wrap:anywhere}
+.file-chip small{font-size:11.5px;font-weight:500;color:var(--muted)}
+.msg.out .file-chip{background:rgba(36,19,10,.08)}
+.msg.out .file-chip small{color:rgba(36,19,10,.7)}
+
+/* full-size photo */
+.lightbox{
+  position:fixed;inset:0;z-index:60;display:grid;place-items:center;cursor:zoom-out;
+  padding:calc(16px + env(safe-area-inset-top,0px)) 16px calc(16px + env(safe-area-inset-bottom,0px));
+  background:rgba(4,8,6,.9);
+}
+.lightbox img{max-width:100%;max-height:88vh;width:auto;height:auto;object-fit:contain;border-radius:14px;box-shadow:0 22px 60px rgba(0,0,0,.5)}
+
+/* two reply variants above the composer */
+.variants{
+  display:flex;flex-direction:column;gap:7px;flex:none;max-height:42vh;overflow:auto;overscroll-behavior:contain;
+  margin:0 10px 8px;padding:10px;border-radius:20px;border:1px solid var(--line);background:rgba(10,14,12,.94);
+  animation:rise .35s var(--ease) both;
+}
+.variants-head{display:flex;align-items:center;gap:8px;padding:0 2px 0 6px;font-size:12px;color:var(--muted)}
+.variants-head span{flex:1;min-width:0}
+.variants-x{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-size:19px;line-height:1;color:var(--muted);flex:none}
+.variants-x:hover{background:rgba(255,255,255,.1);color:var(--ink)}
+.variant{
+  text-align:left;padding:10px 13px;border-radius:16px;border:1px solid var(--line-soft);background:rgba(255,255,255,.04);
+  color:var(--ink);line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;
+  transition:background .2s var(--ease),border-color .2s var(--ease),transform .2s var(--spring);
+}
+.variant:hover,.variant:focus-visible{background:rgba(255,179,107,.12);border-color:rgba(255,179,107,.36)}
+.variant:active{transform:scale(.985)}
 .meta{font-size:11px;color:var(--faint);padding:0 4px}
 .composer{display:flex;align-items:flex-end;gap:8px;margin:0 10px calc(10px + env(safe-area-inset-bottom,0px));padding:7px 7px 7px 16px;border-radius:26px;flex:none}
 .composer textarea{background:transparent;border:0;padding:9px 0;min-height:24px;max-height:140px;box-shadow:none}
@@ -3401,6 +3627,10 @@ textarea{resize:none}
   opacity:.01;pointer-events:none;overflow:hidden;
 }
 .music-stage iframe,.music-stage > div{width:300px;height:152px;border:0;display:block}
+
+/* the official Spotify embed, shown on the music page while a Spotify track is current */
+.sp-slot{margin:0 0 16px;border-radius:20px;overflow:hidden;border:1px solid var(--line-soft);background:rgba(10,14,12,.6);min-height:152px}
+.sp-slot iframe{display:block;width:100%!important;height:152px!important;border:0}
 
 .cover{
   --c:var(--accent);
@@ -3664,6 +3894,7 @@ html.calm *,html.calm *::before,html.calm *::after{
 </div>
 
 <div id="musicStage" class="music-stage" aria-hidden="true"></div>
+<div id="lightbox" class="lightbox" role="dialog" aria-label="Фото на весь экран" hidden><img id="lightboxImg" alt=""></div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
 <script>
@@ -3712,7 +3943,7 @@ const TABS = [
 const TAB_TITLE = {chats: 'Чаты', music: 'Музыка', ai: 'AI Conv', overview: 'Обзор', settings: 'Настройки', admin: 'Админка'};
 const TAB_SUB = {
   music: 'Плейлист из Spotify и SoundCloud',
-  ai: 'Четыре стиля общения · Groq',
+  ai: 'Четыре стиля общения · tokenharbor',
   overview: 'Статистика вашего Inbox',
   settings: 'Подключения и доступ',
   admin: 'Ключи доступа',
@@ -3977,6 +4208,14 @@ document.addEventListener('click', ev => {
   else if (a === 'reset-bg') resetBackground();
 });
 
+// links open in Telegram's own browser when the app runs inside Telegram; in a normal browser they open as usual
+document.addEventListener('click', ev => {
+  const link = ev.target.closest && ev.target.closest('a[data-ext]');
+  if (!link || !TG || typeof TG.openLink !== 'function') return;
+  ev.preventDefault();
+  callTG(() => TG.openLink(link.href));
+});
+
 async function refreshCurrent() {
   await loadStatus();
   await loadChats();
@@ -4224,12 +4463,17 @@ function onLiveMessage(evt) {
     if (!open) toast('Новое сообщение' + (chat ? ' от ' + chat.name : ''));
   }
   if (chat) {
-    chat.last_message_text = String(m.text || '').slice(0, 300);
+    chat.last_message_text = String(m.text || (m.media ? '[Медиа]' : '')).slice(0, 300);
     chat.last_message_date = m.timestamp || chat.last_message_date;
-    if (!m.is_out && !open) chat.unread_count = (chat.unread_count || 0) + 1;
+    if (!m.is_out && !open) {
+      chat.unread_count = (chat.unread_count || 0) + 1;
+      delete READ_HOLD[chatId]; // a fresh unread message must show, even right after a read
+    }
     renderChatList();
   }
   if (open) appendLiveMessage(m);
+  // the open chat is in front of the person, so a new incoming message is read at once
+  if (open && !m.is_out && !document.hidden) markChatRead(state.selected, true);
   scheduleChatsRefresh();
 }
 
@@ -4472,33 +4716,45 @@ function spLoadAPI() {
   return PLAYER.spAPIPromise;
 }
 
+// the Spotify embed lives in the music page's slot, which is shown while a Spotify track is current:
+// its own play button is then always in reach, even where the browser holds back audio that was not asked for by a tap
 function spEnsure(uri) {
   if (!PLAYER.spPromise) {
     PLAYER.spPromise = (async () => {
       const api = await spLoadAPI();
       const el = document.createElement('div');
-      stageEl().appendChild(el);
-      const controller = await withTimeout(new Promise(resolve => {
-        api.createController(el, {uri, width: 300, height: 152}, c => {
-          // the callback can arrive before the embed is ready, so also wait for its ready event
-          c.addListener('ready', () => resolve(c));
-          setTimeout(() => resolve(c), 4000);
-        });
-      }), 12000, 'Spotify не запустился');
-      controller.addListener('playback_started', () => spEvent(() => {
-        PLAYER.spNearEnd = false;
-        PLAYER.spWasPlaying = true;
-        PLAYER.pending = false;
-        setPlaying(true);
-      }));
-      controller.addListener('playback_update', e => spEvent(() => spUpdate(e && e.data ? e.data : {})));
-      PLAYER.sp = controller;
-      PLAYER.spEl = el;
-      PLAYER.spUri = uri;
-      return controller;
+      ($('#spSlot') || stageEl()).appendChild(el);
+      try {
+        const controller = await withTimeout(new Promise(resolve => {
+          api.createController(el, {uri, width: 300, height: 152}, c => {
+            // the callback can arrive before the embed is ready, so also wait for its ready event
+            c.addListener('ready', () => resolve(c));
+            setTimeout(() => resolve(c), 4000);
+          });
+        }), 12000, 'Spotify не запустился');
+        controller.addListener('playback_started', () => spEvent(() => {
+          PLAYER.spNearEnd = false;
+          PLAYER.spWasPlaying = true;
+          PLAYER.pending = false;
+          setPlaying(true);
+        }));
+        controller.addListener('playback_update', e => spEvent(() => spUpdate(e && e.data ? e.data : {})));
+        PLAYER.sp = controller;
+        PLAYER.spEl = el;
+        PLAYER.spUri = uri;
+        return controller;
+      } catch (err) {
+        el.remove();
+        throw err;
+      }
     })().catch(err => { PLAYER.spPromise = null; throw err; });
   }
   return PLAYER.spPromise;
+}
+
+function showSpSlot(on) {
+  const slot = $('#spSlot');
+  if (slot) slot.hidden = !on;
 }
 
 function spEvent(fn) {
@@ -4534,6 +4790,7 @@ async function startItem(item) {
   PLAYER.progress = 0;
   PLAYER.spNearEnd = false;
   PLAYER.spWasPlaying = false;
+  showSpSlot(item.provider === 'spotify');
   renderMini();
   updateTrackStates();
   try {
@@ -4576,7 +4833,13 @@ async function playSpotify(item) {
     else controller.loadUri(uri);
   }
   controller.play();
-  setTimeout(() => { if (PLAYER.item === item && PLAYER.pending) { PLAYER.pending = false; renderMini(); } }, 3500);
+  // no playback event within a few seconds: the browser held the audio back, so the embed's own play button is the way on
+  setTimeout(() => {
+    if (PLAYER.item !== item || !PLAYER.pending) return;
+    PLAYER.pending = false;
+    renderMini();
+    if (state.tab === 'music') toast('Звука нет? Нажмите ▶ во встроенном плеере Spotify');
+  }, 3500);
 }
 
 function pauseSoundCloud() {
@@ -4630,6 +4893,7 @@ function stopPlayback() {
   PLAYER.playing = false;
   PLAYER.pending = false;
   PLAYER.progress = 0;
+  showSpSlot(false);
   renderMini();
   updateTrackStates();
 }
@@ -4707,7 +4971,7 @@ function trackHTML(item, i) {
         </span>
       </button>
       <div class="track-actions">
-        <a class="icon-btn" href="${esc(item.source_url)}" target="_blank" rel="noopener" aria-label="Открыть ссылку" title="Открыть ссылку">${icon('link')}</a>
+        <a class="icon-btn" href="${esc(item.source_url)}" data-ext target="_blank" rel="noopener noreferrer" aria-label="Открыть ссылку" title="Открыть ссылку">${icon('link')}</a>
         <button class="icon-btn" type="button" data-remove="${esc(item.id)}" aria-label="Убрать из плейлиста" title="Убрать">${icon('trash')}</button>
       </div>
     </div>`;
@@ -4731,6 +4995,7 @@ function ensureMusicPage() {
       </form>
       <p class="hint" style="margin:12px 0 0">Полная песня в Spotify требует входа в аккаунт Spotify в этом браузере, без него звучит отрывок. У SoundCloud некоторые треки запрещают встраивание.</p>
     </section>
+    <div class="sp-slot" id="spSlot" hidden></div>
     <section class="card">
       <div class="row" style="justify-content:space-between;margin-bottom:10px">
         <h2 style="margin:0">Плейлист</h2>
@@ -4753,6 +5018,9 @@ function renderMusic() {
     list.innerHTML = '<div class="skel"></div><div class="skel"></div>';
     return;
   }
+  // the Spotify embed loads ahead of time, so the first press of play does not wait for it
+  const spotify = MUSIC.items.find(x => x.provider === 'spotify');
+  if (spotify && !PLAYER.spPromise) spEnsure('spotify:' + spotify.embed_id).catch(() => {});
   const sig = JSON.stringify(MUSIC.items.map(x => [x.id, x.title, x.artist, x.thumb_url, x.provider]));
   if (list.dataset.sig === sig) return updateTrackStates();
   list.dataset.sig = sig;
@@ -4870,21 +5138,42 @@ document.addEventListener('click', ev => {
 /* ================================================================
    VIEWS: chats, conversation, AI, overview, settings, admin
    ================================================================ */
-const AI_NAMES = {groq: 'Groq'};
+const AI_NAMES = {tokenharbor: 'tokenharbor'};
 const pill = (ok, text) => `<span class="pill${ok ? ' ok' : ''}"><span class="dot"></span>${esc(text)}</span>`;
 const stagger = root => Array.from(root.children).forEach((el, i) => el.style.setProperty('--i', Math.min(i, 12)));
 const modeOptions = sel => Object.keys(MODE_NAMES)
   .map(k => `<option value="${k}"${k === sel ? ' selected' : ''}>${esc(MODE_NAMES[k])}</option>`).join('');
 
 /* ---------- chat list (personal chats only: the server already drops groups) ---------- */
+// chat id -> time until which the server's unread count is ignored, so a chat read a moment ago stays read
+// while the server catches up with the read receipt
+const READ_HOLD = {};
+
+// reading a chat (or a new message while it is open and visible) tells Telegram too, so the badge stays gone
+async function markChatRead(chat, force = false) {
+  if (!chat || (!force && !chat.unread_count)) return;
+  chat.unread_count = 0;
+  READ_HOLD[chat.id] = Date.now() + 15000;
+  state.chatStats.unread_count = state.chats.reduce((n, c) => n + (c.unread_count || 0), 0);
+  renderChatList();
+  if (state.tab === 'overview') renderOverview();
+  try {
+    await api(`/telegram/chats/${encodeURIComponent(chat.id)}/read`, {method: 'POST'});
+  } catch {
+    // the next refresh shows whatever Telegram still counts as unread
+  }
+}
+
 async function loadChats() {
   try {
     const d = await api('/telegram/chats');
     state.lastSync = Date.now();
     state.chats = (d.items || []).filter(c => c.is_user !== false);
+    const now = Date.now();
+    state.chats.forEach(c => { if ((READ_HOLD[c.id] || 0) > now) c.unread_count = 0; });
     state.chatStats = {
       count: d.count ?? state.chats.length,
-      unread_count: d.unread_count ?? 0,
+      unread_count: state.chats.reduce((n, c) => n + (c.unread_count || 0), 0),
       ai_active_count: d.ai_active_count ?? 0,
     };
     if (state.selected) {
@@ -4894,7 +5183,11 @@ async function loadChats() {
     }
     renderChatList();
     renderTitle();
-    if (state.selected) await loadMessages(true);
+    if (state.selected) {
+      // an open chat with new messages, seen while the app is in front, counts as read
+      if (state.selected.unread_count && !document.hidden) markChatRead(state.selected, true);
+      await loadMessages(true);
+    }
   } catch (e) {
     state.chats = [];
     renderChatList(e.message);
@@ -4979,6 +5272,7 @@ async function openChat(id) {
   renderChatList();
   renderTitle();
   renderChatPane();
+  markChatRead(chat);
   await loadMessages(false);
 }
 
@@ -5093,17 +5387,91 @@ function renderMessages(silent) {
   box.scrollTop = (!silent || nearBottom) ? box.scrollHeight : keep;
 }
 
+// links in a message become clickable; the rest of the text is escaped as before
+const URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>"']+/gi;
+function linkify(text) {
+  const src = String(text ?? '');
+  let out = '';
+  let last = 0;
+  for (const m of src.matchAll(URL_RE)) {
+    const raw = m[0];
+    const url = raw.replace(/[.,!?;:)\]]+$/, '');
+    if (!url) continue;
+    const href = /^www\./i.test(url) ? 'https://' + url : url;
+    out += esc(src.slice(last, m.index)) +
+      `<a href="${esc(href)}" data-ext target="_blank" rel="noopener noreferrer">${esc(url)}</a>${esc(raw.slice(url.length))}`;
+    last = m.index + raw.length;
+  }
+  return out + esc(src.slice(last));
+}
+
+const MEDIA_LABEL = {photo: 'Фото', video: 'Видео', gif: 'Анимация', sticker: 'Стикер', voice: 'Голосовое', audio: 'Аудио', file: 'Файл', other: 'Вложение'};
+function fmtSize(bytes) {
+  const n = Number(bytes) || 0;
+  if (n >= 1048576) return (n / 1048576).toFixed(1).replace('.', ',') + ' МБ';
+  return Math.max(1, Math.round(n / 1024)) + ' КБ';
+}
+
+// photos and videos load from the server's media endpoint; a file that is too big or unknown gets a short note
+function mediaHTML(m) {
+  if (!m.media) return '';
+  const label = MEDIA_LABEL[m.media] || 'Вложение';
+  const sizeText = m.media_size ? fmtSize(m.media_size) : '';
+  if (!m.media_url) return `<div class="media media-note">${esc(label)}${sizeText ? ' · ' + esc(sizeText) : ''}. Откройте в Telegram</div>`;
+  const src = esc(m.media_url);
+  if (m.media === 'photo') return `<button class="media" type="button" data-zoom="${src}" aria-label="Открыть фото"><img src="${src}" alt="Фото" loading="lazy" decoding="async"></button>`;
+  if (m.media === 'sticker' && /tgsticker/.test(m.media_mime || '')) return '<div class="media media-note">Анимированный стикер</div>';
+  if (m.media === 'sticker') return `<div class="media media-sticker"><img src="${src}" alt="Стикер" loading="lazy" decoding="async"></div>`;
+  if (m.media === 'gif') return `<div class="media"><video src="${src}" autoplay muted loop playsinline preload="auto" aria-label="Анимация"></video></div>`;
+  if (m.media === 'video') return `<div class="media"><video src="${src}" controls playsinline preload="metadata" aria-label="Видео"></video></div>`;
+  if (m.media === 'voice' || m.media === 'audio') return `<div class="media media-audio"><audio src="${src}" controls preload="none"></audio></div>`;
+  if (m.media === 'file') {
+    return `<a class="file-chip" href="${src}" download="${esc(m.media_name || 'file')}">${esc(m.media_name || 'Файл')}${sizeText ? `<small>${esc(sizeText)}</small>` : ''}</a>`;
+  }
+  return `<div class="media media-note">${esc(label)}</div>`;
+}
+
 function messageHTML(m, other, animate) {
   const who = m.author || (m.is_out ? 'Вы' : other);
+  const media = mediaHTML(m);
+  const text = m.text ? `<div class="msg-text">${linkify(m.text)}</div>` : '';
   return `
     <div class="msg ${m.is_out ? 'out' : 'in'}${animate ? ' anim' : ''}" data-mid="${esc(m.id)}">
       ${m.is_out ? '' : avatarHTML(state.selected, 'xs')}
       <div class="bubble-wrap">
-        <div class="bubble">${esc(m.text)}</div>
+        <div class="bubble${media ? ' has-media' : ''}">${media}${text}</div>
         <div class="meta">${esc(who)} · ${esc(fmtTime(m.timestamp))}</div>
       </div>
     </div>`;
 }
+
+// a picture or video that fails to load shows a short message instead of a broken icon
+document.addEventListener('error', ev => {
+  const el = ev.target;
+  if (!(el instanceof HTMLImageElement || el instanceof HTMLVideoElement)) return;
+  const holder = el.closest('.media');
+  if (holder) holder.classList.add('broken');
+}, true);
+
+function openLightbox(src) {
+  const box = $('#lightbox');
+  $('#lightboxImg').src = src;
+  box.hidden = false;
+}
+
+function closeLightbox() {
+  const box = $('#lightbox');
+  if (!box || box.hidden) return;
+  box.hidden = true;
+  $('#lightboxImg').removeAttribute('src');
+}
+
+$('#lightbox').addEventListener('click', closeLightbox);
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') closeLightbox(); });
+$('#chatPane').addEventListener('click', ev => {
+  const zoom = ev.target.closest && ev.target.closest('[data-zoom]');
+  if (zoom) openLightbox(zoom.dataset.zoom);
+});
 
 function appendMessageNodes(list, animate, forceBottom) {
   const box = $('#messages');
@@ -5149,13 +5517,11 @@ async function makeDraft() {
   btn.innerHTML = '<span class="dots" aria-label="ИИ пишет черновик"><i></i><i></i><i></i></span>';
   try {
     const d = await api('/ai/draft', {method: 'POST', body: {chat_id: chat.id, mode: $('#chatMode').value}});
-    const ta = $('#messageText');
-    ta.value = d.draft;
-    autoGrow({target: ta});
-    ta.focus();
+    const list = (Array.isArray(d.variants) && d.variants.length ? d.variants : [d.draft]).filter(Boolean);
+    showVariants(list, d.language);
     SFX.ai();
     haptic('success');
-    toast('Черновик готов' + (d.language ? ' · ' + d.language : '') + '. Проверьте текст и отправьте его сами', 'ok');
+    toast('Ответы готовы' + (d.language ? ' · ' + d.language : '') + '. Выберите один и отправьте его сами', 'ok');
   } catch (e) {
     SFX.error();
     haptic('error');
@@ -5164,6 +5530,41 @@ async function makeDraft() {
     btn.disabled = false;
     btn.innerHTML = icon('spark') + 'Предложить ответ';
   }
+}
+
+/* ---------- reply variants: the AI offers two replies; the person picks one, then sends it */
+function hideVariants() {
+  $('#variants')?.remove();
+}
+
+function showVariants(list, language) {
+  hideVariants();
+  const form = $('#sendForm');
+  if (!form || !list.length) return;
+  const box = document.createElement('div');
+  box.id = 'variants';
+  box.className = 'variants';
+  box.setAttribute('role', 'group');
+  box.setAttribute('aria-label', 'Варианты ответа');
+  box.innerHTML = `
+    <div class="variants-head">
+      <span>${list.length > 1 ? 'Два варианта ответа' : 'Вариант ответа'}${language ? ' · ' + esc(language) : ''}</span>
+      <button class="variants-x" type="button" data-variants-close aria-label="Скрыть варианты">×</button>
+    </div>
+    ${list.map((text, i) => `<button class="variant" type="button" data-variant="${i}">${esc(text)}</button>`).join('')}`;
+  box.addEventListener('click', ev => {
+    if (ev.target.closest('[data-variants-close]')) return hideVariants();
+    const pick = ev.target.closest('[data-variant]');
+    if (!pick) return;
+    const ta = $('#messageText');
+    if (ta) {
+      ta.value = list[Number(pick.dataset.variant)] || '';
+      autoGrow({target: ta});
+      ta.focus();
+    }
+    hideVariants();
+  });
+  form.before(box);
 }
 
 // the send button flies off once, so the message visibly leaves the composer
@@ -5209,8 +5610,8 @@ function renderAI(fromRefresh) {
   page.innerHTML = `
     <div class="stats">
       <div class="stat">
-        <div class="k" style="font:600 15px/1.3 var(--f-body);letter-spacing:0;overflow-wrap:anywhere">${esc(d.model || 'openai/gpt-oss-120b')}</div>
-        <div class="l">${d.configured ? `${esc(AI_NAMES[d.provider] || 'Groq')} API подключён` : 'Добавьте GROQ_API_KEY'}</div>
+        <div class="k" style="font:600 15px/1.3 var(--f-body);letter-spacing:0;overflow-wrap:anywhere">${esc(d.model || 'claude-haiku-5.5:free')}</div>
+        <div class="l">${d.configured ? `${esc(AI_NAMES[d.provider] || 'tokenharbor')} API подключён` : 'Добавьте TOKENHARBOR_API_KEY'}</div>
       </div>
       <div class="stat"><div class="k">${d.today?.auto_sent || 0}</div><div class="l">Автоответов за 24 ч</div></div>
       <div class="stat"><div class="k">${d.today?.drafts || 0}</div><div class="l">Черновиков за 24 ч</div></div>
@@ -5227,6 +5628,7 @@ function renderAI(fromRefresh) {
       <h2>Как это работает</h2>
       <p class="lead">Автоответ включается отдельно в каждом чате и срабатывает только после входящего сообщения. ИИ не пишет первым и не делает рассылок. Черновик можно проверить и поправить перед отправкой.</p>
       <p class="lead">Язык ИИ определяет сам по собеседнику и отвечает на том же языке.</p>
+      <p class="lead">«Предложить ответ» даёт два варианта: выбранный попадает в поле ввода, а отправляете его вы. Автоответ отправляет первый вариант.</p>
       <p class="lead" style="margin:0">ИИ не выдумывает цены и гарантии и не просит пароли или коды входа.</p>
       <div class="btn-row" style="margin-top:14px">
         <button class="btn primary" data-nav="chats">Выбрать чат</button>
@@ -5258,8 +5660,8 @@ function renderOverview() {
     <section class="card">
       <h2>Подключения</h2>
       <div class="kv"><span>Telegram-аккаунт</span>${pill(st.connected, st.connected ? 'Подключён' : 'Не подключён')}</div>
-      <div class="kv"><span>Groq API</span>${pill(st.ai_configured, st.ai_configured ? 'Готов' : 'Нужен ключ')}</div>
-      <div class="kv"><span>Модель</span><b>${esc(ai.model || 'openai/gpt-oss-120b')}</b></div>
+      <div class="kv"><span>tokenharbor API</span>${pill(st.ai_configured, st.ai_configured ? 'Готов' : 'Нужен ключ')}</div>
+      <div class="kv"><span>Модель</span><b>${esc(ai.model || 'claude-haiku-5.5:free')}</b></div>
     </section>
     <section class="card">
       <h2>Быстрый старт</h2>
@@ -5281,7 +5683,7 @@ function renderSettings() {
     : '—';
   page.innerHTML = `
     <section class="card" id="tgCard"><h2>Telegram-аккаунт</h2><div class="skel"></div></section>
-    <section class="card" id="aiCard"><h2>Groq API</h2><div class="skel"></div></section>
+    <section class="card" id="aiCard"><h2>tokenharbor API</h2><div class="skel"></div></section>
     <section class="card" id="bgCard"><h2>Фон сайта</h2><div class="skel"></div></section>
     <section class="card" id="fxCard"></section>
     <section class="card">
@@ -5342,9 +5744,9 @@ function renderTelegramCard(st) {
 
 function renderAICard(st) {
   $('#aiCard').innerHTML = `
-    <h2>Groq API</h2>
+    <h2>tokenharbor API</h2>
     <div class="kv"><span>Подключение</span>${pill(st.ai_configured, st.ai_configured ? 'Подключено' : 'Не настроено')}</div>
-    <p class="hint" style="margin:12px 0 0">Ключ GROQ_API_KEY задаётся в Render → Environment. Модель по умолчанию openai/gpt-oss-120b, её можно сменить через GROQ_MODEL. Бесплатный тариф Groq ограничен по запросам и токенам в минуту и в день. Ключ никогда не попадает в браузер.</p>`;
+    <p class="hint" style="margin:12px 0 0">Адрес tokenharbor.ai/v1, модель claude-haiku-5.5:free. Ключ встроен в сервер и может быть переопределён через TOKENHARBOR_API_KEY в Render → Environment, модель через TOKENHARBOR_MODEL. Лимиты тарифа смотрите на tokenharbor.ai/pricing. Ключ хранится на сервере и в браузер не попадает.</p>`;
 }
 
 function bindTelegramForms() {
