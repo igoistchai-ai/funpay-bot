@@ -66,8 +66,10 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip() or (
 FUNPAY_USER_AGENT_DEFAULT = os.getenv("FUNPAY_USER_AGENT", "").strip()
 FUNPAY_GOLDEN_KEY_ENV = os.getenv("FUNPAY_GOLDEN_KEY", "").strip()
 FUNPAY_TIMEOUT = float(os.getenv("FUNPAY_TIMEOUT", "15"))
-APP_VERSION = "6.0.0"
+APP_VERSION = "7.0.0"
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "8357023784"))
+# admin key: full admin rights and no time limit. Set ADMIN_ACCESS_KEY in the environment to replace it.
+ADMIN_ACCESS_KEY = os.getenv("ADMIN_ACCESS_KEY", "").strip() or "888CC-2747"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
@@ -294,6 +296,16 @@ def init_db() -> None:
             added_at INTEGER NOT NULL,
             UNIQUE(owner, provider, embed_id)
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS music_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            mime TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            data BLOB NOT NULL,
+            added_at INTEGER NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS music_files_owner ON music_files(owner)")
         # Legacy free keys (v4) were issued for 24 h from creation. Re-base them to the
         # strict 30-minute rule measured from creation, then keep the flag consistent.
         conn.execute(
@@ -523,7 +535,7 @@ def _token_hash(token: str) -> str:
 def plan_title(plan_id: str) -> str:
     if plan_id == "free":
         return "FREE PLAN"
-    if plan_id == "admin":
+    if plan_id in ("admin", "admin_key"):
         return "Администратор"
     if plan_id in STAR_PLANS:
         return str(STAR_PLANS[plan_id]["title"])
@@ -572,7 +584,7 @@ class SessionInfo:
 
     def payload(self) -> dict[str, Any]:
         now = now_ts()
-        forever = self.plan_id in ("forever", "admin_forever")
+        forever = self.plan_id in ("forever", "admin_forever", "admin_key")
         key_hint = (self.license_key or "")[-4:] if self.license_key else ""
         return {
             "plan_id": self.plan_id,
@@ -1265,13 +1277,20 @@ def session_summary(plan_id: str, is_admin: bool, license_key: str | None, expir
         "plan_title": plan_title(plan_id),
         "is_admin": is_admin,
         "free": plan_id == "free",
-        "forever": plan_id in ("forever", "admin_forever"),
+        "forever": plan_id in ("forever", "admin_forever", "admin_key"),
         "license_hint": (license_key or "")[-4:],
         "expires_at": expires_at,
         "remaining_seconds": max(0, expires_at - now),
         "server_time": now,
         "version": APP_VERSION,
     }
+
+
+def is_admin_access_key(value: str) -> bool:
+    """True only for the admin key. Compared case-insensitively as bytes, so any input is safe."""
+    if not value:
+        return False
+    return hmac.compare_digest(value.upper().encode("utf-8"), ADMIN_ACCESS_KEY.upper().encode("utf-8"))
 
 
 # ---------------------------------------------------------------- auth and session
@@ -1284,12 +1303,18 @@ async def login(payload: LoginBody, request: Request, response: Response) -> dic
     user_agent = request.headers.get("user-agent", "")
     tg_user = verify_telegram_init_data(payload.init_data)
     is_tg_admin = bool(tg_user and int(tg_user.get("id", 0) or 0) == ADMIN_TELEGRAM_ID)
-    password_ok = bool(DASHBOARD_PASSWORD and supplied and hmac.compare_digest(supplied, DASHBOARD_PASSWORD))
+    password_ok = bool(DASHBOARD_PASSWORD and supplied and hmac.compare_digest(supplied.encode("utf-8"), DASHBOARD_PASSWORD.encode("utf-8")))
+    admin_key_ok = is_admin_access_key(supplied)
 
     if is_tg_admin or password_ok:
         expires = now + ADMIN_SESSION_SECONDS
         token = create_web_session("admin", "admin", True, None, expires, user_agent)
         plan_id, is_admin, license_key = "admin", True, None
+    elif admin_key_ok:
+        # no limit: the key never expires, so the session lasts as long as a forever key's session
+        expires = FOREVER_SESSION_SECONDS + now
+        token = create_web_session("admin", "admin_key", True, None, expires, user_agent)
+        plan_id, is_admin, license_key = "admin_key", True, None
     elif supplied:
         lic = find_license(supplied)
         if lic is None:
@@ -2269,8 +2294,8 @@ MUSIC_SC_RESERVED = {"discover", "charts", "search", "stream", "you", "upload", 
                      "settings", "messages", "notifications", "imprint", "terms-of-use", "people", "tags", "groups"}
 MUSIC_SC_RESERVED_SUB = {"likes", "tracks", "albums", "reposts", "followers", "following", "comments", "popular-tracks"}
 MUSIC_SC_SEG_RE = re.compile(r"^[A-Za-z0-9_\-]{1,80}$")
-MUSIC_KIND_RU = {"track": "Трек", "album": "Альбом", "playlist": "Плейлист", "set": "Плейлист"}
-MUSIC_PROVIDER_RU = {"spotify": "Spotify", "soundcloud": "SoundCloud"}
+MUSIC_KIND_RU = {"track": "Трек", "album": "Альбом", "playlist": "Плейлист", "set": "Плейлист", "video": "Видео", "audio": "Аудио"}
+MUSIC_PROVIDER_RU = {"spotify": "Spotify", "soundcloud": "SoundCloud", "file": "Файл"}
 
 
 class MusicAddBody(BaseModel):
@@ -2341,7 +2366,8 @@ async def _music_meta(parsed: dict[str, str]) -> dict[str, str]:
 def _music_item(row: Any) -> dict[str, Any]:
     return {"id": int(row["id"]), "provider": row["provider"], "provider_label": MUSIC_PROVIDER_RU.get(row["provider"], ""),
             "kind": row["kind"], "kind_label": MUSIC_KIND_RU.get(row["kind"], ""), "embed_id": row["embed_id"],
-            "source_url": row["source_url"], "title": row["title"], "artist": row["artist"], "thumb_url": row["thumb_url"]}
+            "source_url": row["source_url"], "title": row["title"], "artist": row["artist"], "thumb_url": row["thumb_url"],
+            "file_url": ("/api/music/files/" + row["embed_id"]) if row["provider"] == "file" else ""}
 
 
 @app.get("/api/music/playlist")
@@ -2382,8 +2408,126 @@ async def music_add(payload: MusicAddBody, session: SessionInfo = Depends(get_se
 async def music_delete(item_id: int, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
     init_db()
     with db() as conn:
+        row = conn.execute("SELECT provider, embed_id FROM music_playlist WHERE owner=? AND id=?",
+                           (session.owner, int(item_id))).fetchone()
+        if row is not None and row["provider"] == "file":
+            conn.execute("DELETE FROM music_files WHERE owner=? AND id=?", (session.owner, int(row["embed_id"])))
+            MUSIC_FILE_CACHE.pop((session.owner, int(row["embed_id"])), None)
         conn.execute("DELETE FROM music_playlist WHERE owner=? AND id=?", (session.owner, int(item_id)))
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- music files: the owner's own MP4, M4A, MP3 or WAV
+# A file is stored in the database under its owner and listed in the playlist as provider "file".
+# Every query filters by owner, and playback is streamed with byte ranges so the player can seek.
+MUSIC_FILE_MAX_BYTES = 50 * 1024 * 1024
+MUSIC_FILES_QUOTA_BYTES = 300 * 1024 * 1024
+MUSIC_FILE_CACHE_BYTES = 64 * 1024 * 1024
+MUSIC_FILE_TYPES = {"mp4": ("video/mp4", "video"), "m4a": ("audio/mp4", "audio"),
+                    "mp3": ("audio/mpeg", "audio"), "wav": ("audio/wav", "audio")}
+MUSIC_FILE_CACHE: dict[tuple[str, int], bytes] = {}
+
+
+def _music_file_name(raw: str) -> tuple[str, str]:
+    """(name without extension, lowercase extension) from the X-File-Name header; ("", "") for a type we do not take."""
+    name = urllib.parse.unquote(raw or "").replace("\\", "/").split("/")[-1]
+    name = "".join(ch for ch in name if ch.isprintable()).strip()
+    stem, dot, ext = name.rpartition(".")
+    stem = stem.strip()[:160]  # the extension is split off first, so a long name keeps it
+    ext = ext.lower() if dot else ""
+    if ext not in MUSIC_FILE_TYPES or not stem:
+        return "", ""
+    return stem, ext
+
+
+def _music_sniff(data: bytes) -> bool:
+    """True when the bytes start like an MP4, M4A or MOV file, a WAV file or an MP3 (ID3 tag or frame sync)."""
+    if data[4:8] in (b"ftyp", b"moov", b"mdat", b"wide", b"free"):
+        return True
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return True
+    if data[:3] == b"ID3":
+        return True
+    return len(data) > 1 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0
+
+
+async def _music_read_body(request: Request, limit: int) -> bytes:
+    """The raw request body, read in pieces. Reading stops as soon as the body is larger than the limit."""
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=413, detail="Файл больше 50 МБ. Возьмите файл поменьше.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _music_cache_put(key: tuple[str, int], data: bytes) -> None:
+    MUSIC_FILE_CACHE.pop(key, None)
+    MUSIC_FILE_CACHE[key] = data
+    total = sum(len(item) for item in MUSIC_FILE_CACHE.values())
+    while total > MUSIC_FILE_CACHE_BYTES and len(MUSIC_FILE_CACHE) > 1:
+        total -= len(MUSIC_FILE_CACHE.pop(next(iter(MUSIC_FILE_CACHE))))
+
+
+@app.post("/api/music/upload")
+async def music_upload(request: Request, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    """One file from the owner. The file itself is the request body; its name comes in the X-File-Name header."""
+    stem, ext = _music_file_name(request.headers.get("x-file-name", ""))
+    if not ext:
+        raise HTTPException(status_code=422, detail="Поддерживаются файлы MP4, M4A, MP3 и WAV.")
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = 0
+    if declared > MUSIC_FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Файл больше 50 МБ. Возьмите файл поменьше.")
+    data = await _music_read_body(request, MUSIC_FILE_MAX_BYTES)
+    if not data:
+        raise HTTPException(status_code=422, detail="Файл пустой.")
+    if not _music_sniff(data):
+        raise HTTPException(status_code=422, detail="Это не похоже на MP4, M4A, MP3 или WAV. Проверьте файл.")
+    init_db()
+    mime, kind = MUSIC_FILE_TYPES[ext]
+    with db() as conn:
+        count = int(conn.execute("SELECT COUNT(*) AS n FROM music_playlist WHERE owner=?", (session.owner,)).fetchone()["n"])
+        if count >= MUSIC_MAX_ITEMS:
+            raise HTTPException(status_code=422, detail="В плейлисте уже 300 треков. Удалите лишние, чтобы добавить новые.")
+        used = int(conn.execute("SELECT COALESCE(SUM(size), 0) AS n FROM music_files WHERE owner=?", (session.owner,)).fetchone()["n"])
+        if used + len(data) > MUSIC_FILES_QUOTA_BYTES:
+            raise HTTPException(status_code=413, detail="Для файлов не хватает места: лимит 300 МБ. Удалите ненужные файлы.")
+        cur = conn.execute("INSERT INTO music_files(owner,name,mime,size,data,added_at) VALUES(?,?,?,?,?,?)",
+                           (session.owner, stem, mime, len(data), sqlite3.Binary(data), now_ts()))
+        file_id = str(int(cur.lastrowid))
+        conn.execute("""INSERT INTO music_playlist(owner,provider,kind,embed_id,source_url,title,artist,thumb_url,added_at)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+            (session.owner, "file", kind, file_id, "", stem, "", "", now_ts()))
+        row = conn.execute("SELECT * FROM music_playlist WHERE owner=? AND provider=? AND embed_id=?",
+                           (session.owner, "file", file_id)).fetchone()
+    return {"item": _music_item(row), "created": True}
+
+
+@app.get("/api/music/files/{file_id}")
+async def music_file(file_id: int, request: Request, session: SessionInfo = Depends(get_session)) -> Response:
+    """The owner's own file, with byte ranges so the player can seek. Anyone else gets the same 404 as for a missing file."""
+    init_db()
+    key = (session.owner, int(file_id))
+    with db() as conn:
+        meta = conn.execute("SELECT mime FROM music_files WHERE owner=? AND id=?", (session.owner, int(file_id))).fetchone()
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Файл не найден.")
+    data = MUSIC_FILE_CACHE.get(key)
+    if data is None:
+        with db() as conn:
+            blob = conn.execute("SELECT data FROM music_files WHERE owner=? AND id=?", (session.owner, int(file_id))).fetchone()
+        if blob is None:
+            raise HTTPException(status_code=404, detail="Файл не найден.")
+        data = bytes(blob["data"])
+        _music_cache_put(key, data)
+    response = _tg_media_response(request, str(meta["mime"]), data)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 # ---------------------------------------------------------------- FunPay account
@@ -3075,6 +3219,8 @@ async def lifespan(app_: FastAPI):
         log.warning("No AI key set (TOKENHARBOR_API_KEY); AI replies and drafts are disabled.")
     if not DASHBOARD_PASSWORD:
         log.warning("DASHBOARD_PASSWORD is not set; sign-in works with license keys only.")
+    if not os.getenv("ADMIN_ACCESS_KEY", "").strip():
+        log.warning("ADMIN_ACCESS_KEY is not set: the built-in admin key is active. Set your own key in Render.")
     try:
         yield
     finally:
@@ -3739,6 +3885,51 @@ html[data-player="on"] .toast{bottom:calc(env(safe-area-inset-bottom,0px) + 180p
 .toast.ok{border-color:rgba(143,233,189,.42)}
 .toast.bad{border-color:rgba(255,157,171,.5)}
 
+/* ---------- own files: upload card and the media slot ---------- */
+.cover.fl{--c:#8fb8ff}
+.chip.fl{--c:#8fb8ff}
+.file-pick{position:relative;cursor:pointer}
+.file-pick:focus-within{outline:2px solid var(--accent);outline-offset:3px}
+.file-pick.busy{opacity:.55;pointer-events:none}
+.upload{margin-top:12px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.upload .hint{overflow-wrap:anywhere;min-width:0}
+.upload-bar{height:6px;border-radius:6px;background:rgba(255,255,255,.08);overflow:hidden}
+.upload-bar i{display:block;height:100%;width:0;border-radius:6px;background:linear-gradient(90deg,var(--accent),var(--accent-hi));transition:width .2s linear}
+/* the file's player card. flex:none keeps it at its own height inside the flex column of the page */
+.file-slot{
+  flex:none;margin:0 0 16px;padding:14px;border-radius:24px;min-width:0;
+  border:1px solid var(--line);
+  background:linear-gradient(160deg,rgba(255,255,255,.08),rgba(255,255,255,.02)),rgba(8,12,10,.62);
+  box-shadow:0 18px 40px rgba(0,0,0,.22);
+}
+.fp-head{display:flex;align-items:center;gap:12px;min-width:0;margin-bottom:12px}
+.fp-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.fp-info b{font:600 15px/1.3 var(--f-body);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fp-info span{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fp-screen{display:none;position:relative;margin:0 0 12px;border-radius:18px;overflow:hidden;background:#000;aspect-ratio:16/9;max-height:min(52vh,380px);cursor:pointer}
+.file-slot[data-kind="video"] .fp-screen{display:block}
+.fp-screen video{display:block;width:100%;height:100%;object-fit:contain}
+.fp-screen audio{display:none}
+.fp-bar{display:flex;align-items:center;gap:12px;min-width:0}
+.fp-bar .play-btn{flex:none}
+.fp-seek{flex:1;min-width:0;display:flex;flex-direction:column;gap:7px}
+.fp-seek input{
+  -webkit-appearance:none;appearance:none;width:100%;height:22px;margin:0;background:transparent;cursor:pointer;--p:0%;
+}
+.fp-seek input::-webkit-slider-runnable-track{
+  height:6px;border-radius:6px;background:linear-gradient(90deg,var(--accent) var(--p),rgba(255,255,255,.14) var(--p));
+}
+.fp-seek input::-webkit-slider-thumb{
+  -webkit-appearance:none;width:16px;height:16px;margin-top:-5px;border-radius:50%;background:#fff;
+  box-shadow:0 2px 8px rgba(0,0,0,.45);transition:transform .2s var(--spring);
+}
+.fp-seek input:active::-webkit-slider-thumb{transform:scale(1.25)}
+.fp-seek input::-moz-range-track{height:6px;border-radius:6px;background:rgba(255,255,255,.14)}
+.fp-seek input::-moz-range-progress{height:6px;border-radius:6px;background:var(--accent)}
+.fp-seek input::-moz-range-thumb{width:16px;height:16px;border:0;border-radius:50%;background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.45)}
+.fp-seek input:focus-visible{outline:2px solid var(--accent);outline-offset:4px;border-radius:8px}
+.fp-times{display:flex;justify-content:space-between;font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+
 /* ---------- motion: answers to what the person did (tabs, sends, replies, playback) ---------- */
 
 /* tabs slide in from the side they are coming from */
@@ -3942,7 +4133,7 @@ const TABS = [
 ];
 const TAB_TITLE = {chats: 'Чаты', music: 'Музыка', ai: 'AI Conv', overview: 'Обзор', settings: 'Настройки', admin: 'Админка'};
 const TAB_SUB = {
-  music: 'Плейлист из Spotify и SoundCloud',
+  music: 'Плейлист: Spotify, SoundCloud и свои файлы',
   ai: 'Четыре стиля общения · tokenharbor',
   overview: 'Статистика вашего Inbox',
   settings: 'Подключения и доступ',
@@ -4635,14 +4826,16 @@ function renderBackgroundCard() {
 }
 
 /* ================================================================
-   PLAYER: official Spotify and SoundCloud embeds, one at a time.
-   The audio comes from those embeds; the server keeps only links.
+   PLAYER: official Spotify and SoundCloud embeds, and the owner's own uploaded files.
+   One track plays at a time. Spotify and SoundCloud audio comes from their embeds;
+   the server keeps links for those and the uploaded bytes for files.
    ================================================================ */
 const PLAYER = {
   item: null, playing: false, pending: false, progress: 0,
   sc: null, scPromise: null, scEl: null, scUrl: '',
   sp: null, spPromise: null, spEl: null, spUri: '', spAPI: null, spAPIPromise: null,
   spNearEnd: false, spWasPlaying: false, scripts: {},
+  fileEls: {video: null, audio: null}, // one <video> for MP4 and one <audio> for the rest, made on first use
 };
 
 function loadScript(src) {
@@ -4775,6 +4968,104 @@ function spUpdate(d) {
   updateMiniBar();
 }
 
+/* ---------- own files: MP4 plays in a <video>, M4A, MP3 and WAV in an <audio> ---------- */
+function fileKey(kind) { return kind === 'video' ? 'video' : 'audio'; }
+
+function showFileSlot(on) {
+  const slot = $('#fileSlot');
+  if (slot) slot.hidden = !on;
+}
+
+// events only count while a file is the current track
+function fileEvent(fn) {
+  if (PLAYER.item && PLAYER.item.provider === 'file') fn();
+}
+
+// made on first use and kept; only the element for this kind is shown
+function fileMedia(kind) {
+  const key = fileKey(kind);
+  if (!PLAYER.fileEls[key]) {
+    const el = document.createElement(key);
+    el.preload = 'metadata';
+    el.playsInline = true;
+    el.addEventListener('play', () => fileEvent(() => { PLAYER.pending = false; setPlaying(true); }));
+    el.addEventListener('pause', () => fileEvent(() => setPlaying(false)));
+    el.addEventListener('loadedmetadata', () => fileEvent(() => renderFileBar()));
+    el.addEventListener('timeupdate', () => fileEvent(() => {
+      const d = el.duration;
+      PLAYER.progress = Number.isFinite(d) && d > 0 ? Math.min(1, el.currentTime / d) : 0;
+      updateMiniBar();
+      renderFileBar();
+    }));
+    el.addEventListener('ended', () => fileEvent(() => handleEnded()));
+    el.addEventListener('error', () => fileEvent(() => fileFailed()));
+    $('#fpScreen').appendChild(el);
+    PLAYER.fileEls[key] = el;
+  }
+  for (const k of Object.keys(PLAYER.fileEls)) {
+    if (PLAYER.fileEls[k]) PLAYER.fileEls[k].hidden = k !== key;
+  }
+  return PLAYER.fileEls[key];
+}
+
+function fileFailed() {
+  PLAYER.pending = false;
+  PLAYER.playing = false;
+  renderMini();
+  updateTrackStates();
+  SFX.error();
+  toast('Браузер не смог открыть файл. Для видео нужен MP4 с кодеком H.264, для звука MP3 или WAV', 'bad');
+}
+
+async function playFile(item) {
+  pauseSoundCloud();
+  pauseSpotify();
+  const el = fileMedia(item.kind);
+  showFileSlot(true);
+  if (el.getAttribute('src') !== item.file_url) el.src = item.file_url;
+  try {
+    await el.play();
+  } catch (err) {
+    if (PLAYER.item !== item) return; // the user already picked something else
+    if (err.name === 'NotAllowedError') {
+      // the browser wants a tap before it plays sound: the mini player's button does that
+      PLAYER.pending = false;
+      renderMini();
+      toast('Нажмите ▶ внизу, чтобы включить звук');
+    }
+    // other errors reach the element's error event, which reports them once
+  }
+}
+
+function pauseFile() {
+  for (const el of Object.values(PLAYER.fileEls)) {
+    try { if (el) el.pause(); } catch {}
+  }
+}
+
+function toggleFile() {
+  const item = PLAYER.item;
+  const el = PLAYER.fileEls[fileKey(item.kind)];
+  if (!el) return startItem(item);
+  if (el.paused) {
+    el.play().catch(err => {
+      if (err.name === 'NotAllowedError') toast('Браузер ждёт нажатия. Нажмите ▶ ещё раз', 'bad');
+    });
+  } else {
+    el.pause();
+  }
+}
+
+// stop releases the media, so a stopped file is no longer streamed or kept in memory
+function unloadFile() {
+  for (const el of Object.values(PLAYER.fileEls)) {
+    if (!el) continue;
+    try { el.pause(); } catch {}
+    if (el.getAttribute('src')) { el.removeAttribute('src'); el.load(); }
+  }
+  showFileSlot(false);
+}
+
 /* ---------- playback control ---------- */
 async function playItem(item) {
   if (!item) return;
@@ -4791,10 +5082,12 @@ async function startItem(item) {
   PLAYER.spNearEnd = false;
   PLAYER.spWasPlaying = false;
   showSpSlot(item.provider === 'spotify');
+  showFileSlot(item.provider === 'file');
   renderMini();
   updateTrackStates();
   try {
     if (item.provider === 'soundcloud') await playSoundCloud(item);
+    else if (item.provider === 'file') await playFile(item);
     else await playSpotify(item);
   } catch (err) {
     PLAYER.pending = false;
@@ -4842,19 +5135,24 @@ async function playSpotify(item) {
   }, 3500);
 }
 
+// each provider pauses the others, so only one track plays at a time
 function pauseSoundCloud() {
   try { if (PLAYER.sc) PLAYER.sc.pause(); } catch {}
+  pauseFile();
 }
 
 function pauseSpotify() {
   try { if (PLAYER.sp) PLAYER.sp.pause(); } catch {}
+  pauseFile();
 }
 
 function togglePlayback() {
   const item = PLAYER.item;
   if (!item) return;
   try {
-    if (item.provider === 'soundcloud') {
+    if (item.provider === 'file') {
+      toggleFile();
+    } else if (item.provider === 'soundcloud') {
       if (PLAYER.sc) PLAYER.sc.toggle(); else startItem(item);
     } else if (PLAYER.sp) {
       PLAYER.sp.togglePlay();
@@ -4894,8 +5192,50 @@ function stopPlayback() {
   PLAYER.pending = false;
   PLAYER.progress = 0;
   showSpSlot(false);
+  unloadFile();
   renderMini();
   updateTrackStates();
+}
+
+/* ---------- the file's own player card: title, seek bar, time, play button ---------- */
+function fmtDur(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${r}` : `${m}:${r}`;
+}
+
+function renderFileBar() {
+  const slot = $('#fileSlot');
+  const item = PLAYER.item;
+  if (!slot || !item || item.provider !== 'file') return;
+  const el = PLAYER.fileEls[fileKey(item.kind)];
+  const d = el && Number.isFinite(el.duration) ? el.duration : 0;
+  const t = el ? el.currentTime : 0;
+  slot.dataset.kind = fileKey(item.kind);
+  if (slot.dataset.tid !== String(item.id)) {
+    slot.dataset.tid = String(item.id);
+    $('#fpCover').innerHTML = icon('music');
+    $('#fpTitle').textContent = item.title || 'Без названия';
+    $('#fpSub').textContent = [item.kind_label, 'Файл'].filter(Boolean).join(' · ');
+  }
+  const seek = $('#fpSeek');
+  const pct = d ? Math.min(100, t / d * 100) : 0;
+  if (document.activeElement !== seek) seek.value = String(Math.round(pct * 10));
+  seek.style.setProperty('--p', pct.toFixed(2) + '%');
+  $('#fpNow').textContent = fmtDur(t);
+  $('#fpLeft').textContent = d ? '-' + fmtDur(d - t) : '0:00';
+  const btn = $('#fpToggle');
+  btn.innerHTML = icon(PLAYER.playing ? 'pause' : 'play');
+  btn.setAttribute('aria-label', PLAYER.playing ? 'Пауза' : 'Играть');
+}
+
+// fraction 0..1 of the file's length
+function seekFile(fraction) {
+  const item = PLAYER.item;
+  const el = item && item.provider === 'file' ? PLAYER.fileEls[fileKey(item.kind)] : null;
+  if (!el || !Number.isFinite(el.duration)) return;
+  el.currentTime = Math.min(1, Math.max(0, fraction)) * el.duration;
+  renderFileBar();
 }
 
 /* ---------- state and mini player ---------- */
@@ -4912,6 +5252,13 @@ function updateMiniBar() {
   if (bar) bar.style.transform = 'scaleX(' + PLAYER.progress.toFixed(4) + ')';
 }
 
+// the colour of a track: Spotify green, SoundCloud orange, the owner's own files blue
+function providerClass(item) {
+  if (item.provider === 'soundcloud') return 'sc';
+  if (item.provider === 'file') return 'fl';
+  return 'sp';
+}
+
 function renderMini() {
   const mini = $('#miniPlayer');
   if (!mini) return;
@@ -4921,7 +5268,7 @@ function renderMini() {
   mini.hidden = false;
   mini.classList.toggle('playing', PLAYER.playing);
   mini.classList.toggle('pending', PLAYER.pending && !PLAYER.playing);
-  $('#miniCover').className = 'cover ' + (item.provider === 'soundcloud' ? 'sc' : 'sp');
+  $('#miniCover').className = 'cover ' + providerClass(item);
   $('#miniCover').innerHTML = coverInner(item);
   $('#miniTitle').textContent = item.title || 'Без названия';
   $('#miniSub').textContent = [item.provider_label, item.artist].filter(Boolean).join(' · ');
@@ -4929,12 +5276,13 @@ function renderMini() {
   btn.innerHTML = icon(PLAYER.playing ? 'pause' : 'play');
   btn.setAttribute('aria-label', PLAYER.playing ? 'Пауза' : 'Играть');
   updateMiniBar();
+  renderFileBar();
 }
 
 /* ================================================================
    MUSIC: playlist of Spotify and SoundCloud links (add, play, remove)
    ================================================================ */
-const MUSIC = {items: [], loaded: false, busy: false};
+const MUSIC = {items: [], loaded: false, busy: false, uploading: false};
 
 function ruPlural(n, forms) {
   const m10 = n % 10, m100 = n % 100;
@@ -4960,7 +5308,7 @@ document.addEventListener('error', ev => {
 
 function trackHTML(item, i) {
   const cur = !!PLAYER.item && PLAYER.item.id === item.id;
-  const sp = item.provider === 'soundcloud' ? 'sc' : 'sp';
+  const sp = providerClass(item);
   return `
     <div class="track${cur ? ' current' : ''}${cur && PLAYER.playing ? ' playing' : ''}" data-tid="${esc(item.id)}" style="--i:${Math.min(i, 14)}">
       <button class="track-main" type="button" data-play="${esc(item.id)}" aria-label="Играть: ${esc(item.title)}">
@@ -4971,7 +5319,7 @@ function trackHTML(item, i) {
         </span>
       </button>
       <div class="track-actions">
-        <a class="icon-btn" href="${esc(item.source_url)}" data-ext target="_blank" rel="noopener noreferrer" aria-label="Открыть ссылку" title="Открыть ссылку">${icon('link')}</a>
+        ${item.source_url ? `<a class="icon-btn" href="${esc(item.source_url)}" data-ext target="_blank" rel="noopener noreferrer" aria-label="Открыть ссылку" title="Открыть ссылку">${icon('link')}</a>` : ''}
         <button class="icon-btn" type="button" data-remove="${esc(item.id)}" aria-label="Убрать из плейлиста" title="Убрать">${icon('trash')}</button>
       </div>
     </div>`;
@@ -4995,7 +5343,33 @@ function ensureMusicPage() {
       </form>
       <p class="hint" style="margin:12px 0 0">Полная песня в Spotify требует входа в аккаунт Spotify в этом браузере, без него звучит отрывок. У SoundCloud некоторые треки запрещают встраивание.</p>
     </section>
+    <section class="card">
+      <h2>Свой файл</h2>
+      <p class="hint" style="margin:0 0 12px">MP4, M4A, MP3 или WAV, до 50 МБ. Файл хранится на сервере и виден только вам.</p>
+      <label class="btn primary file-pick" id="filePick">
+        <input type="file" id="musicFile" class="sr-only" accept=".mp4,.m4a,.mp3,.wav,video/mp4,audio/mp4,audio/mpeg,audio/wav,audio/x-wav">
+        ${icon('plus')}Выбрать файл
+      </label>
+      <div class="upload" id="uploadBox" hidden>
+        <div class="upload-bar"><i id="uploadBar"></i></div>
+        <span class="hint" id="uploadText"></span>
+      </div>
+    </section>
     <div class="sp-slot" id="spSlot" hidden></div>
+    <section class="file-slot" id="fileSlot" hidden aria-label="Плеер файла">
+      <div class="fp-head">
+        <span class="cover fl" id="fpCover"></span>
+        <div class="fp-info"><b id="fpTitle"></b><span id="fpSub"></span></div>
+      </div>
+      <div class="fp-screen" id="fpScreen" title="Нажмите, чтобы остановить или продолжить"></div>
+      <div class="fp-bar">
+        <button class="play-btn" type="button" id="fpToggle" aria-label="Играть"></button>
+        <div class="fp-seek">
+          <input type="range" id="fpSeek" min="0" max="1000" step="1" value="0" aria-label="Перемотка">
+          <div class="fp-times"><span id="fpNow">0:00</span><span id="fpLeft">0:00</span></div>
+        </div>
+      </div>
+    </section>
     <section class="card">
       <div class="row" style="justify-content:space-between;margin-bottom:10px">
         <h2 style="margin:0">Плейлист</h2>
@@ -5026,7 +5400,7 @@ function renderMusic() {
   list.dataset.sig = sig;
   list.innerHTML = n
     ? MUSIC.items.map((item, i) => trackHTML(item, i)).join('')
-    : emptyBox('Плейлист пуст', 'Вставьте ссылку на трек Spotify или SoundCloud выше. Ссылка сохранится здесь.');
+    : emptyBox('Плейлист пуст', 'Вставьте ссылку Spotify или SoundCloud, либо загрузите свой MP4 или MP3. Всё сохранится здесь.');
   updateTrackStates();
 }
 
@@ -5105,6 +5479,93 @@ async function removeTrack(id) {
   }
 }
 
+/* ---------- own files: MP4, M4A, MP3 or WAV, uploaded to this owner's space ---------- */
+const UPLOAD_MAX = 50 * 1024 * 1024;
+const UPLOAD_RE = /\.(mp4|m4a|mp3|wav)$/i;
+
+function showUpload(p, text) {
+  const box = $('#uploadBox');
+  if (!box) return;
+  box.hidden = false;
+  $('#uploadBar').style.width = (Math.min(1, Math.max(0, p)) * 100).toFixed(1) + '%';
+  $('#uploadText').textContent = text;
+}
+
+function setUploading(on) {
+  MUSIC.uploading = on;
+  const pick = $('#filePick');
+  if (pick) pick.classList.toggle('busy', on);
+  if (!on) {
+    const box = $('#uploadBox');
+    if (box) box.hidden = true;
+  }
+}
+
+function uploadFile(file) {
+  const name = String(file.name || '').trim();
+  if (MUSIC.uploading) return toast('Дождитесь окончания загрузки', 'bad');
+  if (!UPLOAD_RE.test(name)) {
+    SFX.error();
+    haptic('error');
+    return toast('Выберите файл MP4, M4A, MP3 или WAV', 'bad');
+  }
+  if (!file.size) {
+    SFX.error();
+    return toast('Этот файл пустой', 'bad');
+  }
+  if (file.size > UPLOAD_MAX) {
+    SFX.error();
+    haptic('error');
+    return toast('Файл больше 50 МБ. Возьмите файл поменьше', 'bad');
+  }
+  setUploading(true);
+  showUpload(0, `Загружаем: ${name}`);
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/music/upload');
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+  xhr.setRequestHeader('X-File-Name', encodeURIComponent(name));
+  xhr.upload.onprogress = ev => {
+    if (ev.lengthComputable) showUpload(ev.loaded / ev.total, `Загружаем: ${name}`);
+  };
+  xhr.onerror = () => {
+    setUploading(false);
+    SFX.error();
+    haptic('error');
+    toast('Нет связи с сервером. Попробуйте ещё раз', 'bad');
+  };
+  xhr.onload = () => {
+    setUploading(false);
+    let data = {};
+    try { data = JSON.parse(xhr.responseText || '{}'); } catch {}
+    if (xhr.status < 200 || xhr.status >= 300) {
+      SFX.error();
+      haptic('error');
+      const msg = typeof data.detail === 'string' ? data.detail : (data.detail?.message || 'Не удалось загрузить файл');
+      return toast(msg, 'bad');
+    }
+    const item = data.item;
+    if (!MUSIC.items.some(x => x.id === item.id)) MUSIC.items.push(item);
+    SFX.success();
+    haptic('success');
+    toast(`Файл добавлен: ${item.title}`, 'ok');
+    renderMusic();
+    playItem(item);
+  };
+  xhr.send(file);
+}
+
+$('#musicPage').addEventListener('change', ev => {
+  if (!ev.target || ev.target.id !== 'musicFile') return;
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = ''; // so picking the same file again still fires a change
+  if (file) uploadFile(file);
+});
+
+// dragging the seek bar moves the file
+$('#musicPage').addEventListener('input', ev => {
+  if (ev.target && ev.target.id === 'fpSeek') seekFile(Number(ev.target.value) / 1000);
+});
+
 $('#musicPage').addEventListener('submit', ev => {
   if (ev.target && ev.target.id === 'musicForm') {
     ev.preventDefault();
@@ -5113,6 +5574,7 @@ $('#musicPage').addEventListener('submit', ev => {
 });
 
 $('#musicPage').addEventListener('click', ev => {
+  if (ev.target.closest('#fpToggle') || ev.target.closest('#fpScreen')) return togglePlayback();
   const add = ev.target.closest('[data-add="list"]');
   if (add) return addTrack(false);
   const play = ev.target.closest('[data-play]');
