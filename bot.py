@@ -1659,7 +1659,9 @@ async def telegram_logout(session: SessionInfo = Depends(get_session)) -> dict[s
 async def telegram_chats(session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
     client = await _tg_client_for(session.owner)
     rows = []
-    async for dialog in client.iter_dialogs(limit=150):
+    async for dialog in client.iter_dialogs(limit=300):
+        if not dialog.is_user:  # personal chats only: groups, channels and supergroups are skipped
+            continue
         entity = dialog.entity
         title = dialog.name or getattr(entity, "username", None) or str(dialog.id)
         last = dialog.message
@@ -2493,63 +2495,1411 @@ async def index() -> HTMLResponse:
 
 # The interface is embedded so the project stays a single deployable file.
 HTML_PAGE = r'''<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="dark"><meta name="theme-color" content="#111216"><meta name="robots" content="noindex,nofollow"><title>NEZZX AI Telegram Conv</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#07100a">
+<meta name="robots" content="noindex,nofollow">
+<title>NEZZX AI Telegram Conv</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700&family=Unbounded:wght@600;700;800&display=swap" rel="stylesheet">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-:root{--bg:#15161b;--rail:#202127;--panel:#22232a;--panel2:#292a33;--chat:#343540;--line:#363741;--text:#f3f3f7;--muted:#a4a5b1;--blue:#5b83ed;--blue2:#4975e6;--green:#41c998;--red:#ff7f89;--radius:13px;font-family:Inter,system-ui,-apple-system,sans-serif;color-scheme:dark}*{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--text)}body{font-size:14px}button,input,textarea,select{font:inherit;color:inherit}button{cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}.hidden{display:none!important}.muted{color:var(--muted)}.tiny{font-size:12px}.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid #474954;border-radius:999px;padding:4px 9px;font-size:11px;color:#d5d6df}.dot{width:7px;height:7px;display:inline-block;border-radius:50%;background:var(--green)}.btn{background:#3b3d48;border:1px solid #4b4d59;padding:9px 12px;border-radius:10px;font-weight:600;transition:.18s}.btn:hover{background:#4a4c59}.btn.blue{background:var(--blue);border-color:var(--blue);color:white}.btn.blue:hover{background:var(--blue2)}.btn.ghost{background:transparent}.btn.danger{color:#ffb3b8;border-color:#81464c}.iconbtn{width:36px;height:36px;border:1px solid transparent;background:transparent;border-radius:9px;display:grid;place-items:center;font-size:17px;color:var(--muted)}.iconbtn:hover{background:#373841;color:white}.field{display:flex;flex-direction:column;gap:7px}.field label{font-size:12px;color:var(--muted);font-weight:600}.input,textarea,select{background:#191a20;border:1px solid #42444f;border-radius:10px;padding:11px 12px;outline:none;width:100%;min-width:0}.input:focus,textarea:focus,select:focus{border-color:#7194fa;box-shadow:0 0 0 3px #5b83ed20}textarea{resize:vertical;min-height:84px}.row{display:flex;align-items:center;gap:9px}.between{justify-content:space-between}.grow{flex:1;min-width:0}.stack{display:flex;flex-direction:column;gap:12px}.card{background:linear-gradient(155deg,#292a32,#22232a);border:1px solid #393a45;border-radius:14px;padding:17px;min-width:0}.card h3{margin:0 0 12px;font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}.kpi{font-size:29px;font-weight:800;letter-spacing:-.04em}.h1{font-size:23px;font-weight:800;letter-spacing:-.03em}.error{color:#ffacb2;font-size:12px;min-height:0}.hint{color:var(--muted);font-size:12px;line-height:1.55}.loading,.empty{padding:28px;text-align:center;color:var(--muted);line-height:1.6}.shell{height:100dvh;display:grid;grid-template-columns:66px 300px minmax(0,1fr);overflow:hidden;background:#17181d}.shell[data-view]:not([data-view="messages"]){grid-template-columns:66px minmax(0,1fr)}.rail{background:var(--rail);border-right:1px solid #2d2e36;display:flex;flex-direction:column;align-items:center;padding:13px 8px;gap:8px}.logo{width:39px;height:39px;border-radius:13px;background:linear-gradient(145deg,#7293ff,#4e68c7);display:grid;place-items:center;font-weight:900;font-size:22px;margin-bottom:17px;box-shadow:0 5px 22px #4d6fe444}.rail button{width:43px;height:43px;border-radius:12px;border:1px solid transparent;color:#aaaab8;background:transparent;font-size:19px;position:relative}.rail button:hover,.rail button.active{background:#383945;border-color:#4a4c5a;color:white}.rail .bottom{margin-top:auto}.inbox{background:#202127;border-right:1px solid #30313b;display:flex;flex-direction:column;min-height:0;overflow:hidden}.shell[data-view]:not([data-view="messages"]) .inbox{display:none}.inbox-head{padding:22px 18px 13px;border-bottom:1px solid #30313a}.brand-title{font-size:17px;font-weight:800;letter-spacing:-.02em}.inbox-search{margin-top:16px;position:relative}.inbox-search input{padding-left:35px;background:#2b2c34;border-color:#373943}.search-icon{position:absolute;left:12px;top:11px;color:#afb0bc}.chat-list{overflow:auto;min-height:0;padding:7px 7px 15px}.chat-card{width:100%;display:flex;gap:10px;align-items:flex-start;text-align:left;padding:12px 10px;margin:3px 0;background:#292a32;border:1px solid transparent;border-radius:11px;transition:.15s}.chat-card:hover{background:#33343e}.chat-card.selected{background:#405b9b;border-color:#607cc0}.avatar{width:39px;height:39px;border-radius:50%;display:grid;place-items:center;flex:none;background:linear-gradient(135deg,#9d9fb0,#575b6d);font-size:14px;font-weight:800;color:#fff;text-transform:uppercase}.avatar.small{width:34px;height:34px}.chat-meta{min-width:0;flex:1}.chat-meta .name{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.chat-meta .preview{color:#b2b3c0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}.chat-card.selected .preview{color:#e4e9fa}.chat-bottom{display:flex;justify-content:space-between;gap:5px;color:#9b9dab;font-size:11px;margin-top:7px}.unread{border-radius:999px;background:#5b83ed;padding:2px 6px;color:white;font-size:10px;font-weight:700}.main{min-width:0;min-height:0;display:flex;flex-direction:column;background:#292a33}.topbar{height:72px;flex:none;display:flex;align-items:center;gap:10px;padding:0 22px;border-bottom:1px solid #3b3c47;background:#202127}.contact{display:flex;align-items:center;gap:10px;min-width:0;flex:1}.contact .name{font-weight:800;font-size:15px}.top-actions{display:flex;gap:3px}.pane{flex:1;min-height:0;overflow:auto}.chat-pane{display:flex;flex-direction:column;min-height:0;flex:1}.messages{flex:1;min-height:0;overflow:auto;padding:21px clamp(12px,3vw,42px);display:flex;flex-direction:column;gap:17px}.day-pill{align-self:center;background:#444550;color:#d7d7e1;padding:6px 12px;border-radius:20px;font-size:11px;margin-bottom:3px}.msg-row{display:flex;gap:9px;max-width:90%;align-items:flex-end}.msg-row.out{align-self:flex-end;flex-direction:row-reverse}.bubble-wrap{min-width:0;display:flex;flex-direction:column;gap:5px}.msg-info{font-size:11px;color:#a8a9b7;display:flex;gap:9px;align-items:center}.msg-row.out .msg-info{justify-content:flex-end}.bubble{background:#41424e;border-radius:4px 13px 13px 13px;padding:10px 13px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;color:#f0f0f5}.msg-row.out .bubble{background:var(--blue);border-radius:13px 4px 13px 13px;color:white}.composer{padding:12px 16px 17px;display:flex;gap:10px;align-items:flex-end;background:#292a33;border-top:1px solid #3a3b45}.composer textarea{background:#40414c;border:1px solid #484a55;border-radius:22px;min-height:44px;max-height:160px;padding:12px 16px;resize:none}.composer .send{width:43px;height:43px;border-radius:50%;background:var(--blue);border:0;font-size:20px}.chat-controls{padding:9px 18px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;border-bottom:1px solid #393a44;background:#2d2e37}.chat-controls select{width:auto;max-width:200px;padding:7px 9px;font-size:12px}.toggle{width:35px;height:20px;border-radius:20px;background:#555762;padding:3px;border:0}.toggle:after{content:"";display:block;width:14px;height:14px;background:white;border-radius:50%;transition:.2s}.toggle.on{background:#4e83ef}.toggle.on:after{transform:translateX(15px)}.view{padding:24px;overflow:auto;min-height:0;flex:1}.view-inner{max-width:1050px;margin:0 auto;display:flex;flex-direction:column;gap:16px}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.stat-label{font-size:12px;color:var(--muted);margin-bottom:8px}.stat-foot{font-size:11px;color:#7fdaaF;margin-top:9px}.mode-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.mode{background:#262730;border:1px solid #3a3b47;border-radius:13px;padding:16px}.mode h4{margin:0 0 8px}.mode p{font-size:12px;color:var(--muted);line-height:1.6;margin:0}.connect-status{padding:12px;border-radius:11px;border:1px solid #454753;background:#24252c}.pill-good{color:#68ddb7;background:#153b31;border:1px solid #285a4d}.login-bg{min-height:100dvh;display:grid;place-items:center;padding:24px;background:radial-gradient(ellipse at 20% 0%,#293252 0,transparent 43%),#141519}.login-card{width:min(430px,100%);background:#22232a;border:1px solid #41434f;border-radius:20px;padding:26px;box-shadow:0 30px 90px #0007}.login-logo{display:flex;align-items:center;gap:11px;margin-bottom:25px}.login-card h1{font-size:23px;margin:0}.login-card p{font-size:13px;color:var(--muted);line-height:1.6}.login-card form{display:flex;flex-direction:column;gap:15px}.key-foot{border-top:1px solid #393a44;padding-top:14px;margin-top:18px}.toast{position:fixed;right:18px;bottom:18px;z-index:100;background:#353640;border:1px solid #555764;padding:12px 16px;border-radius:11px;box-shadow:0 10px 35px #0007;max-width:min(440px,calc(100vw - 36px));font-size:13px}.mobile-back{display:none}
-@media(max-width:900px){.shell{grid-template-columns:58px 260px minmax(0,1fr)}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.view{padding:16px}.topbar{padding:0 14px}}@media(max-width:650px){.shell{grid-template-columns:52px minmax(0,1fr)}.shell[data-view="messages"] .inbox{display:flex;position:absolute;left:52px;top:0;bottom:0;width:min(295px,calc(100vw - 52px));z-index:5;box-shadow:10px 0 40px #0008}.shell[data-view="messages"]:not(.list-open) .inbox{display:none}.rail{padding:9px 4px}.rail button{width:42px;height:42px}.topbar{height:62px}.messages{padding:14px 10px}.msg-row{max-width:96%}.composer{padding:10px}.stats{gap:8px}.card{padding:13px}.mode-grid{grid-template-columns:1fr}.mobile-back{display:grid}.view{padding:13px}.kpi{font-size:25px}}@media(max-width:380px){.stats{grid-template-columns:1fr 1fr}.chat-controls{padding:7px 10px}}
-</style></head><body>
-<div id="login" class="login-bg hidden"><div class="login-card"><div class="login-logo"><div class="logo">N</div><div><div class="brand-title">NEZZX AI</div><div class="tiny muted">TELEGRAM CONV</div></div></div><h1>Войти в панель</h1><p>Введите ключ доступа. Покупка и управление ключами по-прежнему доступны через Telegram-бота.</p><form id="loginForm"><div class="field"><label for="licenseKey">Ключ доступа</label><input class="input" id="licenseKey" autocomplete="off" spellcheck="false" placeholder="FP-XXXXXX-XXXXXX-XXXXXX" required></div><div class="field"><label for="adminPassword">Пароль администратора (необязательно)</label><input class="input" id="adminPassword" type="password" autocomplete="current-password" placeholder="Если настроен на сервере"></div><div id="loginError" class="error"></div><button class="btn blue" type="submit" id="loginSubmit">Войти →</button></form><div class="key-foot"><p>Нет ключа? Откройте своего Telegram-бота и отправьте <b>/start</b>, чтобы получить бесплатный доступ или купить подписку за Telegram Stars.</p></div></div></div>
-<div id="shell" class="shell hidden" data-view="messages">
-<aside class="rail"><div class="logo">N</div><button class="active" data-nav="messages" title="Сообщения">▤</button><button data-nav="overview" title="Главная">⌂</button><button data-nav="ai" title="AI Conv">✧</button><button data-nav="settings" title="Настройки">⚙</button><button data-nav="keys" title="Ключи">◇</button><button data-nav="admin" id="adminNav" class="hidden" title="Администрирование">♙</button><button class="bottom" id="logoutBtn" title="Выйти">⇥</button></aside>
-<aside class="inbox" id="inbox"><div class="inbox-head"><div class="row between"><div><div class="brand-title">Inbox</div><div class="tiny muted" id="inboxSub">Telegram account</div></div><button class="iconbtn" id="refreshChats" title="Обновить чаты">↻</button></div><div class="inbox-search"><span class="search-icon">⌕</span><input id="chatSearch" class="input" placeholder="Поиск чатов…" autocomplete="off"></div><div class="row between" style="margin-top:12px"><span class="tiny muted" id="chatCount">Чаты</span><select id="chatSort" style="width:auto;padding:6px 8px;font-size:11px;background:#2a2b32;border-radius:8px;border:1px solid #3b3c46"><option value="recent">Последние</option><option value="unread">Непрочитанные</option><option value="ai">AI включён</option></select></div></div><div id="chatList" class="chat-list"><div class="empty">Подключите Telegram в настройках, чтобы загрузить чаты.</div></div></aside>
-<main class="main"><header class="topbar"><button id="mobileBack" class="iconbtn mobile-back" title="Список чатов">☰</button><div class="contact"><div class="avatar small" id="headAvatar">N</div><div style="min-width:0"><div class="name" id="headName">Выберите чат</div><div class="tiny muted" id="headStatus">NEZZX AI Telegram Conv</div></div></div><div class="top-actions"><button class="iconbtn" id="headRefresh" title="Обновить сообщения">↻</button><button class="iconbtn" id="headAi" title="Настройки AI для чата">✧</button></div></header><div id="mainView" class="chat-pane"><div class="empty" style="margin:auto"><div style="font-size:35px;margin-bottom:9px">✦</div><b style="color:#eee">Твоя переписка — в одном месте</b><div class="muted" style="margin-top:6px">Подключи Telegram в настройках и выбери чат слева.</div><button class="btn blue" style="margin-top:17px" data-goto="settings">Подключить Telegram</button></div></div></main></div>
-<div id="toast" class="toast hidden"></div>
+/* ---------- tokens: one dark glass world, apricot accent ---------- */
+:root{
+  color-scheme:dark;
+  --bg:#07100a;
+  --ink:#f6f3ee;
+  --muted:rgba(246,243,238,.68);
+  --faint:rgba(246,243,238,.44);
+  --accent:#ffb36b;
+  --accent-hi:#ffc98f;
+  --accent-ink:#21120a;
+  --ai:#a9d2ff;
+  --ok:#8fe9bd;
+  --bad:#ff9dab;
+  --glass:rgba(12,16,14,.56);
+  --glass-strong:rgba(12,16,14,.82);
+  --glass-soft:rgba(255,255,255,.06);
+  --line:rgba(255,255,255,.13);
+  --line-soft:rgba(255,255,255,.07);
+  --field:rgba(4,8,6,.5);
+  --r-xl:28px;
+  --r-lg:20px;
+  --r-md:15px;
+  --f-display:"Unbounded",ui-rounded,"Arial Rounded MT Bold",system-ui,sans-serif;
+  --f-body:"Onest",system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --ease:cubic-bezier(.22,.8,.24,1);
+  --spring:cubic-bezier(.34,1.5,.64,1);
+}
+
+/* ---------- reset ---------- */
+*,*::before,*::after{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{height:100%;margin:0}
+body{
+  background:var(--bg);color:var(--ink);overflow:hidden;
+  font:400 14px/1.5 var(--f-body);
+  -webkit-font-smoothing:antialiased;-webkit-tap-highlight-color:transparent;
+  user-select:none;-webkit-user-select:none;
+}
+input,textarea{user-select:text;-webkit-user-select:text}
+button,input,textarea,select{font:inherit;color:inherit}
+button{cursor:pointer;border:0;background:none;padding:0}
+button:disabled{opacity:.45;cursor:not-allowed}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.muted{color:var(--muted)}
+.hidden{display:none!important}
+svg.i{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none;display:block}
+
+/* ---------- background photo ---------- */
+#bg{
+  position:fixed;inset:0;z-index:0;
+  background:var(--bg) url("data:image/jpeg;base64,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") center/cover no-repeat;
+  animation:bgIn 1.6s var(--ease) both;
+}
+#bg::after{
+  content:"";position:absolute;inset:0;
+  background:linear-gradient(180deg,rgba(4,9,6,.42) 0%,rgba(4,9,6,.66) 55%,rgba(4,9,6,.9) 100%);
+}
+@keyframes bgIn{from{transform:scale(1.12);opacity:.25}to{transform:none;opacity:1}}
+
+/* ---------- app frame (edge to edge, safe areas respected) ---------- */
+#app{
+  position:fixed;inset:0;z-index:1;
+  padding-top:calc(env(safe-area-inset-top,0px) + var(--tg-content-safe-area-inset-top,0px));
+  padding-left:env(safe-area-inset-left,0px);
+  padding-right:env(safe-area-inset-right,0px);
+}
+.shell{position:absolute;inset:0;display:flex;min-width:0}
+.stage{position:relative;flex:1;min-width:0;min-height:0;display:flex;flex-direction:column}
+
+/* ---------- top bar ---------- */
+.topbar{
+  display:flex;align-items:center;gap:10px;
+  margin:10px 12px 0;padding:8px 10px 8px 8px;
+  border-radius:var(--r-lg);min-height:62px;flex:none;
+}
+.title-wrap{flex:1;min-width:0}
+.title-wrap h1{
+  margin:0;font:700 17px/1.2 var(--f-display);letter-spacing:-.01em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.title-wrap p{margin:3px 0 0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top-actions{display:flex;gap:4px;flex:none}
+#backBtn{display:grid}
+@media (min-width:900px){#backBtn{display:none!important}}
+
+/* ---------- views ---------- */
+.views{position:relative;flex:1;min-height:0;margin:10px 12px 0}
+.view{position:absolute;inset:0;display:none;flex-direction:column;min-height:0}
+.view.active{display:flex;animation:fadeIn .35s var(--ease) both}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+
+.page{
+  flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;
+  display:flex;flex-direction:column;gap:12px;
+  padding:2px 2px calc(104px + env(safe-area-inset-bottom,0px));
+}
+.view.active .page > *{animation:rise .55s var(--ease) both;animation-delay:calc(var(--i,0) * 60ms)}
+
+/* ---------- chats: list + conversation ---------- */
+.chats-layout{position:relative;flex:1;min-height:0;display:flex;overflow:hidden;border-radius:var(--r-xl)}
+.list-pane{
+  flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;
+  border-radius:var(--r-xl);
+  transition:transform .5s var(--ease),opacity .4s var(--ease);
+}
+.chat-pane{
+  position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;min-width:0;min-height:0;
+  border-radius:var(--r-xl);
+  transform:translateX(104%);
+  transition:transform .55s var(--ease);
+}
+.shell[data-mode="chat"] .chat-pane{transform:none}
+.shell[data-mode="chat"] .list-pane{transform:translateX(-14%);opacity:0;pointer-events:none}
+
+/* ---------- bottom tab bar (phones) ---------- */
+.sidebar{display:none}
+.tabbar{
+  position:absolute;left:14px;right:14px;z-index:6;
+  bottom:calc(env(safe-area-inset-bottom,0px) + 12px);
+  height:66px;padding:6px;border-radius:26px;
+  display:grid;grid-auto-flow:column;grid-auto-columns:1fr;align-items:stretch;
+  transition:transform .5s var(--ease),opacity .35s var(--ease);
+}
+.shell[data-mode="chat"] .tabbar{transform:translateY(140%);opacity:0;pointer-events:none}
+.indicator{
+  position:absolute;top:6px;bottom:6px;left:0;width:0;border-radius:20px;
+  background:rgba(255,255,255,.1);
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.14),0 8px 24px rgba(255,179,107,.14);
+  transition:transform .55s var(--spring),width .45s var(--ease);
+}
+.tab{
+  position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+  color:var(--faint);font-size:11px;font-weight:600;letter-spacing:.01em;
+  transition:color .3s var(--ease),transform .25s var(--ease);
+}
+.tab:active{transform:scale(.92)}
+.tab svg.i{transition:transform .45s var(--spring)}
+.tab.active{color:var(--ink)}
+.tab.active svg.i{color:var(--accent);transform:translateY(-1px) scale(1.06)}
+
+/* ---------- desktop: left rail, no tab bar ---------- */
+@media (min-width:900px){
+  .sidebar{
+    display:flex;flex-direction:column;align-items:center;gap:8px;
+    width:96px;flex:none;margin:12px 0 12px 12px;padding:14px 10px;border-radius:var(--r-xl);
+  }
+  .tabbar{display:none}
+  .views{margin:10px 12px 12px 12px}
+  .page{padding-bottom:24px}
+  .list-pane{flex:0 0 340px}
+  .chat-pane{position:relative;inset:auto;flex:1;transform:none}
+  .shell[data-mode="chat"] .list-pane{transform:none;opacity:1;pointer-events:auto}
+  .chat-list{padding-bottom:14px!important}
+  .toast{bottom:28px!important}
+}
+.rail-brand{margin-bottom:10px}
+.rail{display:flex;flex-direction:column;gap:6px;width:100%;flex:1}
+.rail-btn{
+  width:100%;display:flex;flex-direction:column;align-items:center;gap:5px;padding:12px 4px;border-radius:17px;
+  color:var(--faint);font-size:11px;font-weight:600;
+  transition:background .3s var(--ease),color .3s var(--ease),transform .2s var(--ease);
+}
+.rail-btn:hover{background:var(--glass-soft);color:var(--ink)}
+.rail-btn:active{transform:scale(.94)}
+.rail-btn.active{color:var(--accent);background:rgba(255,179,107,.14)}
+
+/* ---------- glass surfaces ---------- */
+.glass{
+  background:var(--glass);
+  -webkit-backdrop-filter:blur(26px) saturate(1.5);backdrop-filter:blur(26px) saturate(1.5);
+  border:1px solid var(--line);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.09),0 22px 60px rgba(0,0,0,.34);
+}
+@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
+  .glass{background:var(--glass-strong)}
+}
+.card{
+  padding:18px;border-radius:var(--r-lg);min-width:0;
+  background:var(--glass);
+  -webkit-backdrop-filter:blur(22px) saturate(1.4);backdrop-filter:blur(22px) saturate(1.4);
+  border:1px solid var(--line);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.07),0 16px 44px rgba(0,0,0,.3);
+}
+.card h2{margin:0 0 12px;font:600 15px/1.3 var(--f-body);letter-spacing:-.005em}
+.card .lead{margin:0 0 12px;font-size:13px;color:var(--muted);line-height:1.6}
+
+.chat-pane.glass{background:rgba(10,14,12,.8)}
+
+/* ---------- headings ---------- */
+.h-display{margin:0;font:700 22px/1.15 var(--f-display);letter-spacing:-.02em}
+.eyebrow{margin:0 0 6px;font-size:12.5px;color:var(--muted)}
+
+/* ---------- buttons ---------- */
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  padding:11px 16px;border-radius:15px;font-weight:600;white-space:nowrap;
+  background:rgba(255,255,255,.09);border:1px solid var(--line);
+  transition:transform .2s var(--ease),background .25s,border-color .25s,box-shadow .25s;
+}
+.btn svg.i{width:18px;height:18px}
+.btn:hover{background:rgba(255,255,255,.16)}
+.btn:active{transform:scale(.96)}
+.btn.primary{
+  background:linear-gradient(160deg,var(--accent-hi),var(--accent));color:var(--accent-ink);
+  border-color:transparent;box-shadow:0 12px 30px rgba(255,179,107,.26);
+}
+.btn.primary:hover{background:linear-gradient(160deg,#ffd9ad,#ffbd80)}
+.btn.ghost{background:transparent}
+.btn.danger{color:var(--bad);border-color:rgba(255,157,171,.36);background:rgba(255,157,171,.08)}
+.btn.block{width:100%}
+.btn.sm{padding:8px 12px;border-radius:12px;font-size:13px}
+.btn-row{display:flex;flex-wrap:wrap;gap:8px}
+.icon-btn{
+  width:42px;height:42px;border-radius:14px;display:grid;place-items:center;flex:none;
+  color:var(--muted);transition:background .25s,color .25s,transform .2s var(--ease);
+}
+.icon-btn:hover{background:rgba(255,255,255,.1);color:var(--ink)}
+.icon-btn:active{transform:scale(.9)}
+.link{color:var(--accent);text-decoration:none;font-weight:600}
+
+/* ---------- inputs ---------- */
+.field{display:flex;flex-direction:column;gap:7px;min-width:0}
+.field > span{font-size:12.5px;color:var(--muted);font-weight:600}
+.field > span em{font-style:normal;font-weight:500;color:var(--faint)}
+.input,.select,textarea{
+  width:100%;min-width:0;background:var(--field);border:1px solid var(--line);
+  border-radius:15px;padding:12px 14px;outline:none;
+  transition:border-color .25s,box-shadow .25s,background .25s;
+}
+.input:focus,.select:focus,textarea:focus{
+  border-color:rgba(255,179,107,.62);box-shadow:0 0 0 4px rgba(255,179,107,.14);
+}
+.input::placeholder,textarea::placeholder{color:var(--faint)}
+.select{width:auto;padding:9px 12px;border-radius:13px;font-size:13px;cursor:pointer}
+.select option{background:#101512;color:var(--ink)}
+textarea{resize:none}
+.search{position:relative;display:block}
+.search svg.i{position:absolute;left:13px;top:50%;transform:translateY(-50%);color:var(--faint);width:18px;height:18px}
+.search .input{padding-left:40px;border-radius:16px}
+.error{color:var(--bad);font-size:13px}
+.error:empty{display:none}
+
+/* ---------- switch ---------- */
+.switch{position:relative;width:46px;height:27px;border-radius:999px;background:rgba(255,255,255,.2);flex:none;transition:background .35s var(--ease)}
+.switch span{
+  position:absolute;top:3px;left:3px;width:21px;height:21px;border-radius:50%;background:#fff;
+  box-shadow:0 2px 7px rgba(0,0,0,.35);transition:transform .5s var(--spring);
+}
+.switch.on{background:var(--accent)}
+.switch.on span{transform:translateX(19px)}
+
+/* ---------- avatars ---------- */
+.avatar{
+  --h:30;
+  width:44px;height:44px;border-radius:50%;flex:none;display:grid;place-items:center;
+  font:700 13px/1 var(--f-display);color:#16100a;
+  background:linear-gradient(145deg,hsl(var(--h) 88% 74%),hsl(calc(var(--h) + 38) 78% 58%));
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.22);
+}
+.avatar.sm{width:38px;height:38px;font-size:12px}
+.avatar.xs{width:28px;height:28px;font-size:10px}
+.mark{
+  width:42px;height:42px;border-radius:15px;display:grid;place-items:center;flex:none;
+  font:800 17px/1 var(--f-display);color:#21120a;
+  background:linear-gradient(145deg,#ffdcb4,#ff9f6a);
+  box-shadow:0 10px 30px rgba(255,159,106,.34);
+}
+
+/* ---------- chat list ---------- */
+.list-head{padding:16px 14px 10px;display:flex;flex-direction:column;gap:12px;flex:none}
+.list-meta{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.list-meta .muted{font-size:12px}
+.chat-list{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:2px 8px 96px;display:flex;flex-direction:column;gap:3px}
+.chat-list.list-rise .chat-row{animation:rise .5s var(--ease) both;animation-delay:calc(var(--i,0) * 38ms)}
+.chat-row{
+  display:flex;align-items:center;gap:12px;width:100%;text-align:left;
+  padding:10px;border-radius:17px;border:1px solid transparent;
+  transition:background .25s var(--ease),border-color .25s,transform .2s var(--ease);
+}
+.chat-row:hover{background:rgba(255,255,255,.06)}
+.chat-row:active{transform:scale(.985)}
+.chat-row.selected{background:rgba(255,179,107,.14);border-color:rgba(255,179,107,.3)}
+.chat-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+.chat-top,.chat-bottom{display:flex;align-items:center;gap:8px;min-width:0}
+.chat-top .name{flex:1;min-width:0;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chat-top time{font-size:11.5px;color:var(--faint);flex:none}
+.preview{flex:1;min-width:0;font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ai-badge{font-size:10px;font-weight:700;letter-spacing:.04em;padding:2px 7px;border-radius:999px;background:rgba(169,210,255,.16);color:var(--ai);flex:none}
+.unread{min-width:21px;height:21px;padding:0 6px;border-radius:999px;background:var(--accent);color:var(--accent-ink);font:700 11px/1 var(--f-body);display:grid;place-items:center;flex:none}
+
+/* ---------- conversation ---------- */
+.chat-tools{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;flex:none;
+  padding:12px 14px;border-bottom:1px solid var(--line-soft);
+}
+.chat-tools .tools-text{display:flex;flex-direction:column;min-width:0;flex:1 1 120px}
+.chat-tools .tools-text b{font-size:13px;font-weight:600}
+.chat-tools .tools-text span{font-size:12px;color:var(--muted)}
+.messages{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:14px 14px 10px;display:flex;flex-direction:column;gap:7px}
+.day{align-self:center;margin:6px 0 4px;font-size:11.5px;color:var(--muted);padding:5px 12px;border-radius:999px;background:rgba(0,0,0,.3);border:1px solid var(--line-soft)}
+.msg{display:flex;align-items:flex-end;gap:8px;max-width:86%}
+.msg.in{align-self:flex-start}
+.msg.out{align-self:flex-end;flex-direction:row-reverse}
+.msg.anim{animation:rise .42s var(--ease) both;animation-delay:calc(var(--i,0) * 40ms)}
+.bubble-wrap{display:flex;flex-direction:column;gap:4px;min-width:0}
+.msg.out .bubble-wrap{align-items:flex-end}
+.bubble{
+  padding:9px 13px;border-radius:19px 19px 19px 6px;line-height:1.5;
+  background:rgba(14,18,16,.7);border:1px solid var(--line-soft);
+  white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;-webkit-user-select:text;
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+}
+.msg.out .bubble{background:linear-gradient(160deg,#ffc58f,#ff9f6a);color:#24130a;border-color:transparent;border-radius:19px 19px 6px 19px}
+.meta{font-size:11px;color:var(--faint);padding:0 4px}
+.composer{display:flex;align-items:flex-end;gap:8px;margin:0 10px calc(10px + env(safe-area-inset-bottom,0px));padding:7px 7px 7px 16px;border-radius:26px;flex:none}
+.composer textarea{background:transparent;border:0;padding:9px 0;min-height:24px;max-height:140px;box-shadow:none}
+.composer textarea:focus{box-shadow:none}
+.send{
+  width:44px;height:44px;border-radius:50%;flex:none;display:grid;place-items:center;
+  background:linear-gradient(160deg,var(--accent-hi),var(--accent));color:var(--accent-ink);
+  box-shadow:0 8px 22px rgba(255,179,107,.3);transition:transform .2s var(--spring);
+}
+.send:active{transform:scale(.88)}
+.send:disabled{opacity:.5}
+
+/* ---------- empty + loading states ---------- */
+.empty{margin:auto;max-width:320px;padding:28px 18px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:10px}
+.empty .sigil{width:54px;height:54px;border-radius:19px;display:grid;place-items:center;color:var(--accent);background:rgba(255,179,107,.12);border:1px solid rgba(255,179,107,.25)}
+.empty .sigil svg.i{width:24px;height:24px}
+.empty b{font:600 15px/1.35 var(--f-body)}
+.empty p{margin:0;font-size:13px;color:var(--muted);line-height:1.6}
+.empty-inline{margin:auto;padding:20px;text-align:center;color:var(--muted);font-size:13px}
+.skel{
+  height:58px;border-radius:16px;
+  background:linear-gradient(90deg,rgba(255,255,255,.05),rgba(255,255,255,.13),rgba(255,255,255,.05));
+  background-size:200% 100%;animation:shimmer 1.4s linear infinite;
+}
+@keyframes shimmer{to{background-position:-200% 0}}
+
+/* ---------- overview / AI / settings / admin ---------- */
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.stat{padding:16px;border-radius:var(--r-md);background:rgba(4,8,6,.38);border:1px solid var(--line-soft);min-width:0}
+.stat .k{font:700 23px/1 var(--f-display);letter-spacing:-.03em;font-variant-numeric:tabular-nums}
+.stat .l{margin-top:9px;font-size:12px;color:var(--muted)}
+.kv{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 0;border-bottom:1px solid var(--line-soft)}
+.kv:last-child{border-bottom:0;padding-bottom:0}
+.kv:first-child{padding-top:0}
+.kv > span:first-child{color:var(--muted);min-width:0}
+.kv b{text-align:right;min-width:0;overflow-wrap:anywhere}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.pill.ok{color:var(--ok);border-color:rgba(143,233,189,.36);background:rgba(143,233,189,.1)}
+.pill .dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.mode-list{display:flex;flex-direction:column;gap:10px}
+.mode{display:grid;grid-template-columns:auto minmax(0,1fr);gap:14px;align-items:start;padding:14px;border-radius:var(--r-md);background:rgba(4,8,6,.38);border:1px solid var(--line-soft)}
+.mode .tag{min-width:52px;height:52px;border-radius:16px;display:grid;place-items:center;font:700 11px/1 var(--f-display);color:var(--accent);background:rgba(255,179,107,.12);border:1px solid rgba(255,179,107,.24)}
+.mode h3{margin:0 0 4px;font:600 14px/1.3 var(--f-body)}
+.mode p{margin:0;font-size:12.5px;color:var(--muted);line-height:1.55}
+.key-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border-radius:14px;background:rgba(4,8,6,.38);border:1px solid var(--line-soft)}
+.key-row code{font:500 12.5px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.key-row small{display:block;margin-top:4px;color:var(--muted);font-size:11.5px}
+.row{display:flex;gap:10px;align-items:center;min-width:0}
+.row > .grow{flex:1;min-width:0}
+.keygen{display:flex;flex-direction:column;gap:10px}
+.keygen-out{font-size:13px;color:var(--muted);min-height:0;overflow-wrap:anywhere}
+.keygen-out code{color:var(--ink);font:600 13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.hint{font-size:12.5px;color:var(--muted);line-height:1.6}
+.stack{display:flex;flex-direction:column;gap:12px;min-width:0}
+
+/* ---------- login ---------- */
+.login{position:absolute;inset:0;z-index:4;display:grid;place-items:center;padding:20px 16px}
+.login-card{
+  width:min(420px,100%);padding:26px;border-radius:var(--r-xl);
+  display:flex;flex-direction:column;gap:14px;animation:pop .65s var(--spring) both;
+}
+.login-card h1{margin:10px 0 0;font:700 22px/1.2 var(--f-display);letter-spacing:-.02em}
+.login-card > p{margin:0;font-size:13.5px;color:var(--muted);line-height:1.6}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.brand-name{font:700 14px/1.2 var(--f-display);letter-spacing:-.01em}
+.brand-sub{font-size:12px;color:var(--muted)}
+.rail-brand .mark{margin:0 auto}
+
+/* ---------- toast ---------- */
+.toast{
+  position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom,0px) + 94px);z-index:60;
+  max-width:min(440px,calc(100vw - 32px));padding:12px 16px;border-radius:17px;font-size:13px;line-height:1.45;
+  background:var(--glass-strong);border:1px solid var(--line);box-shadow:0 18px 50px rgba(0,0,0,.45);
+  transform:translate(-50%,26px) scale(.98);opacity:0;pointer-events:none;
+  transition:transform .5s var(--spring),opacity .3s var(--ease);
+}
+.toast.show{transform:translate(-50%,0) scale(1);opacity:1}
+
+/* ---------- motion ---------- */
+@keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+@keyframes pop{from{opacity:0;transform:scale(.94) translateY(12px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-delay:0ms!important;transition-duration:.01ms!important}
+}
+
+</style>
+</head>
+<body>
+<div id="bg" aria-hidden="true"></div>
+
+<div id="app">
+  <section id="login" class="login hidden" aria-labelledby="loginTitle">
+    <form id="loginForm" class="glass login-card" autocomplete="off">
+      <div class="brand">
+        <div class="mark" aria-hidden="true">N</div>
+        <div>
+          <div class="brand-name">NEZZX AI</div>
+          <div class="brand-sub">Telegram Conv</div>
+        </div>
+      </div>
+      <h1 id="loginTitle">Войдите в панель</h1>
+      <p>Введите ключ доступа. Ключ выдаёт Telegram-бот: там же можно получить бесплатный доступ или продлить подписку.</p>
+      <label class="field">
+        <span>Ключ доступа</span>
+        <input id="licenseKey" class="input" spellcheck="false" placeholder="FP-XXXXXX-XXXXXX-XXXXXX" required>
+      </label>
+      <label class="field">
+        <span>Пароль администратора <em>необязательно</em></span>
+        <input id="adminPassword" class="input" type="password" autocomplete="current-password" placeholder="Если задан на сервере">
+      </label>
+      <div id="loginError" class="error" role="alert"></div>
+      <button class="btn primary block" type="submit" id="loginSubmit">Войти</button>
+      <a class="link" id="loginBotLink" href="#" target="_blank" rel="noopener" hidden>Нет ключа? Откройте бота и отправьте /start</a>
+    </form>
+  </section>
+
+  <div id="shell" class="shell hidden" data-tab="chats" data-mode="list">
+    <aside class="sidebar glass" aria-label="Разделы">
+      <div class="rail-brand"><div class="mark" aria-hidden="true">N</div></div>
+      <nav class="rail" id="rail" aria-label="Разделы"></nav>
+      <button class="rail-btn" data-action="logout" title="Выйти">
+        <span data-icon="logout"></span><span>Выход</span>
+      </button>
+    </aside>
+
+    <main class="stage">
+      <header class="topbar glass">
+        <button class="icon-btn" id="backBtn" data-action="back" aria-label="Назад к списку" hidden><span data-icon="back"></span></button>
+        <div class="avatar sm" id="headAvatar" hidden>N</div>
+        <div class="title-wrap">
+          <h1 id="pageTitle">Чаты</h1>
+          <p id="pageSub" class="muted">NEZZX AI Telegram Conv</p>
+        </div>
+        <div class="top-actions" id="topActions"></div>
+      </header>
+
+      <div class="views">
+        <section class="view active" data-view="chats">
+          <div class="chats-layout" id="chatsLayout">
+            <div class="list-pane glass">
+              <div class="list-head">
+                <label class="search">
+                  <span data-icon="search"></span>
+                  <input id="chatSearch" class="input" placeholder="Поиск по личным чатам" autocomplete="off">
+                </label>
+                <div class="list-meta">
+                  <span id="chatCount" class="muted">Личные чаты</span>
+                  <select id="chatSort" class="select" aria-label="Сортировка">
+                    <option value="recent">Недавние</option>
+                    <option value="unread">Непрочитанные</option>
+                    <option value="ai">С AI</option>
+                  </select>
+                </div>
+              </div>
+              <div id="chatList" class="chat-list"></div>
+            </div>
+            <div class="chat-pane glass" id="chatPane"></div>
+          </div>
+        </section>
+
+        <section class="view" data-view="ai"><div class="page" id="aiPage"></div></section>
+        <section class="view" data-view="overview"><div class="page" id="overviewPage"></div></section>
+        <section class="view" data-view="settings"><div class="page" id="settingsPage"></div></section>
+        <section class="view" data-view="admin"><div class="page" id="adminPage"></div></section>
+      </div>
+    </main>
+
+    <nav class="tabbar glass" id="tabbar" aria-label="Разделы">
+      <span class="indicator" id="indicator"></span>
+    </nav>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
 <script>
 'use strict';
-const $=s=>document.querySelector(s); const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const MODE_NAMES={friendly:'Дружелюбный',mm2_trade:'MM2 Trade',looking_for_players:'Найти игроков',careful_trade:'Безопасный трейд'};
-const MODE_DESC={friendly:'Неформально и спокойно общается об игре. Подходит для обычной переписки.',mm2_trade:'Обсуждает Murder Mystery 2 и предметы только на основе подтверждённых условий.',looking_for_players:'Помогает найти людей для совместной игры и договориться о времени.',careful_trade:'Помогает согласовать справедливые условия обмена и избегать сомнительных схем.'};
-const state={session:null,view:'messages',chats:[],selected:null,messages:[],status:null,config:null,chatAI:{enabled:false,mode:'friendly'},loading:false,flowStep:'phone',phone:'',timer:null};
-async function api(path,opts={}){const init={method:opts.method||'GET',credentials:'same-origin',headers:{'Accept':'application/json'}};if(opts.body!==undefined){init.headers['Content-Type']='application/json';init.body=JSON.stringify(opts.body)}const r=await fetch('/api'+path,init);let d={};try{d=await r.json()}catch{}if(!r.ok){let msg=typeof d.detail==='string'?d.detail:(d.detail?.message||'Ошибка запроса');throw new Error(msg)}return d}
-function toast(msg){const e=$('#toast');e.textContent=msg;e.classList.remove('hidden');clearTimeout(state.toastTimer);state.toastTimer=setTimeout(()=>e.classList.add('hidden'),3600)}
-function initials(name){return (String(name||'?').trim().split(/\s+/).slice(0,2).map(x=>x[0]||'').join('')||'?').toUpperCase()}
-function showLogin(){ $('#login').classList.remove('hidden');$('#shell').classList.add('hidden') }
-function showShell(){ $('#login').classList.add('hidden');$('#shell').classList.remove('hidden');if(state.session?.is_admin)$('#adminNav').classList.remove('hidden');else $('#adminNav').classList.add('hidden');setView('messages');loadStatus().then(()=>loadChats()) }
-async function boot(){try{state.config=await api('/public/config')}catch{}try{state.session=await api('/session');showShell()}catch{showLogin()}}
-$('#loginForm').addEventListener('submit',async ev=>{ev.preventDefault();const btn=$('#loginSubmit');btn.disabled=true;btn.textContent='Проверяем…';$('#loginError').textContent='';try{await api('/login',{method:'POST',body:{key:$('#adminPassword').value.trim()?'':$('#licenseKey').value.trim(),password:$('#adminPassword').value.trim()||$('#licenseKey').value.trim()}});state.session=await api('/session');showShell()}catch(e){$('#loginError').textContent=e.message}finally{btn.disabled=false;btn.textContent='Войти →'}});
-async function logout(){try{await api('/logout',{method:'POST'})}catch{}state.session=null;state.chats=[];state.selected=null;clearInterval(state.timer);showLogin()}
-$('#logoutBtn').addEventListener('click',logout);
-function setView(v){state.view=v;$('#shell').dataset.view=v;$('#shell').classList.toggle('list-open',false);document.querySelectorAll('[data-nav]').forEach(b=>b.classList.toggle('active',b.dataset.nav===v));const listView=v==='messages';$('#inbox').classList.toggle('hidden',!listView);const main=$('#mainView');$('#headRefresh').classList.toggle('hidden',!listView);$('#headAi').classList.toggle('hidden',!listView);if(v==='messages'){if(state.selected)renderChat();else renderBlankChat();return}$('#headName').textContent=({overview:'Главная',ai:'AI Conv',settings:'Настройки',keys:'Ключи и подписка',admin:'Администрирование'})[v]||v;$('#headStatus').textContent='NEZZX AI Telegram Conv';$('#headAvatar').textContent='N';if(v==='overview')renderOverview();else if(v==='ai')renderAI();else if(v==='settings')renderSettings();else if(v==='keys')renderKeys();else if(v==='admin')renderAdmin();else renderBlankChat()}
-document.querySelectorAll('[data-nav]').forEach(b=>b.addEventListener('click',()=>setView(b.dataset.nav)));
-document.addEventListener('click',ev=>{const b=ev.target.closest('[data-goto]');if(b)setView(b.dataset.goto)});
-async function loadStatus(){try{state.status=await api('/telegram/status')}catch(e){state.status={connected:false,api_configured:false,ai_configured:false,error:e.message}}return state.status}
-async function loadChats(){try{const d=await api('/telegram/chats');state.chats=d.items||[];state.chatStats=d;drawChats();if(state.selected&&!state.chats.some(c=>c.id===state.selected.id)){state.selected=null;renderBlankChat()}else if(state.selected){state.selected=state.chats.find(c=>c.id===state.selected.id)||state.selected;await loadMessages(true)}if(state.view==='overview')renderOverview()}catch(e){state.chats=[];drawChats();if(!state.status?.connected){$('#chatList').innerHTML=`<div class="empty">${esc(e.message)}<br><button class="btn blue" style="margin-top:12px" data-goto="settings">Подключить Telegram</button></div>`}else toast(e.message)}}
-function drawChats(){const q=$('#chatSearch').value.toLowerCase().trim();let chats=state.chats.filter(c=>(`${c.name} ${c.username||''} ${c.last_message_text||''}`).toLowerCase().includes(q));const sort=$('#chatSort').value;if(sort==='unread')chats.sort((a,b)=>b.unread_count-a.unread_count);else if(sort==='ai')chats=chats.filter(c=>c.ai_enabled);else chats.sort((a,b)=>(b.last_message_date||'').localeCompare(a.last_message_date||''));$('#chatCount').textContent=`${state.chats.length} чатов`;$('#inboxSub').textContent=state.status?.username?('@'+state.status.username):state.status?.connected?'Telegram подключён':'Telegram не подключён';if(!chats.length){$('#chatList').innerHTML=`<div class="empty">${state.chats.length?'Ничего не найдено':'Чатов пока нет'}<br><span class="tiny">${state.status?.connected?'Здесь появятся доступные диалоги.':'Подключите аккаунт в настройках.'}</span></div>`;return}$('#chatList').innerHTML=chats.map(c=>`<button class="chat-card ${state.selected?.id===c.id?'selected':''}" data-chat="${esc(c.id)}"><div class="avatar">${esc(initials(c.name))}</div><div class="chat-meta"><div class="row between"><span class="name">${esc(c.name)}</span>${c.ai_enabled?'<span title="AI включён" style="color:#95b6ff">✧</span>':''}</div><div class="preview">${esc(c.last_message_text||'Нет сообщений')}</div><div class="chat-bottom"><span>${c.last_message_date?esc(new Date(c.last_message_date).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})):' '}</span>${c.unread_count?`<span class="unread">${c.unread_count}</span>`:''}</div></div></button>`).join('');$('#chatList').querySelectorAll('[data-chat]').forEach(b=>b.addEventListener('click',()=>selectChat(b.dataset.chat)))}
-$('#chatSearch').addEventListener('input',drawChats);$('#chatSort').addEventListener('change',drawChats);$('#refreshChats').addEventListener('click',loadChats);
-async function selectChat(id){const c=state.chats.find(x=>x.id===String(id));if(!c)return;state.selected=c;state.chatAI={enabled:!!c.ai_enabled,mode:c.ai_mode||'friendly'};drawChats();setView('messages');$('#headName').textContent=c.name;$('#headAvatar').textContent=initials(c.name);$('#headStatus').textContent=c.username?'@'+c.username:'Telegram chat';await loadMessages(false);$('#shell').classList.remove('list-open')}
-function renderBlankChat(){$('#headName').textContent='Выберите чат';$('#headAvatar').textContent='N';$('#headStatus').textContent=state.status?.connected?'Telegram подключён':'Подключите Telegram в настройках';$('#mainView').className='chat-pane';$('#mainView').innerHTML='<div class="empty" style="margin:auto"><div style="font-size:35px;margin-bottom:9px">✦</div><b style="color:#eee">Твоя переписка — в одном месте</b><div class="muted" style="margin-top:6px">Выбери чат слева или подключи Telegram.</div><button class="btn blue" style="margin-top:17px" data-goto="settings">Подключить Telegram</button></div>'}
-function modeOptions(sel){return Object.keys(MODE_NAMES).map(k=>`<option value="${k}" ${k===sel?'selected':''}>${MODE_NAMES[k]}</option>`).join('')}
-async function loadMessages(silent){if(!state.selected)return;try{const d=await api(`/telegram/chats/${encodeURIComponent(state.selected.id)}/messages?limit=80`);if(!state.selected)return;state.messages=d.items||[];state.chatAI=d.ai||state.chatAI;renderChatMessages(silent)}catch(e){if(!silent)toast(e.message)}}
-function renderChat(){const c=state.selected;if(!c){renderBlankChat();return}$('#headName').textContent=c.name;$('#headAvatar').textContent=initials(c.name);$('#headStatus').textContent=c.username?'@'+c.username:'Telegram conversation';$('#mainView').className='chat-pane';$('#mainView').innerHTML=`<div class="chat-controls"><span class="tiny muted">AI-ответы</span><button class="toggle ${state.chatAI.enabled?'on':''}" id="aiToggle" role="switch" aria-checked="${state.chatAI.enabled}"></button><span class="tiny">${state.chatAI.enabled?'Включены для этого чата':'Выключены'}</span><span class="grow"></span><select id="chatMode" aria-label="Режим ИИ">${modeOptions(state.chatAI.mode)}</select><button class="btn" id="draftBtn">✧ Предложить ответ</button></div><div id="messages" class="messages"><div class="empty">Загружаем сообщения…</div></div><form class="composer" id="sendForm"><textarea id="messageText" rows="1" placeholder="Написать сообщение…" maxlength="4000"></textarea><button class="send" type="submit" title="Отправить">➤</button></form>`;$('#aiToggle').addEventListener('click',toggleAI);$('#chatMode').addEventListener('change',e=>saveAI(state.chatAI.enabled,e.target.value));$('#draftBtn').addEventListener('click',makeDraft);$('#sendForm').addEventListener('submit',sendMessage);renderChatMessages(false);}
-function renderChatMessages(silent){const box=$('#messages');if(!box)return;const wasBottom=box.scrollHeight-box.scrollTop-box.clientHeight<100;box.innerHTML=state.messages.length?'<div class="day-pill">История сообщений</div>'+state.messages.map(m=>`<div class="msg-row ${m.is_out?'out':''}">${!m.is_out?`<div class="avatar small">${esc(initials(m.author))}</div>`:''}<div class="bubble-wrap"><div class="msg-info"><span>${esc(m.author|| (m.is_out?'Вы':'Собеседник'))}</span><span>${m.timestamp?esc(new Date(m.timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})):''}</span></div><div class="bubble">${esc(m.text)}</div></div>${m.is_out?`<div class="avatar small">N</div>`:''}</div>`).join(''):'<div class="empty">В этой переписке пока нет сообщений.</div>';if(wasBottom||!silent)box.scrollTop=box.scrollHeight}
-async function toggleAI(){await saveAI(!state.chatAI.enabled,$('#chatMode').value)}
-async function saveAI(enabled,mode){if(!state.selected)return;try{const d=await api(`/telegram/chats/${encodeURIComponent(state.selected.id)}/ai`,{method:'PUT',body:{enabled,mode}});state.chatAI=d;state.selected.ai_enabled=d.enabled;state.selected.ai_mode=d.mode;drawChats();renderChat();toast(enabled?'AI-ответы включены для этого чата':'AI-ответы выключены')}catch(e){toast(e.message)}}
-async function makeDraft(){if(!state.selected)return;const b=$('#draftBtn');b.disabled=true;b.textContent='Думаю…';try{const d=await api('/ai/draft',{method:'POST',body:{chat_id:state.selected.id,mode:$('#chatMode').value}});$('#messageText').value=d.draft;$('#messageText').focus();toast('Черновик готов — проверь и отправь его сам')}catch(e){toast(e.message)}finally{b.disabled=false;b.textContent='✧ Предложить ответ'}}
-async function sendMessage(ev){ev.preventDefault();if(!state.selected)return;const input=$('#messageText'),text=input.value.trim();if(!text)return;const b=ev.submitter||$('#sendForm button');b.disabled=true;try{await api(`/telegram/chats/${encodeURIComponent(state.selected.id)}/send`,{method:'POST',body:{text}});input.value='';await loadMessages(false);await loadChats()}catch(e){toast(e.message)}finally{b.disabled=false;input.focus()}}
-$('#headRefresh').addEventListener('click',()=>loadMessages(false));$('#headAi').addEventListener('click',()=>{if(!state.selected){toast('Сначала выберите чат');return}setView('ai')});$('#mobileBack').addEventListener('click',()=>$('#shell').classList.toggle('list-open'));
-function renderOverview(){const d=state.chatStats||{count:state.chats.length,unread_count:state.chats.reduce((n,c)=>n+c.unread_count,0),ai_active_count:state.chats.filter(c=>c.ai_enabled).length};const ai=state.aiStats||{};$('#mainView').className='pane view';$('#mainView').innerHTML=`<div class="view-inner"><div class="row between"><div><div class="h1">Обзор</div><div class="muted" style="margin-top:6px">Статистика твоего Telegram Inbox</div></div><button class="btn" id="overviewRefresh">↻ Обновить</button></div><div class="stats"><div class="card"><div class="stat-label">Всего чатов</div><div class="kpi">${d.count||0}</div><div class="stat-foot">Доступные диалоги</div></div><div class="card"><div class="stat-label">Непрочитанные</div><div class="kpi">${d.unread_count||0}</div><div class="stat-foot">По данным Telegram</div></div><div class="card"><div class="stat-label">AI-диалоги</div><div class="kpi">${d.ai_active_count||0}</div><div class="stat-foot">Включены вручную</div></div><div class="card"><div class="stat-label">AI ответов сегодня</div><div class="kpi">${ai.today?.auto_sent||0}</div><div class="stat-foot">Входящие диалоги</div></div></div><div class="card stack"><h3>Состояние подключений</h3><div class="row between"><span>Telegram аккаунт</span><span class="pill ${state.status?.connected?'pill-good':''}">${state.status?.connected?'● Подключён':'Не подключён'}</span></div><div class="row between"><span>Gemini API</span><span class="pill ${state.status?.ai_configured?'pill-good':''}">${state.status?.ai_configured?'● Готов':'Нужен API key'}</span></div><div class="row between"><span>Модель</span><span class="pill">${esc(ai.model||'gemini-2.5-flash')}</span></div><div class="row wrap" style="margin-top:6px"><button class="btn blue" data-goto="messages">Открыть сообщения</button><button class="btn" data-goto="settings">Настройки Telegram</button><button class="btn" data-goto="ai">Настроить AI Conv</button></div></div><div class="card"><h3>Быстрый старт</h3><div class="hint">1. Подключи Telegram по номеру и коду подтверждения.<br>2. Выбери нужный диалог в Inbox.<br>3. Используй «Предложить ответ» или отдельно включи автоматические ответы только в этом чате.<br>4. Все первые сообщения отправляются вручную; AI реагирует только на входящие сообщения из явно включённых диалогов.</div></div></div>`;$('#overviewRefresh').addEventListener('click',async()=>{await loadStatus();await loadChats();await loadAIStats();renderOverview()})}
-async function loadAIStats(){try{state.aiStats=await api('/ai/status')}catch{state.aiStats={}}}
-function renderAI(){loadAIStats().then(()=>{if(state.view!=='ai')return;const d=state.aiStats||{};$('#mainView').className='pane view';$('#mainView').innerHTML=`<div class="view-inner"><div><div class="h1">AI Conv</div><div class="muted" style="margin-top:6px">Четыре стиля общения на базе Gemini</div></div><div class="stats"><div class="card"><div class="stat-label">Модель</div><div style="font-weight:800">${esc(d.model||'gemini-2.5-flash')}</div><div class="stat-foot">${d.configured?'API подключён':'Добавьте GEMINI_API_KEY'}</div></div><div class="card"><div class="stat-label">Автоответов за 24 ч.</div><div class="kpi">${d.today?.auto_sent||0}</div></div><div class="card"><div class="stat-label">Черновиков за 24 ч.</div><div class="kpi">${d.today?.drafts||0}</div></div><div class="card"><div class="stat-label">AI-операций всего</div><div class="kpi">${d.today?.total||0}</div></div></div><div class="mode-grid">${Object.entries(MODE_NAMES).map(([k,n])=>`<div class="mode"><div class="row between"><h4>${esc(n)}</h4><span class="pill">${k==='mm2_trade'?'MM2':k==='friendly'?'Chat':k==='careful_trade'?'Safe':'Play'}</span></div><p>${esc(MODE_DESC[k])}</p></div>`).join('')}</div><div class="card stack"><h3>Как работают режимы</h3><p class="hint">Автоответы включаются отдельно внутри каждого чата и работают только после входящего сообщения. ИИ не запускает холодную рассылку и не пишет первым. Черновики можно проверить и отредактировать перед отправкой.</p><p class="hint">Системный промпт запрещает выдумывать ценность предметов, скрытые риски, фальшивых гарантов и просить пароли или коды входа. Если собеседник спрашивает, ассистент честно говорит о помощи ИИ.</p><div class="row wrap"><button class="btn blue" data-goto="messages">Выбрать чат</button><button class="btn" data-goto="settings">Проверить API</button></div></div></div>`})}
-function renderSettings(){loadStatus().then(st=>{if(state.view!=='settings')return;const connected=!!st.connected;$('#mainView').className='pane view';$('#mainView').innerHTML=`<div class="view-inner"><div><div class="h1">Настройки</div><div class="muted" style="margin-top:6px">Подключения и безопасность</div></div><section class="card stack"><h3>Telegram аккаунт</h3><div class="connect-status row between"><div><div style="font-weight:800">${connected?esc(st.display_name||st.username||st.phone||'Аккаунт подключён'):'Не подключён'}</div><div class="tiny muted">${connected?esc(st.phone||'MTProto session активна'):'Вход по номеру телефона Telegram'}</div></div><span class="pill ${connected?'pill-good':''}">${connected?'● Connected':'Отключён'}</span></div>${connected?`<div class="row wrap"><div class="hint grow">Сессия зашифрована на сервере. Код подтверждения и пароль 2FA не сохраняются.</div><button class="btn danger" id="tgDisconnect">Отключить аккаунт</button></div>`:`<form id="phoneForm" class="stack"><div class="field"><label for="phone">Номер телефона с кодом страны</label><input class="input" id="phone" inputmode="tel" autocomplete="tel" placeholder="+374…" required></div><div class="error" id="tgError"></div><button class="btn blue" id="phoneSubmit" type="submit">Отправить код в Telegram</button></form><form id="codeForm" class="stack hidden"><div class="field"><label for="tgCode">Код подтверждения</label><input class="input" id="tgCode" autocomplete="one-time-code" inputmode="numeric" placeholder="Код из Telegram" required></div><div class="error" id="codeError"></div><button class="btn blue" type="submit" id="codeSubmit">Подтвердить код</button></form><form id="passwordForm" class="stack hidden"><div class="field"><label for="tgPassword">Пароль двухэтапной аутентификации (2FA)</label><input class="input" type="password" id="tgPassword" autocomplete="current-password" placeholder="Пароль 2FA" required></div><div class="hint">Пароль нужен только для завершения входа и не записывается в базу или журнал приложения.</div><div class="error" id="passwordError"></div><button class="btn blue" type="submit" id="passwordSubmit">Войти в Telegram</button></form>`}<div class="hint">Вход использует официальный Telegram MTProto API. Код приходит в приложение Telegram или доступным Telegram способом, а не обязательно SMS.</div>${!st.api_configured?'<div class="error">Не заданы TELEGRAM_API_ID и TELEGRAM_API_HASH в Render → Environment.</div>':''}</section><section class="card stack"><h3>Google Gemini</h3><div class="row between"><span>API status</span><span class="pill ${st.ai_configured?'pill-good':''}">${st.ai_configured?'● Подключён':'Не настроен'}</span></div><div class="hint">Задай GEMINI_API_KEY в Render → Environment. Модель настраивается через GEMINI_MODEL (по умолчанию gemini-2.5-flash). Сам ключ API не вводится в браузере и не передаётся клиенту.</div></section><section class="card stack"><h3>Встроенный Telegram client profile</h3><div class="row between"><span>Device model</span><span class="pill">NEZZX AI Telegram Conv</span></div><div class="row between"><span>App version</span><span class="pill">${esc(state.session?.version||'6.0.0')}</span></div><div class="hint">Для MTProto используется профиль устройства Telegram, а не браузерный HTTP User-Agent.</div></section><section class="card stack"><h3>Доступ</h3><div class="row between"><div><b>${esc(state.session?.plan_title||'Ключ доступа')}</b><div class="tiny muted">${state.session?.forever?'Без срока действия':state.session?.expires_at?'До '+new Date(state.session.expires_at*1000).toLocaleString():'Активная сессия'}</div></div><button class="btn ghost" id="settingsLogout">Выйти</button></div></section></div>`;bindTelegramForms()})}
-function bindTelegramForms(){const pf=$('#phoneForm');if(pf)pf.addEventListener('submit',async e=>{e.preventDefault();const b=$('#phoneSubmit');b.disabled=true;$('#tgError').textContent='';state.phone=$('#phone').value.trim();try{await api('/telegram/login/start',{method:'POST',body:{phone:state.phone}});$('#codeForm').classList.remove('hidden');toast('Код отправлен в Telegram')}catch(err){$('#tgError').textContent=err.message}finally{b.disabled=false}});const cf=$('#codeForm');if(cf)cf.addEventListener('submit',async e=>{e.preventDefault();const b=$('#codeSubmit');b.disabled=true;$('#codeError').textContent='';try{const d=await api('/telegram/login/complete',{method:'POST',body:{code:$('#tgCode').value.trim()}});if(d.needs_password){$('#passwordForm').classList.remove('hidden');$('#tgPassword').focus()}else{await afterTelegramConnect()}}catch(err){$('#codeError').textContent=err.message}finally{b.disabled=false}});const pw=$('#passwordForm');if(pw)pw.addEventListener('submit',async e=>{e.preventDefault();const b=$('#passwordSubmit');b.disabled=true;$('#passwordError').textContent='';try{await api('/telegram/login/password',{method:'POST',body:{password:$('#tgPassword').value}});$('#tgPassword').value='';await afterTelegramConnect()}catch(err){$('#passwordError').textContent=err.message}finally{b.disabled=false}});const disc=$('#tgDisconnect');if(disc)disc.addEventListener('click',async()=>{if(!confirm('Отключить Telegram и удалить сохранённую серверную сессию?'))return;try{await api('/telegram/logout',{method:'POST'});state.selected=null;await loadStatus();toast('Telegram отключён');renderSettings();loadChats()}catch(e){toast(e.message)}});const lo=$('#settingsLogout');if(lo)lo.addEventListener('click',logout)}
-async function afterTelegramConnect(){await loadStatus();await loadChats();toast('Telegram подключён');setView('messages')}
-function renderKeys(){const s=state.session||{};$('#mainView').className='pane view';$('#mainView').innerHTML=`<div class="view-inner"><div class="h1">Ключи и подписка</div><section class="card stack"><h3>Текущий доступ</h3><div class="h1">${esc(s.plan_title||'Ключ доступа')}</div><div class="row between"><span class="muted">Статус</span><span class="pill pill-good">Активен</span></div><div class="row between"><span class="muted">Срок</span><b>${s.forever?'Навсегда':s.expires_at?esc(new Date(s.expires_at*1000).toLocaleString()):'—'}</b></div><div class="row between"><span class="muted">ID ключа</span><span class="pill">•••• ${esc(s.license_hint||'ADMIN')}</span></div></section><section class="card stack"><h3>Получить или продлить ключ</h3><p class="hint">Покупка по Telegram Stars и бесплатный 30-минутный доступ остаются в Telegram-боте. Открой бота, отправь /start и выбери нужный срок. После оплаты ключ придёт сообщением.</p>${state.config?.telegram_bot_url?`<a class="btn blue" style="align-self:flex-start;text-decoration:none" href="${esc(state.config.telegram_bot_url)}" target="_blank" rel="noopener">Открыть Telegram-бота ↗</a>`:'<div class="hint">Добавь TELEGRAM_BOT_USERNAME в переменные окружения, чтобы показать ссылку на бота.</div>'}<button id="copyKeyHint" class="btn" style="align-self:flex-start">Показать инструкцию</button></section></div>`;$('#copyKeyHint').addEventListener('click',()=>toast('Откройте Telegram-бота и отправьте /start'))}
-async function renderAdmin(){if(!state.session?.is_admin){setView('overview');return}$('#mainView').className='pane view';$('#mainView').innerHTML=`<div class="view-inner"><div class="h1">Администрирование</div><section class="card stack"><h3>Создать ключ</h3><div class="row wrap"><select id="admDuration" class="grow"><option value="1h">1 час</option><option value="6h">6 часов</option><option value="12h">12 часов</option><option value="24h" selected>1 день</option><option value="36h">1,5 дня</option><option value="3d">3 дня</option><option value="7d">7 дней</option><option value="30d">30 дней</option><option value="forever">Навсегда</option></select><input id="admTg" class="input grow" inputmode="numeric" placeholder="Telegram ID (необязательно)"><button id="admCreate" class="btn blue">Создать</button></div><div id="admOut" class="hint"></div></section><section class="card stack"><h3>Последние ключи</h3><button id="admRefresh" class="btn" style="align-self:flex-start">Обновить список</button><div id="adminKeys" class="stack"><div class="loading">Загрузка…</div></div></section></div>`;$('#admCreate').addEventListener('click',async()=>{try{const d=await api('/admin/licenses',{method:'POST',body:{duration:$('#admDuration').value,telegram_user_id:Number($('#admTg').value||0)}});$('#admOut').innerHTML=`<b>Создан ключ:</b> <code>${esc(d.key)}</code> <button class="btn" id="admCopy">Копировать</button>`;$('#admCopy').addEventListener('click',()=>navigator.clipboard.writeText(d.key));loadAdminKeys()}catch(e){toast(e.message)}});$('#admRefresh').addEventListener('click',loadAdminKeys);loadAdminKeys()}
-async function loadAdminKeys(){try{const d=await api('/admin/licenses');$('#adminKeys').innerHTML=(d.items||[]).slice(0,50).map(k=>`<div class="row between" style="padding:10px;background:#25262e;border-radius:9px"><div style="min-width:0"><code>${esc(k.key)}</code><div class="tiny muted">${esc(k.plan_id)} · ${k.active?'активен':k.revoked?'отозван':'истёк'}</div></div>${k.active?`<button class="btn danger" data-revoke="${esc(k.key)}">Отозвать</button>`:''}</div>`).join('')||'<div class="empty">Ключей нет</div>';$('#adminKeys').querySelectorAll('[data-revoke]').forEach(b=>b.addEventListener('click',async()=>{if(!confirm('Отозвать этот ключ?'))return;try{await api('/admin/licenses/revoke',{method:'POST',body:{key:b.dataset.revoke}});loadAdminKeys()}catch(e){toast(e.message)}}))}catch(e){$('#adminKeys').textContent=e.message}}
-setInterval(async()=>{if(!state.session)return;if(state.view==='messages'&&state.selected)await loadMessages(true);await loadChats()},15000);
+/* ================================================================
+   CORE: state, helpers, API, Telegram WebApp, login, navigation
+   ================================================================ */
+const TG = window.Telegram?.WebApp || null;
+const $  = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+const ICON = {
+  chat:    '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22z"/>',
+  spark:   '<path d="M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/>',
+  grid:    '<rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/>',
+  sliders: '<line x1="4" y1="7" x2="20" y2="7"/><circle cx="9" cy="7" r="2.2"/><line x1="4" y1="17" x2="20" y2="17"/><circle cx="15" cy="17" r="2.2"/>',
+  shield:  '<path d="M12 3l7.5 3v5.5c0 4.6-3.2 8.3-7.5 9.5-4.3-1.2-7.5-4.9-7.5-9.5V6z"/><path d="M9 12l2.2 2.2L15.5 10"/>',
+  search:  '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/>',
+  back:    '<path d="M14.5 5.5L8 12l6.5 6.5"/>',
+  send:    '<path d="M4 12h15"/><path d="M13 6l6 6-6 6"/>',
+  refresh: '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4h-4"/>',
+  logout:  '<path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M10 8l-4 4 4 4"/><path d="M6 12h10"/>',
+  expand:  '<path d="M4 9V4h5"/><path d="M20 9V4h-5"/><path d="M4 15v5h5"/><path d="M20 15v5h-5"/>',
+};
+const icon = name => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICON[name] || ''}</svg>`;
+const hydrateIcons = () => $$('[data-icon]').forEach(el => { el.innerHTML = icon(el.dataset.icon); });
+
+const TABS = [
+  {id: 'chats',    label: 'Чаты',      icon: 'chat'},
+  {id: 'ai',       label: 'AI',        icon: 'spark'},
+  {id: 'overview', label: 'Обзор',     icon: 'grid'},
+  {id: 'settings', label: 'Настройки', icon: 'sliders'},
+  {id: 'admin',    label: 'Админ',     icon: 'shield', admin: true},
+];
+const TAB_TITLE = {chats: 'Чаты', ai: 'AI Conv', overview: 'Обзор', settings: 'Настройки', admin: 'Админка'};
+const TAB_SUB = {
+  ai: 'Четыре стиля общения на Gemini',
+  overview: 'Статистика вашего Inbox',
+  settings: 'Подключения и доступ',
+  admin: 'Ключи доступа',
+};
+const MODE_NAMES = {friendly: 'Дружелюбный', mm2_trade: 'MM2 Trade', looking_for_players: 'Поиск игроков', careful_trade: 'Безопасный трейд'};
+const MODE_TAG   = {friendly: 'Chat', mm2_trade: 'MM2', looking_for_players: 'Play', careful_trade: 'Safe'};
+const MODE_DESC  = {
+  friendly: 'Неформально и спокойно общается об игре. Подходит для обычной переписки.',
+  mm2_trade: 'Обсуждает Murder Mystery 2 и предметы только на основе подтверждённых условий.',
+  looking_for_players: 'Помогает найти людей для совместной игры и договориться о времени.',
+  careful_trade: 'Помогает согласовать справедливые условия обмена и избегать сомнительных схем.',
+};
+
+const state = {
+  session: null, config: null, status: null, aiStats: null,
+  chats: [], chatStats: {count: 0, unread_count: 0, ai_active_count: 0},
+  selected: null, chatAI: {enabled: false, mode: 'friendly'}, messages: [],
+  tab: 'chats', listAnimated: false, fsTries: 0, toastTimer: 0, pollTimer: 0,
+};
+
+/* ---------- helpers ---------- */
+function initials(name) {
+  return (String(name || '?').trim().split(/\s+/).slice(0, 2).map(x => x[0] || '').join('') || '?').toUpperCase();
+}
+function hueOf(text) {
+  let h = 7;
+  for (const ch of String(text || '')) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return h % 360;
+}
+function fmtTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return isNaN(d) ? '' : d.toLocaleTimeString('ru-RU', {hour: '2-digit', minute: '2-digit'});
+}
+function dayKey(iso) { const d = new Date(iso); return isNaN(d) ? '' : d.toDateString(); }
+function dayLabel(iso) {
+  const d = new Date(iso); if (isNaN(d)) return '';
+  const today = new Date(); const yest = new Date(); yest.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return 'Сегодня';
+  if (d.toDateString() === yest.toDateString()) return 'Вчера';
+  return d.toLocaleDateString('ru-RU', {day: 'numeric', month: 'long'});
+}
+function emptyBox(title, text = '', action = '') {
+  return `<div class="empty"><div class="sigil">${icon('spark')}</div><b>${esc(title)}</b>${text ? `<p>${esc(text)}</p>` : ''}${action}</div>`;
+}
+
+/* ---------- API ---------- */
+async function api(path, opts = {}) {
+  const init = {method: opts.method || 'GET', credentials: 'same-origin', headers: {Accept: 'application/json'}};
+  if (opts.body !== undefined) {
+    init.headers['Content-Type'] = 'application/json';
+    init.body = JSON.stringify(opts.body);
+  }
+  const res = await fetch('/api' + path, init);
+  let data = {};
+  try { data = await res.json(); } catch {}
+  if (!res.ok) {
+    const msg = typeof data.detail === 'string' ? data.detail : (data.detail?.message || 'Не удалось выполнить запрос');
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+function toast(msg) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(state.toastTimer);
+  state.toastTimer = setTimeout(() => el.classList.remove('show'), 3400);
+}
+
+/* ---------- Telegram WebApp: open full screen, no accidental close ---------- */
+function callTG(fn) { try { return fn(); } catch { return undefined; } }
+
+function requestFullscreen() {
+  if (!TG || TG.isFullscreen) return;
+  state.fsTries += 1;
+  callTG(() => TG.requestFullscreen());
+}
+
+function setupTelegram() {
+  if (!TG) return;
+  callTG(() => TG.ready());
+  callTG(() => TG.expand());
+  callTG(() => TG.disableVerticalSwipes());
+  callTG(() => TG.setHeaderColor('#07100a'));
+  callTG(() => TG.setBackgroundColor('#07100a'));
+  callTG(() => TG.BackButton.onClick(() => { if (state.selected) closeChat(); }));
+  requestFullscreen();
+  // some clients only allow fullscreen after a tap, so try again on the first two taps
+  document.addEventListener('pointerdown', () => { if (state.fsTries < 3) requestFullscreen(); }, {passive: true});
+}
+
+function toggleFullscreen() {
+  if (TG) {
+    if (TG.isFullscreen) callTG(() => TG.exitFullscreen());
+    else callTG(() => TG.requestFullscreen());
+    return;
+  }
+  if (document.fullscreenElement) document.exitFullscreen?.();
+  else Promise.resolve(document.documentElement.requestFullscreen?.()).catch(() => toast('Браузер не разрешил полноэкранный режим'));
+}
+
+/* ---------- login / logout ---------- */
+function showLogin() {
+  $('#shell').classList.add('hidden');
+  $('#login').classList.remove('hidden');
+  if (state.config?.telegram_bot_url) {
+    const link = $('#loginBotLink');
+    link.href = state.config.telegram_bot_url;
+    link.hidden = false;
+  }
+  setTimeout(() => $('#licenseKey')?.focus({preventScroll: true}), 350);
+}
+
+$('#loginForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const btn = $('#loginSubmit');
+  const key = $('#licenseKey').value.trim();
+  const pass = $('#adminPassword').value.trim();
+  btn.disabled = true;
+  btn.textContent = 'Проверяем…';
+  $('#loginError').textContent = '';
+  try {
+    await api('/login', {method: 'POST', body: {key: pass ? '' : key, password: pass || key, init_data: TG?.initData || ''}});
+    state.session = await api('/session');
+    showShell();
+  } catch (e) {
+    $('#loginError').textContent = e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Войти';
+  }
+});
+
+async function logout() {
+  try { await api('/logout', {method: 'POST'}); } catch {}
+  clearInterval(state.pollTimer);
+  state.session = null;
+  state.chats = [];
+  state.selected = null;
+  state.messages = [];
+  state.listAnimated = false;
+  showLogin();
+}
+
+/* ---------- navigation ---------- */
+function buildNav() {
+  const isAdmin = !!state.session?.is_admin;
+  const items = TABS.filter(t => !t.admin || isAdmin);
+  const btn = (t, cls) => `<button class="${cls}" data-nav="${t.id}" aria-label="${esc(t.label)}"><span data-icon="${t.icon}"></span><span>${esc(t.label)}</span></button>`;
+  $('#rail').innerHTML = items.map(t => btn(t, 'rail-btn')).join('');
+  const bar = $('#tabbar');
+  bar.querySelectorAll('.tab').forEach(n => n.remove());
+  bar.insertAdjacentHTML('afterbegin', items.map(t => btn(t, 'tab')).join(''));
+  hydrateIcons();
+}
+
+function moveIndicator() {
+  const ind = $('#indicator');
+  const active = $('#tabbar .tab.active');
+  if (!active) return;
+  ind.style.width = active.offsetWidth + 'px';
+  ind.style.transform = `translateX(${active.offsetLeft}px)`;
+}
+
+function subtitle() {
+  if (state.tab === 'chats') {
+    if (!state.status?.connected) return 'Telegram не подключён';
+    return state.status.username ? '@' + state.status.username : 'Telegram подключён';
+  }
+  return TAB_SUB[state.tab] || '';
+}
+
+function renderTitle() {
+  const sel = state.tab === 'chats' ? state.selected : null;
+  const av = $('#headAvatar');
+  if (sel) {
+    $('#pageTitle').textContent = sel.name;
+    $('#pageSub').textContent = sel.username ? '@' + sel.username : 'Личный чат';
+    av.hidden = false;
+    av.textContent = initials(sel.name);
+    av.style.setProperty('--h', hueOf(sel.name));
+  } else {
+    av.hidden = true;
+    $('#pageTitle').textContent = TAB_TITLE[state.tab] || 'NEZZX AI';
+    $('#pageSub').textContent = subtitle();
+  }
+  $('#backBtn').hidden = !sel;
+  $('#shell').dataset.mode = sel ? 'chat' : 'list';
+  if (TG?.BackButton) callTG(() => (sel ? TG.BackButton.show() : TG.BackButton.hide()));
+}
+
+function renderTopActions() {
+  $('#topActions').innerHTML = (state.tab === 'chats' || state.tab === 'overview')
+    ? `<button class="icon-btn" data-action="refresh" aria-label="Обновить" title="Обновить">${icon('refresh')}</button>`
+    : '';
+}
+
+function go(tab) {
+  const isAdmin = !!state.session?.is_admin;
+  if (tab === 'admin' && !isAdmin) tab = 'chats';
+  state.tab = tab;
+  $('#shell').dataset.tab = tab;
+  $$('[data-nav]').forEach(b => {
+    const on = b.dataset.nav === tab;
+    b.classList.toggle('active', on);
+    if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+  });
+  $$('.view').forEach(v => v.classList.toggle('active', v.dataset.view === tab));
+  moveIndicator();
+  renderTitle();
+  renderTopActions();
+  if (tab === 'chats') { renderChatList(); renderChatPane(); }
+  else if (tab === 'ai') renderAI();
+  else if (tab === 'overview') renderOverview();
+  else if (tab === 'settings') renderSettings();
+  else if (tab === 'admin') renderAdmin();
+}
+
+function showShell() {
+  $('#login').classList.add('hidden');
+  $('#shell').classList.remove('hidden');
+  buildNav();
+  go(state.tab);
+  loadStatus().then(loadChats);
+  loadAIStats();
+  startPolling();
+}
+
+/* one delegated handler for every [data-nav], [data-goto] and [data-action] */
+document.addEventListener('click', ev => {
+  const nav = ev.target.closest('[data-nav]');
+  if (nav) return go(nav.dataset.nav);
+  const goto = ev.target.closest('[data-goto]');
+  if (goto) return go(goto.dataset.goto);
+  const act = ev.target.closest('[data-action]');
+  if (!act) return;
+  const a = act.dataset.action;
+  if (a === 'logout') logout();
+  else if (a === 'back') closeChat();
+  else if (a === 'refresh') refreshCurrent();
+  else if (a === 'fullscreen') toggleFullscreen();
+});
+
+async function refreshCurrent() {
+  await loadStatus();
+  await loadChats();
+  if (state.tab === 'overview') renderOverview();
+}
+
+async function loadStatus() {
+  try { state.status = await api('/telegram/status'); }
+  catch (e) { state.status = {connected: false, api_configured: false, ai_configured: false, error: e.message}; }
+  return state.status;
+}
+
+async function loadAIStats() {
+  try { state.aiStats = await api('/ai/status'); } catch { state.aiStats = {}; }
+}
+
+function startPolling() {
+  clearInterval(state.pollTimer);
+  state.pollTimer = setInterval(() => { if (state.session && !document.hidden) loadChats(); }, 15000);
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && state.session) loadChats(); });
+window.addEventListener('resize', moveIndicator);
+
+/* ---------- boot ---------- */
+async function boot() {
+  setupTelegram();
+  hydrateIcons();
+  try { state.config = await api('/public/config'); } catch {}
+  try {
+    state.session = await api('/session');
+  } catch {
+    // opened from Telegram: try the signed WebApp data (works for the admin account)
+    if (TG?.initData) {
+      try {
+        await api('/login', {method: 'POST', body: {key: '', password: '', init_data: TG.initData}});
+        state.session = await api('/session');
+      } catch {}
+    }
+  }
+  if (state.session) showShell(); else showLogin();
+}
+
+/* ================================================================
+   VIEWS: chats, conversation, AI, overview, settings, admin
+   ================================================================ */
+const pill = (ok, text) => `<span class="pill${ok ? ' ok' : ''}"><span class="dot"></span>${esc(text)}</span>`;
+const stagger = root => Array.from(root.children).forEach((el, i) => el.style.setProperty('--i', Math.min(i, 12)));
+const modeOptions = sel => Object.keys(MODE_NAMES)
+  .map(k => `<option value="${k}"${k === sel ? ' selected' : ''}>${esc(MODE_NAMES[k])}</option>`).join('');
+
+/* ---------- chat list (personal chats only: the server already drops groups) ---------- */
+async function loadChats() {
+  try {
+    const d = await api('/telegram/chats');
+    state.chats = (d.items || []).filter(c => c.is_user !== false);
+    state.chatStats = {
+      count: d.count ?? state.chats.length,
+      unread_count: d.unread_count ?? 0,
+      ai_active_count: d.ai_active_count ?? 0,
+    };
+    if (state.selected) {
+      const fresh = state.chats.find(c => c.id === state.selected.id);
+      if (fresh) state.selected = fresh;
+      else { state.selected = null; state.messages = []; renderTitle(); renderChatPane(); }
+    }
+    renderChatList();
+    renderTitle();
+    if (state.selected) await loadMessages(true);
+  } catch (e) {
+    state.chats = [];
+    renderChatList(e.message);
+    if (state.status?.connected) toast(e.message);
+  }
+}
+
+function renderChatList(errorMsg = '') {
+  const list = $('#chatList');
+  const hasTg = !!state.status?.connected;
+  if (errorMsg) {
+    list.innerHTML = emptyBox('Чаты не загрузились', errorMsg,
+      hasTg ? '' : '<button class="btn primary sm" data-goto="settings">Подключить Telegram</button>');
+    return;
+  }
+  const q = $('#chatSearch').value.trim().toLowerCase();
+  const sort = $('#chatSort').value;
+  let items = state.chats.filter(c =>
+    `${c.name} ${c.username || ''} ${c.last_message_text || ''}`.toLowerCase().includes(q));
+  if (sort === 'unread') items.sort((a, b) => b.unread_count - a.unread_count);
+  else if (sort === 'ai') items = items.filter(c => c.ai_enabled);
+  else items.sort((a, b) => (b.last_message_date || '').localeCompare(a.last_message_date || ''));
+
+  $('#chatCount').textContent = state.chats.length ? `${state.chats.length} личных` : 'Личные чаты';
+
+  if (!items.length) {
+    list.innerHTML = state.chats.length
+      ? emptyBox('Ничего не найдено', 'Попробуйте другое имя или смените фильтр.')
+      : hasTg
+        ? emptyBox('Личных чатов пока нет', 'Здесь появятся диалоги с людьми. Группы сюда не попадают.')
+        : emptyBox('Telegram не подключён', 'Подключите аккаунт в настройках, и личные чаты появятся здесь.',
+            '<button class="btn primary sm" data-goto="settings">Подключить Telegram</button>');
+    return;
+  }
+
+  const first = !state.listAnimated;
+  list.classList.toggle('list-rise', first);
+  if (first) {
+    state.listAnimated = true;
+    setTimeout(() => list.classList.remove('list-rise'), 1300);
+  }
+  list.innerHTML = items.map((c, i) => `
+    <button class="chat-row${state.selected?.id === c.id ? ' selected' : ''}" data-chat="${esc(c.id)}" style="--i:${Math.min(i, 14)}">
+      <span class="avatar" style="--h:${hueOf(c.name)}">${esc(initials(c.name))}</span>
+      <span class="chat-main">
+        <span class="chat-top"><span class="name">${esc(c.name)}</span><time>${esc(fmtTime(c.last_message_date))}</time></span>
+        <span class="chat-bottom">
+          <span class="preview">${esc(c.last_message_text || 'Нет сообщений')}</span>
+          ${c.ai_enabled ? '<span class="ai-badge" title="AI включён в этом чате">AI</span>' : ''}
+          ${c.unread_count ? `<span class="unread">${c.unread_count}</span>` : ''}
+        </span>
+      </span>
+    </button>`).join('');
+}
+
+$('#chatList').addEventListener('click', ev => {
+  const row = ev.target.closest('[data-chat]');
+  if (row) openChat(row.dataset.chat);
+});
+$('#chatSearch').addEventListener('input', () => renderChatList());
+$('#chatSort').addEventListener('change', () => renderChatList());
+
+/* ---------- conversation ---------- */
+async function openChat(id) {
+  const chat = state.chats.find(c => c.id === String(id));
+  if (!chat) return;
+  state.selected = chat;
+  state.chatAI = {enabled: !!chat.ai_enabled, mode: chat.ai_mode || 'friendly'};
+  state.messages = [];
+  renderChatList();
+  renderTitle();
+  renderChatPane();
+  await loadMessages(false);
+}
+
+function closeChat() {
+  state.selected = null;
+  state.messages = [];
+  renderChatList();
+  renderTitle();
+  renderChatPane();
+}
+
+function renderChatPane() {
+  const pane = $('#chatPane');
+  const c = state.selected;
+  if (!c) {
+    pane.innerHTML = emptyBox('Выберите чат',
+      'Откройте диалог слева, чтобы читать переписку, отвечать и включать AI.',
+      state.status?.connected ? '' : '<button class="btn primary sm" data-goto="settings">Подключить Telegram</button>');
+    return;
+  }
+  pane.innerHTML = `
+    <div class="chat-tools">
+      <button class="switch" id="aiToggle" role="switch" aria-checked="false" aria-label="AI-ответы в этом чате"><span></span></button>
+      <div class="tools-text"><b>AI-ответы</b><span id="aiState"></span></div>
+      <select id="chatMode" class="select" aria-label="Режим ИИ">${modeOptions(state.chatAI.mode)}</select>
+      <button class="btn sm" id="draftBtn" type="button">${icon('spark')}Предложить ответ</button>
+    </div>
+    <div id="messages" class="messages">
+      <div class="skel"></div>
+      <div class="skel" style="width:70%;margin-left:auto"></div>
+    </div>
+    <form class="composer glass" id="sendForm">
+      <textarea id="messageText" rows="1" maxlength="4000" placeholder="Написать сообщение" aria-label="Текст сообщения"></textarea>
+      <button class="send" type="submit" aria-label="Отправить">${icon('send')}</button>
+    </form>`;
+  const form = $('#sendForm');
+  const ta = $('#messageText');
+  $('#aiToggle').addEventListener('click', () => saveAI(!state.chatAI.enabled, $('#chatMode').value));
+  $('#chatMode').addEventListener('change', e => saveAI(state.chatAI.enabled, e.target.value));
+  $('#draftBtn').addEventListener('click', makeDraft);
+  form.addEventListener('submit', sendMessage);
+  ta.addEventListener('input', autoGrow);
+  ta.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && matchMedia('(min-width:900px)').matches) {
+      e.preventDefault();
+      form.requestSubmit();
+    }
+  });
+  renderChatTools();
+}
+
+function renderChatTools() {
+  const sw = $('#aiToggle');
+  if (!sw) return;
+  const on = !!state.chatAI.enabled;
+  sw.classList.toggle('on', on);
+  sw.setAttribute('aria-checked', String(on));
+  $('#aiState').textContent = on ? 'Включены в этом чате' : 'Выключены';
+  const sel = $('#chatMode');
+  if (sel && sel.value !== state.chatAI.mode) sel.value = state.chatAI.mode;
+}
+
+function autoGrow(ev) {
+  const t = ev.target;
+  t.style.height = 'auto';
+  t.style.height = Math.min(t.scrollHeight, 140) + 'px';
+}
+
+async function loadMessages(silent) {
+  const chat = state.selected;
+  if (!chat) return;
+  try {
+    const d = await api(`/telegram/chats/${encodeURIComponent(chat.id)}/messages?limit=80`);
+    if (!state.selected || state.selected.id !== chat.id) return;
+    state.messages = d.items || [];
+    state.chatAI = d.ai || state.chatAI;
+    renderChatTools();
+    renderMessages(silent);
+  } catch (e) {
+    if (!silent) toast(e.message);
+    const box = $('#messages');
+    if (box && !silent && !state.messages.length) box.innerHTML = emptyBox('Переписка не открылась', e.message);
+  }
+}
+
+function renderMessages(silent) {
+  const box = $('#messages');
+  if (!box) return;
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 140;
+  if (!state.messages.length) {
+    box.innerHTML = '<div class="empty-inline">В этой переписке пока нет сообщений.</div>';
+    return;
+  }
+  const other = state.selected?.name || 'Собеседник';
+  let lastDay = '';
+  let html = '';
+  state.messages.forEach((m, i) => {
+    const key = dayKey(m.timestamp);
+    if (key && key !== lastDay) {
+      html += `<div class="day">${esc(dayLabel(m.timestamp))}</div>`;
+      lastDay = key;
+    }
+    const who = m.author || (m.is_out ? 'Вы' : other);
+    html += `
+      <div class="msg ${m.is_out ? 'out' : 'in'}${silent ? '' : ' anim'}" style="--i:${Math.min(i, 10)}">
+        ${m.is_out ? '' : `<span class="avatar xs" style="--h:${hueOf(who)}">${esc(initials(who))}</span>`}
+        <div class="bubble-wrap">
+          <div class="bubble">${esc(m.text)}</div>
+          <div class="meta">${esc(who)} · ${esc(fmtTime(m.timestamp))}</div>
+        </div>
+      </div>`;
+  });
+  box.innerHTML = html;
+  if (!silent || nearBottom) box.scrollTop = box.scrollHeight;
+}
+
+async function saveAI(enabled, mode) {
+  const chat = state.selected;
+  if (!chat) return;
+  try {
+    const d = await api(`/telegram/chats/${encodeURIComponent(chat.id)}/ai`, {method: 'PUT', body: {enabled, mode}});
+    state.chatAI = {enabled: !!d.enabled, mode: d.mode || mode};
+    chat.ai_enabled = state.chatAI.enabled;
+    chat.ai_mode = state.chatAI.mode;
+    renderChatTools();
+    renderChatList();
+    toast(state.chatAI.enabled ? 'AI-ответы включены для этого чата' : 'AI-ответы выключены');
+  } catch (e) {
+    toast(e.message);
+    renderChatTools();
+  }
+}
+
+async function makeDraft() {
+  const chat = state.selected;
+  if (!chat) return;
+  const btn = $('#draftBtn');
+  btn.disabled = true;
+  btn.textContent = 'Думаю…';
+  try {
+    const d = await api('/ai/draft', {method: 'POST', body: {chat_id: chat.id, mode: $('#chatMode').value}});
+    const ta = $('#messageText');
+    ta.value = d.draft;
+    autoGrow({target: ta});
+    ta.focus();
+    toast('Черновик готов. Проверьте текст и отправьте его сами');
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = icon('spark') + 'Предложить ответ';
+  }
+}
+
+async function sendMessage(ev) {
+  ev.preventDefault();
+  const chat = state.selected;
+  const input = $('#messageText');
+  const text = input.value.trim();
+  if (!chat || !text) return;
+  const btn = ev.submitter || ev.target.querySelector('button[type="submit"]');
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/telegram/chats/${encodeURIComponent(chat.id)}/send`, {method: 'POST', body: {text}});
+    input.value = '';
+    autoGrow({target: input});
+    await loadMessages(false);
+    await loadChats();
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+    input.focus();
+  }
+}
+
+/* ---------- AI ---------- */
+function renderAI(fromRefresh) {
+  const page = $('#aiPage');
+  const d = state.aiStats || {};
+  page.innerHTML = `
+    <div class="stats">
+      <div class="stat">
+        <div class="k" style="font:600 15px/1.3 var(--f-body);letter-spacing:0;overflow-wrap:anywhere">${esc(d.model || 'gemini-2.5-flash')}</div>
+        <div class="l">${d.configured ? 'API подключён' : 'Добавьте GEMINI_API_KEY'}</div>
+      </div>
+      <div class="stat"><div class="k">${d.today?.auto_sent || 0}</div><div class="l">Автоответов за 24 ч</div></div>
+      <div class="stat"><div class="k">${d.today?.drafts || 0}</div><div class="l">Черновиков за 24 ч</div></div>
+      <div class="stat"><div class="k">${d.today?.total || 0}</div><div class="l">Операций всего</div></div>
+    </div>
+    <div class="mode-list">
+      ${Object.keys(MODE_NAMES).map(k => `
+        <article class="mode">
+          <span class="tag">${esc(MODE_TAG[k])}</span>
+          <div><h3>${esc(MODE_NAMES[k])}</h3><p>${esc(MODE_DESC[k])}</p></div>
+        </article>`).join('')}
+    </div>
+    <section class="card">
+      <h2>Как это работает</h2>
+      <p class="lead">Автоответ включается отдельно в каждом чате и срабатывает только после входящего сообщения. ИИ не пишет первым и не делает рассылок. Черновик можно проверить и поправить перед отправкой.</p>
+      <p class="lead" style="margin:0">ИИ не выдумывает цены и гарантии и не просит пароли или коды входа.</p>
+      <div class="btn-row" style="margin-top:14px">
+        <button class="btn primary" data-nav="chats">Выбрать чат</button>
+        <button class="btn" data-nav="settings">Проверить API</button>
+      </div>
+    </section>`;
+  stagger(page);
+  if (!fromRefresh) {
+    const before = JSON.stringify(state.aiStats);
+    loadAIStats().then(() => {
+      if (state.tab === 'ai' && JSON.stringify(state.aiStats) !== before) renderAI(true);
+    });
+  }
+}
+
+/* ---------- overview ---------- */
+function renderOverview() {
+  const page = $('#overviewPage');
+  const st = state.status || {};
+  const ai = state.aiStats || {};
+  const s = state.chatStats || {};
+  page.innerHTML = `
+    <div class="stats">
+      <div class="stat"><div class="k">${s.count || 0}</div><div class="l">Личных чатов</div></div>
+      <div class="stat"><div class="k">${s.unread_count || 0}</div><div class="l">Непрочитанных</div></div>
+      <div class="stat"><div class="k">${s.ai_active_count || 0}</div><div class="l">С включённым AI</div></div>
+      <div class="stat"><div class="k">${ai.today?.auto_sent || 0}</div><div class="l">Автоответов за 24 ч</div></div>
+    </div>
+    <section class="card">
+      <h2>Подключения</h2>
+      <div class="kv"><span>Telegram-аккаунт</span>${pill(st.connected, st.connected ? 'Подключён' : 'Не подключён')}</div>
+      <div class="kv"><span>Gemini API</span>${pill(st.ai_configured, st.ai_configured ? 'Готов' : 'Нужен ключ')}</div>
+      <div class="kv"><span>Модель</span><b>${esc(ai.model || 'gemini-2.5-flash')}</b></div>
+    </section>
+    <section class="card">
+      <h2>Быстрый старт</h2>
+      <p class="lead">Подключите Telegram по номеру, откройте диалог и отметьте, где AI может отвечать. Первое сообщение всегда отправляете вы.</p>
+      <div class="btn-row">
+        <button class="btn primary" data-nav="chats">Открыть чаты</button>
+        <button class="btn" data-nav="settings">Настройки</button>
+      </div>
+    </section>`;
+  stagger(page);
+}
+
+/* ---------- settings ---------- */
+function renderSettings() {
+  const page = $('#settingsPage');
+  const s = state.session || {};
+  const expires = s.forever ? 'Без срока'
+    : s.expires_at ? new Date(s.expires_at * 1000).toLocaleString('ru-RU', {day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit'})
+    : '—';
+  page.innerHTML = `
+    <section class="card" id="tgCard"><h2>Telegram-аккаунт</h2><div class="skel"></div></section>
+    <section class="card" id="aiCard"><h2>Google Gemini</h2><div class="skel"></div></section>
+    <section class="card">
+      <h2>Доступ</h2>
+      <div class="kv"><span>Тариф</span><b>${esc(s.plan_title || 'Ключ доступа')}</b></div>
+      <div class="kv"><span>Действует до</span><b>${esc(expires)}</b></div>
+      <div class="kv"><span>Версия</span><b>${esc(s.version || '6.0.0')}</b></div>
+      <div class="btn-row" style="margin-top:14px">
+        ${state.config?.telegram_bot_url ? `<a class="btn" href="${esc(state.config.telegram_bot_url)}" target="_blank" rel="noopener">Открыть бота</a>` : ''}
+        <button class="btn" data-action="fullscreen">${icon('expand')}Во весь экран</button>
+        <button class="btn danger" data-action="logout">Выйти</button>
+      </div>
+    </section>`;
+  stagger(page);
+  loadStatus().then(st => {
+    if (state.tab !== 'settings') return;
+    renderTelegramCard(st);
+    renderAICard(st);
+  });
+}
+
+function renderTelegramCard(st) {
+  const card = $('#tgCard');
+  const on = !!st.connected;
+  const who = st.username ? '@' + st.username : (st.phone || 'Аккаунт');
+  card.innerHTML = `
+    <h2>Telegram-аккаунт</h2>
+    <div class="kv"><span>${on ? esc(who) : 'Аккаунт не подключён'}</span>${pill(on, on ? 'Подключён' : 'Отключён')}</div>
+    ${on ? `
+      <p class="hint" style="margin:12px 0">Сессия хранится на сервере в зашифрованном виде. Код и пароль 2FA не сохраняются.</p>
+      <button class="btn danger block" id="tgDisconnect" type="button">Отключить аккаунт</button>`
+    : `
+      <p class="lead" style="margin:12px 0">Вход по номеру через официальный Telegram MTProto. Код придёт в приложение Telegram.</p>
+      ${st.api_configured ? '' : '<p class="error" style="margin:0 0 12px">Не заданы TELEGRAM_API_ID и TELEGRAM_API_HASH в Render → Environment.</p>'}
+      <form id="phoneForm" class="stack">
+        <label class="field"><span>Номер с кодом страны</span>
+          <input class="input" id="phone" inputmode="tel" autocomplete="tel" placeholder="+374…" required></label>
+        <div class="error" id="tgError"></div>
+        <button class="btn primary block" id="phoneSubmit" type="submit">Отправить код</button>
+      </form>
+      <form id="codeForm" class="stack" hidden>
+        <label class="field"><span>Код из Telegram</span>
+          <input class="input" id="tgCode" autocomplete="one-time-code" inputmode="numeric" placeholder="Код из Telegram" required></label>
+        <div class="error" id="codeError"></div>
+        <button class="btn primary block" type="submit" id="codeSubmit">Подтвердить код</button>
+      </form>
+      <form id="passwordForm" class="stack" hidden>
+        <label class="field"><span>Пароль двухэтапной проверки</span>
+          <input class="input" type="password" id="tgPassword" autocomplete="current-password" required></label>
+        <p class="hint" style="margin:0">Пароль нужен только для входа и нигде не сохраняется.</p>
+        <div class="error" id="passwordError"></div>
+        <button class="btn primary block" type="submit" id="passwordSubmit">Войти в Telegram</button>
+      </form>`}`;
+  bindTelegramForms();
+}
+
+function renderAICard(st) {
+  $('#aiCard').innerHTML = `
+    <h2>Google Gemini</h2>
+    <div class="kv"><span>Подключение</span>${pill(st.ai_configured, st.ai_configured ? 'Подключено' : 'Не настроено')}</div>
+    <p class="hint" style="margin:12px 0 0">Ключ GEMINI_API_KEY задаётся в Render → Environment, модель меняется через GEMINI_MODEL. Ключ никогда не попадает в браузер.</p>`;
+}
+
+function bindTelegramForms() {
+  const pf = $('#phoneForm');
+  if (pf) pf.addEventListener('submit', async e => {
+    e.preventDefault();
+    const b = $('#phoneSubmit');
+    b.disabled = true;
+    $('#tgError').textContent = '';
+    try {
+      await api('/telegram/login/start', {method: 'POST', body: {phone: $('#phone').value.trim()}});
+      $('#codeForm').hidden = false;
+      $('#tgCode').focus();
+      toast('Код отправлен в Telegram');
+    } catch (err) {
+      $('#tgError').textContent = err.message;
+    } finally {
+      b.disabled = false;
+    }
+  });
+
+  const cf = $('#codeForm');
+  if (cf) cf.addEventListener('submit', async e => {
+    e.preventDefault();
+    const b = $('#codeSubmit');
+    b.disabled = true;
+    $('#codeError').textContent = '';
+    try {
+      const d = await api('/telegram/login/complete', {method: 'POST', body: {code: $('#tgCode').value.trim()}});
+      if (d.needs_password) {
+        $('#passwordForm').hidden = false;
+        $('#tgPassword').focus();
+      } else {
+        await afterTelegramConnect();
+      }
+    } catch (err) {
+      $('#codeError').textContent = err.message;
+    } finally {
+      b.disabled = false;
+    }
+  });
+
+  const pw = $('#passwordForm');
+  if (pw) pw.addEventListener('submit', async e => {
+    e.preventDefault();
+    const b = $('#passwordSubmit');
+    b.disabled = true;
+    $('#passwordError').textContent = '';
+    try {
+      await api('/telegram/login/password', {method: 'POST', body: {password: $('#tgPassword').value}});
+      $('#tgPassword').value = '';
+      await afterTelegramConnect();
+    } catch (err) {
+      $('#passwordError').textContent = err.message;
+    } finally {
+      b.disabled = false;
+    }
+  });
+
+  const disc = $('#tgDisconnect');
+  if (disc) disc.addEventListener('click', async () => {
+    if (!confirm('Отключить Telegram и удалить сохранённую серверную сессию?')) return;
+    try {
+      await api('/telegram/logout', {method: 'POST'});
+      state.selected = null;
+      state.messages = [];
+      await loadStatus();
+      toast('Telegram отключён');
+      renderSettings();
+      loadChats();
+    } catch (err) {
+      toast(err.message);
+    }
+  });
+}
+
+async function afterTelegramConnect() {
+  await loadStatus();
+  await loadChats();
+  toast('Telegram подключён');
+  go('chats');
+}
+
+/* ---------- admin ---------- */
+function renderAdmin() {
+  if (!state.session?.is_admin) { go('chats'); return; }
+  const page = $('#adminPage');
+  page.innerHTML = `
+    <section class="card keygen">
+      <h2 style="margin:0">Создать ключ</h2>
+      <select id="admDuration" class="select" aria-label="Срок действия" style="width:100%">
+        <option value="1h">1 час</option><option value="6h">6 часов</option><option value="12h">12 часов</option>
+        <option value="24h" selected>1 день</option><option value="36h">1,5 дня</option><option value="3d">3 дня</option>
+        <option value="7d">7 дней</option><option value="30d">30 дней</option><option value="forever">Навсегда</option>
+      </select>
+      <div class="row">
+        <input id="admTg" class="input grow" inputmode="numeric" placeholder="Telegram ID (необязательно)">
+        <button id="admCreate" class="btn primary" type="button">Создать</button>
+      </div>
+      <div id="admOut" class="keygen-out"></div>
+    </section>
+    <section class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <h2 style="margin:0">Последние ключи</h2>
+        <button class="btn sm" id="admRefresh" type="button">${icon('refresh')}Обновить</button>
+      </div>
+      <div id="adminKeys" class="stack"><div class="skel"></div><div class="skel"></div></div>
+    </section>`;
+  stagger(page);
+  $('#admCreate').addEventListener('click', createKey);
+  $('#admRefresh').addEventListener('click', loadAdminKeys);
+  loadAdminKeys();
+}
+
+async function createKey() {
+  const btn = $('#admCreate');
+  btn.disabled = true;
+  try {
+    const d = await api('/admin/licenses', {method: 'POST', body: {
+      duration: $('#admDuration').value,
+      telegram_user_id: Number($('#admTg').value || 0),
+    }});
+    $('#admOut').innerHTML = `Новый ключ: <code>${esc(d.key)}</code> <button class="btn sm" id="admCopy" type="button">Копировать</button>`;
+    $('#admCopy').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(d.key); toast('Ключ скопирован'); }
+      catch { toast('Не удалось скопировать. Выделите ключ вручную'); }
+    });
+    loadAdminKeys();
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function loadAdminKeys() {
+  const box = $('#adminKeys');
+  if (!box) return;
+  try {
+    const d = await api('/admin/licenses');
+    const items = (d.items || []).slice(0, 50);
+    box.innerHTML = items.length
+      ? items.map(k => `
+          <div class="key-row">
+            <div style="min-width:0"><code>${esc(k.key)}</code>
+              <small>${esc(k.plan_id)} · ${k.active ? 'активен' : k.revoked ? 'отозван' : 'истёк'}</small></div>
+            ${k.active ? `<button class="btn danger sm" data-revoke="${esc(k.key)}" type="button">Отозвать</button>` : ''}
+          </div>`).join('')
+      : emptyBox('Ключей пока нет', 'Создайте первый ключ выше.');
+    box.querySelectorAll('[data-revoke]').forEach(b => b.addEventListener('click', async () => {
+      if (!confirm('Отозвать этот ключ?')) return;
+      try {
+        await api('/admin/licenses/revoke', {method: 'POST', body: {key: b.dataset.revoke}});
+        loadAdminKeys();
+      } catch (e) { toast(e.message); }
+    }));
+  } catch (e) {
+    box.innerHTML = `<p class="error">${esc(e.message)}</p>`;
+  }
+}
+
 boot();
-</script></body></html>'''
+
+</script>
+</body>
+</html>
+'''
 
 
 if __name__ == "__main__":
