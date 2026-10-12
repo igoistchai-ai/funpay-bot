@@ -260,6 +260,12 @@ def init_db() -> None:
             session_enc TEXT NOT NULL,
             updated_at INTEGER NOT NULL
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS tg_blocked (
+            owner TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(owner, chat_id)
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS ai_chat_settings (
             owner TEXT NOT NULL,
             chat_id TEXT NOT NULL,
@@ -2043,6 +2049,17 @@ def _ai_settings_map(owner: str) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _blocked_set(owner: str) -> set[str]:
+    init_db()
+    with db() as conn:
+        rows = conn.execute("SELECT chat_id FROM tg_blocked WHERE owner=?", (owner,)).fetchall()
+    return {str(row["chat_id"]) for row in rows}
+
+
+class ChatBlockBody(BaseModel):
+    blocked: bool = True
+
+
 @app.get("/api/telegram/chats")
 async def telegram_chats(fresh: int = 0, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
     cached = CHATS_CACHE.get(session.owner)
@@ -2050,6 +2067,7 @@ async def telegram_chats(fresh: int = 0, session: SessionInfo = Depends(get_sess
         return cached[1]
     client = await _tg_client_for(session.owner)
     flags = _ai_settings_map(session.owner)
+    blocked_ids = _blocked_set(session.owner)
     rows = []
     async for dialog in client.iter_dialogs(limit=300):
         if not dialog.is_user:  # personal chats only: groups, channels and supergroups are skipped
@@ -2063,7 +2081,7 @@ async def telegram_chats(fresh: int = 0, session: SessionInfo = Depends(get_sess
                      "last_message_text": (getattr(last, "message", "") or ("[Медиа]" if getattr(last, "media", None) else ""))[:300] if last else "",
                      "last_message_date": last.date.isoformat() if last and last.date else "",
                      "is_user": bool(getattr(entity, "bot", None) is not None or hasattr(entity, "first_name")),
-                     "ai_enabled": settings["enabled"], "ai_mode": settings["mode"]})
+                     "ai_enabled": settings["enabled"], "ai_mode": settings["mode"], "blocked": str(dialog.id) in blocked_ids})
     payload = {"items": rows, "count": len(rows), "unread_count": sum(x["unread_count"] for x in rows),
                "ai_active_count": sum(1 for x in rows if x["ai_enabled"])}
     CHATS_CACHE[session.owner] = (time.monotonic(), payload)
@@ -2163,6 +2181,40 @@ async def telegram_send_voice(chat_id: str, request: Request, session: SessionIn
     CHATS_CACHE.pop(session.owner, None)
     _sse_publish(session.owner, {"type": "message", "chat_id": str(chat_id), "message": _tg_message_item(message, "Вы", chat_id)})
     return {"ok": True, "id": message.id, "ogg": ogg is not None}
+
+
+@app.delete("/api/telegram/chats/{chat_id}")
+async def telegram_delete_chat(chat_id: str, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    client = await _tg_client_for(session.owner)
+    try:
+        entity = await client.get_entity(int(chat_id))
+        await client.delete_dialog(entity)
+    except Exception as exc:
+        log.warning("Telegram delete chat failed (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Не удалось удалить чат в Telegram.") from exc
+    CHATS_CACHE.pop(session.owner, None)
+    return {"ok": True}
+
+
+@app.post("/api/telegram/chats/{chat_id}/block")
+async def telegram_block_chat(chat_id: str, payload: ChatBlockBody, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    from telethon.tl.functions.contacts import BlockRequest, UnblockRequest
+    client = await _tg_client_for(session.owner)
+    try:
+        peer = await client.get_input_entity(int(chat_id))
+        await client((BlockRequest if payload.blocked else UnblockRequest)(id=peer))
+    except Exception as exc:
+        log.warning("Telegram block change failed (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Не удалось изменить блокировку в Telegram.") from exc
+    init_db()
+    with db() as conn:
+        if payload.blocked:
+            conn.execute("INSERT OR IGNORE INTO tg_blocked(owner,chat_id,updated_at) VALUES(?,?,?)",
+                         (session.owner, str(chat_id), now_ts()))
+        else:
+            conn.execute("DELETE FROM tg_blocked WHERE owner=? AND chat_id=?", (session.owner, str(chat_id)))
+    CHATS_CACHE.pop(session.owner, None)
+    return {"ok": True, "blocked": payload.blocked}
 
 
 @app.put("/api/telegram/chats/{chat_id}/ai")
@@ -3719,6 +3771,15 @@ textarea{resize:none}
 .chat-row:hover{background:rgba(255,255,255,.06)}
 .chat-row:active{transform:scale(.985)}
 .chat-row.selected{background:rgba(255,179,107,.14);border-color:rgba(255,179,107,.3)}
+.chat-item{display:flex;align-items:center;gap:6px}
+.chat-item > .chat-row{flex:1;min-width:0}
+.chat-acts{display:flex;flex-direction:column;gap:5px;flex:none}
+.chat-act{width:30px;height:30px;border-radius:10px;display:grid;place-items:center;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);color:var(--muted);transition:background .2s var(--ease),color .2s var(--ease),transform .2s var(--spring)}
+.chat-act svg.i{width:15px;height:15px}
+.chat-act:hover{color:var(--ink);background:rgba(255,255,255,.1)}
+.chat-act:active{transform:scale(.9)}
+.chat-act.del:hover{color:#ff8b8b;background:rgba(255,80,80,.12);border-color:rgba(255,80,80,.3)}
+.chat-act.blk.on{color:#ffb36b;background:rgba(255,179,107,.12);border-color:rgba(255,179,107,.3)}
 .chat-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
 .chat-top,.chat-bottom{display:flex;align-items:center;gap:8px;min-width:0}
 .chat-top .name{flex:1;min-width:0;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -3822,6 +3883,14 @@ button.media{padding:0;border:0;font:inherit;color:inherit;cursor:zoom-in}
 .voice-opt small{color:var(--faint);font-size:11px}
 .voice-range{width:100%;margin-top:10px}
 .voice-range-row{display:flex;justify-content:space-between;font-size:11px;color:var(--faint);margin-top:4px}
+.voice-chip{display:flex;align-items:center;gap:10px;margin:0 10px 8px;padding:8px 10px 8px 8px;border-radius:18px;flex:none}
+.voice-chip[hidden]{display:none}
+.vc-play{width:36px;height:36px;border-radius:50%;flex:none;display:grid;place-items:center;background:linear-gradient(160deg,var(--accent-hi),var(--accent));color:var(--accent-ink)}
+.vc-bar{flex:1;height:4px;border-radius:4px;background:rgba(255,255,255,.12);overflow:hidden}
+.vc-bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .15s linear}
+.vc-time{font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums;min-width:38px;text-align:right}
+.vc-del{width:30px;height:30px;border-radius:50%;flex:none;display:grid;place-items:center;color:var(--muted);background:transparent;border:0}
+.vc-del:hover{color:#ff8b8b;background:rgba(255,80,80,.12)}
 
 /* ---------- empty + loading states ---------- */
 .empty{margin:auto;max-width:320px;padding:28px 18px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:10px}
@@ -4263,6 +4332,7 @@ const ICON = {
   mic:     '<rect x="9" y="3.5" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/>',
   stop:    '<rect x="6.5" y="6.5" width="11" height="11" rx="2.5" fill="currentColor" stroke="none"/>',
   wave:    '<path d="M3.5 12h2M7.5 8.5v7M11.5 5v14M15.5 8.5v7M19.5 10.5v3"/>',
+  lock:    '<rect x="5" y="10.5" width="14" height="10" rx="2.6"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5"/>',
 };
 const icon = name => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICON[name] || ''}</svg>`;
 const hydrateIcons = () => $$('[data-icon]').forEach(el => { el.innerHTML = icon(el.dataset.icon); });
@@ -5839,7 +5909,7 @@ function renderChatList(errorMsg = '') {
 
   // unchanged list: no DOM work at all (the live stream and the polling both call this often)
   const sig = JSON.stringify([q, sort, state.selected?.id || '',
-    items.map(c => [c.id, c.name, c.last_message_text, c.last_message_date, c.unread_count, c.ai_enabled])]);
+    items.map(c => [c.id, c.name, c.last_message_text, c.last_message_date, c.unread_count, c.ai_enabled, !!c.blocked])]);
   if (list.dataset.sig === sig) return;
   list.dataset.sig = sig;
 
@@ -5850,27 +5920,70 @@ function renderChatList(errorMsg = '') {
     setTimeout(() => list.classList.remove('list-rise'), 1300);
   }
   list.innerHTML = items.map((c, i) => `
-    <button class="chat-row${state.selected?.id === c.id ? ' selected' : ''}${LIVE.fresh.has(c.id) ? ' fresh' : ''}" data-chat="${esc(c.id)}" style="--i:${Math.min(i, 14)}">
-      ${avatarHTML(c)}
-      <span class="chat-main">
-        <span class="chat-top"><span class="name">${esc(c.name)}</span><time>${esc(fmtTime(c.last_message_date))}</time></span>
-        <span class="chat-bottom">
-          <span class="preview">${esc(c.last_message_text || 'Нет сообщений')}</span>
-          ${c.ai_enabled ? '<span class="ai-badge" title="AI включён в этом чате">AI</span>' : ''}
-          ${c.unread_count ? `<span class="unread">${c.unread_count}</span>` : ''}
+    <div class="chat-item" style="--i:${Math.min(i, 14)}">
+      <button class="chat-row${state.selected?.id === c.id ? ' selected' : ''}${LIVE.fresh.has(c.id) ? ' fresh' : ''}" data-chat="${esc(c.id)}">
+        ${avatarHTML(c)}
+        <span class="chat-main">
+          <span class="chat-top"><span class="name">${esc(c.name)}</span><time>${esc(fmtTime(c.last_message_date))}</time></span>
+          <span class="chat-bottom">
+            <span class="preview">${esc(c.last_message_text || 'Нет сообщений')}</span>
+            ${c.ai_enabled ? '<span class="ai-badge" title="AI включён в этом чате">AI</span>' : ''}
+            ${c.unread_count ? `<span class="unread">${c.unread_count}</span>` : ''}
+          </span>
         </span>
-      </span>
-    </button>`).join('');
+      </button>
+      <div class="chat-acts">
+        <button class="chat-act blk${c.blocked ? ' on' : ''}" data-act="block" data-chat="${esc(c.id)}" title="${c.blocked ? 'Разблокировать' : 'Заблокировать'}" aria-label="${c.blocked ? 'Разблокировать' : 'Заблокировать'}">${icon('lock')}</button>
+        <button class="chat-act del" data-act="delete" data-chat="${esc(c.id)}" title="Удалить чат" aria-label="Удалить чат">${icon('trash')}</button>
+      </div>
+    </div>`).join('');
 }
 
 $('#chatList').addEventListener('click', ev => {
-  const row = ev.target.closest('[data-chat]');
+  const act = ev.target.closest('[data-act]');
+  if (act) {
+    ev.stopPropagation();
+    SFX.tap();
+    chatAction(act.dataset.chat, act.dataset.act);
+    return;
+  }
+  const row = ev.target.closest('.chat-row[data-chat]');
   if (row) {
     SFX.open();
     haptic('light');
     openChat(row.dataset.chat);
   }
 });
+
+async function chatAction(id, act) {
+  const chat = state.chats.find(c => c.id === String(id));
+  if (!chat) return;
+  if (act === 'delete') {
+    if (!confirm(`Удалить чат с «${chat.name}»? Переписка удалится у вас в Telegram.`)) return;
+    try {
+      await api(`/telegram/chats/${encodeURIComponent(chat.id)}`, {method: 'DELETE'});
+      state.chats = state.chats.filter(c => c.id !== chat.id);
+      if (state.selected?.id === chat.id) closeChat();
+      renderChatList();
+      toast('Чат удалён', 'ok');
+    } catch (e) {
+      toast(e.message, 'bad');
+    }
+    return;
+  }
+  if (act === 'block') {
+    const blocked = !chat.blocked;
+    if (blocked && !confirm(`Заблокировать «${chat.name}» в Telegram?`)) return;
+    try {
+      await api(`/telegram/chats/${encodeURIComponent(chat.id)}/block`, {method: 'POST', body: {blocked}});
+      chat.blocked = blocked;
+      renderChatList();
+      toast(blocked ? 'Пользователь заблокирован' : 'Пользователь разблокирован', 'ok');
+    } catch (e) {
+      toast(e.message, 'bad');
+    }
+  }
+}
 $('#chatSearch').addEventListener('input', () => renderChatList());
 $('#chatSort').addEventListener('change', () => renderChatList());
 
@@ -5917,6 +6030,12 @@ function renderChatPane() {
       <div class="skel" style="width:70%;margin-left:auto"></div>
     </div>
     <div class="attach-chip" id="attachChip" hidden></div>
+    <div class="voice-chip glass" id="voiceChip" hidden>
+      <button class="vc-play" type="button" id="vcPlay" aria-label="Прослушать">${icon('play')}</button>
+      <span class="vc-bar"><i></i></span>
+      <span class="vc-time" id="vcTime">0:00</span>
+      <button class="vc-del" type="button" id="vcDel" aria-label="Удалить запись" title="Удалить запись">${icon('trash')}</button>
+    </div>
     <form class="composer glass" id="sendForm">
       <button class="icon-btn" type="button" id="attachBtn" aria-label="Прикрепить фото" title="Прикрепить фото">${icon('image')}</button>
       <input type="file" id="attachFile" accept="image/*" hidden>
@@ -6196,12 +6315,14 @@ function showVariants(list, language) {
   form.before(box);
 }
 
-/* ---------- voice messages: record, change the voice, send ---------- */
+/* ---------- voice messages: record, clean up the sound, preview, send ---------- */
 const VOICE = {
   mode: localStorage.getItem('nezzx_voice_mode') || 'normal',
   level: Number(localStorage.getItem('nezzx_voice_level')) || 0.5,
-  rec: null, stream: null, chunks: [], timer: null, startedAt: 0, chatId: null, sendAfter: true,
+  rec: null, stream: null, chunks: [], timer: null, startedAt: 0, chatId: null,
+  pending: null,   // {chatId, raw, url, seconds, key, wav:Promise<Blob>, audio}
 };
+const VOICE_MAX_SEC = 60;
 
 function paintVoicePick() {
   const pick = $('#voicePick');
@@ -6227,12 +6348,64 @@ function setVoiceLevel(v) {
   paintVoicePick();
 }
 
+function fmtVoiceTime(s) {
+  return Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+}
+
+function paintVoiceChip() {
+  const chip = $('#voiceChip');
+  if (!chip) return;
+  const p = VOICE.pending;
+  chip.hidden = !p;
+  if (!p) return;
+  const playing = !!(p.audio && !p.audio.paused);
+  const play = $('#vcPlay');
+  if (play) play.innerHTML = icon(playing ? 'pause' : 'play');
+  const t = $('#vcTime');
+  if (t) t.textContent = fmtVoiceTime(p.seconds);
+}
+
+function discardVoicePending() {
+  const p = VOICE.pending;
+  if (!p) return;
+  if (p.audio) p.audio.pause();
+  try { URL.revokeObjectURL(p.url); } catch {}
+  VOICE.pending = null;
+  paintVoiceChip();
+}
+
+function playVoicePending() {
+  const p = VOICE.pending;
+  if (!p) return;
+  if (!p.audio) {
+    p.audio = new Audio(p.url);
+    p.audio.addEventListener('timeupdate', () => {
+      const d = p.audio.duration || p.seconds;
+      const bar = $('#voiceChip .vc-bar i');
+      if (bar) bar.style.width = Math.min(100, (p.audio.currentTime / d) * 100) + '%';
+      const t = $('#vcTime');
+      if (t) t.textContent = fmtVoiceTime(Math.max(0, d - p.audio.currentTime));
+    });
+    p.audio.addEventListener('ended', () => {
+      const bar = $('#voiceChip .vc-bar i');
+      if (bar) bar.style.width = '0%';
+      paintVoiceChip();
+    });
+    p.audio.addEventListener('play', paintVoiceChip);
+    p.audio.addEventListener('pause', paintVoiceChip);
+  }
+  if (p.audio.paused) p.audio.play().catch(() => toast('Не удалось проиграть запись', 'bad'));
+  else p.audio.pause();
+}
+
 function wireVoice() {
   const btn = $('#voiceBtn');
   const pick = $('#voicePick');
   const pop = $('#voicePop');
   if (!btn || !pick || !pop) return;
+  if (VOICE.pending && VOICE.pending.chatId !== state.selected?.id) discardVoicePending();
   paintVoicePick();
+  paintVoiceChip();
   btn.addEventListener('click', toggleVoiceRec);
   pick.addEventListener('click', e => { e.stopPropagation(); pop.classList.toggle('open'); });
   pop.addEventListener('click', e => e.stopPropagation());
@@ -6241,6 +6414,10 @@ function wireVoice() {
     if (VOICE.mode === 'rough') pop.classList.add('open');
   }));
   $('#voiceRange').addEventListener('input', e => setVoiceLevel(e.target.value));
+  const play = $('#vcPlay');
+  const del = $('#vcDel');
+  if (play) play.addEventListener('click', playVoicePending);
+  if (del) del.addEventListener('click', discardVoicePending);
   if (!window.__voicePopBound) {
     window.__voicePopBound = true;
     document.addEventListener('click', () => { const p = $('#voicePop'); if (p) p.classList.remove('open'); });
@@ -6250,26 +6427,29 @@ function wireVoice() {
 function tickVoiceTimer() {
   const s = Math.floor((Date.now() - VOICE.startedAt) / 1000);
   const t = $('#voiceTimer');
-  if (t) t.textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  if (t) t.textContent = fmtVoiceTime(s);
+  if (s >= VOICE_MAX_SEC) stopVoiceRec();
 }
 
 async function toggleVoiceRec() {
-  if (VOICE.rec) { stopVoiceRec(true); return; }
+  if (VOICE.rec) { stopVoiceRec(); return; }
   const chat = state.selected;
   if (!chat) return;
+  if (VOICE.pending) discardVoicePending();
   if (!navigator.mediaDevices || !window.MediaRecorder) {
     toast('Этот браузер не умеет записывать звук', 'bad');
     return;
   }
   try {
-    VOICE.stream = await navigator.mediaDevices.getUserMedia({audio: true});
+    VOICE.stream = await navigator.mediaDevices.getUserMedia({
+      audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true},
+    });
   } catch {
     toast('Нет доступа к микрофону. Разрешите его в браузере', 'bad');
     return;
   }
   VOICE.chatId = chat.id;
   VOICE.chunks = [];
-  VOICE.sendAfter = true;
   const rec = new MediaRecorder(VOICE.stream);
   rec.ondataavailable = e => { if (e.data && e.data.size) VOICE.chunks.push(e.data); };
   rec.onstop = () => finishVoiceRec();
@@ -6285,42 +6465,51 @@ async function toggleVoiceRec() {
   haptic('soft');
 }
 
-function stopVoiceRec(send) {
-  if (!VOICE.rec) return;
-  VOICE.sendAfter = send;
-  VOICE.rec.stop();
+function stopVoiceRec() {
+  if (VOICE.rec) VOICE.rec.stop();
 }
 
-async function finishVoiceRec() {
-  const send = VOICE.sendAfter !== false;
+// stop = the recording shows up at once as a preview; the clean-up runs in the background
+function finishVoiceRec() {
   clearInterval(VOICE.timer);
   VOICE.timer = null;
   const chunks = VOICE.chunks;
   const chatId = VOICE.chatId;
   const seconds = Math.max(1, Math.round((Date.now() - VOICE.startedAt) / 1000));
   if (VOICE.stream) VOICE.stream.getTracks().forEach(t => t.stop());
-  VOICE.rec = null; VOICE.stream = null; VOICE.chunks = []; VOICE.sendAfter = true;
+  VOICE.rec = null;
+  VOICE.stream = null;
+  VOICE.chunks = [];
   const btn = $('#voiceBtn');
   if (btn) { btn.classList.remove('rec'); btn.innerHTML = icon('mic'); }
-  const t = $('#voiceTimer');
-  if (t) t.hidden = true;
-  if (!send || !chunks.length) return;
-  if (btn) btn.classList.add('busy');
-  try {
-    const raw = new Blob(chunks, {type: chunks[0].type || 'audio/webm'});
-    const wav = await voiceToWav(raw, VOICE.mode, VOICE.level);
-    await uploadVoice(chatId, wav);
-    SFX.sent();
-    haptic('soft');
-    await loadMessages(false);
-    await loadChats();
-  } catch (e) {
-    SFX.error();
-    haptic('error');
-    toast(e.message || 'Не удалось отправить голосовое', 'bad');
-  } finally {
-    if (btn) btn.classList.remove('busy');
+  const timer = $('#voiceTimer');
+  if (timer) timer.hidden = true;
+  if (!chunks.length) return;
+  const raw = new Blob(chunks, {type: chunks[0].type || 'audio/webm'});
+  const key = VOICE.mode + ':' + VOICE.level;
+  const wav = voiceToWav(raw, VOICE.mode, VOICE.level);
+  wav.catch(() => {});   // reported when it is sent; no unhandled rejection in the meantime
+  VOICE.pending = {chatId, raw, url: URL.createObjectURL(raw), seconds, key, wav, audio: null};
+  paintVoiceChip();
+  SFX.tap();
+  haptic('light');
+}
+
+// the send button sends the preview; if the voice was changed after the recording, it is cleaned again
+async function sendVoicePending() {
+  const p = VOICE.pending;
+  const chat = state.selected;
+  if (!p || !chat || p.chatId !== chat.id) return false;
+  const key = VOICE.mode + ':' + VOICE.level;
+  if (p.key !== key) {
+    p.key = key;
+    p.wav = voiceToWav(p.raw, VOICE.mode, VOICE.level);
+    p.wav.catch(() => {});
   }
+  const wav = await p.wav;
+  await uploadVoice(chat.id, wav);
+  discardVoicePending();
+  return true;
 }
 
 async function voiceToWav(blob, mode, level) {
@@ -6328,8 +6517,142 @@ async function voiceToWav(blob, mode, level) {
   const ctx = new Ctx();
   const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
   if (ctx.close) ctx.close();
-  const rendered = mode === 'rough' ? await roughRender(decoded, level) : decoded;
+  const clean = gateMono(denoiseMono(toMono(decoded)), decoded.sampleRate, 22);
+  const buf = makeBuffer(clean, decoded.sampleRate);
+  const rendered = mode === 'rough' ? await roughRender(buf, level) : buf;
   return encodeWav(rendered);
+}
+
+function toMono(buf) {
+  const n = buf.length;
+  const ch = buf.numberOfChannels;
+  const out = new Float32Array(n);
+  for (let c = 0; c < ch; c++) {
+    const d = buf.getChannelData(c);
+    for (let i = 0; i < n; i++) out[i] += d[i] / ch;
+  }
+  return out;
+}
+
+function makeBuffer(data, sr) {
+  const ctx = new OfflineAudioContext(1, Math.max(1, data.length), sr);
+  const buf = ctx.createBuffer(1, Math.max(1, data.length), sr);
+  buf.copyToChannel(data, 0);
+  return buf;
+}
+
+// in-place radix-2 FFT (re/im are Float64Array of power-of-two length)
+function fftInPlace(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len;
+    const wr = Math.cos(ang), wi = Math.sin(ang);
+    const half = len >> 1;
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let j = 0; j < half; j++) {
+        const a = i + j, b = a + half;
+        const tr = re[b] * cr - im[b] * ci;
+        const ti = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti;
+        re[a] += tr; im[a] += ti;
+        const ncr = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr;
+        cr = ncr;
+      }
+    }
+  }
+}
+
+// spectral subtraction: the noise spectrum is taken from the quietest 12% of the recording
+function denoiseMono(x) {
+  const N = 512, H = 128, PAD = N;
+  const win = new Float64Array(N);
+  for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N);
+  const total = x.length + 2 * PAD;
+  const padded = new Float64Array(total);
+  padded.set(x, PAD);
+  const frames = Math.floor((total - N) / H) + 1;
+  const energy = new Float64Array(frames);
+  for (let k = 0; k < frames; k++) {
+    let e = 0;
+    const o = k * H;
+    for (let i = 0; i < N; i++) { const v = padded[o + i]; e += v * v; }
+    energy[k] = e;
+  }
+  const order = Array.from(energy.keys()).sort((a, b) => energy[a] - energy[b]);
+  const nq = Math.max(1, Math.floor(frames * 0.12));
+  const re = new Float64Array(N), im = new Float64Array(N);
+  const noise = new Float64Array(N);
+  for (let q = 0; q < nq; q++) {
+    const o = order[q] * H;
+    for (let i = 0; i < N; i++) { re[i] = padded[o + i] * win[i]; im[i] = 0; }
+    fftInPlace(re, im);
+    for (let i = 0; i < N; i++) noise[i] += re[i] * re[i] + im[i] * im[i];
+  }
+  for (let i = 0; i < N; i++) noise[i] /= nq;
+  const out = new Float64Array(total), norm = new Float64Array(total);
+  const prevG = new Float64Array(N);
+  const ALPHA = 2.2, BETA = 0.06;
+  for (let k = 0; k < frames; k++) {
+    const o = k * H;
+    for (let i = 0; i < N; i++) { re[i] = padded[o + i] * win[i]; im[i] = 0; }
+    fftInPlace(re, im);
+    for (let i = 0; i < N; i++) {
+      const p = re[i] * re[i] + im[i] * im[i];
+      let g = (p - ALPHA * noise[i]) / Math.max(p, 1e-12);
+      g = Math.sqrt(Math.max(g, BETA * BETA));
+      if (k > 0) g = Math.max(g, 0.7 * prevG[i]);
+      prevG[i] = g;
+      re[i] *= g; im[i] *= g;
+    }
+    for (let i = 0; i < N; i++) im[i] = -im[i];   // inverse FFT by conjugation
+    fftInPlace(re, im);
+    for (let i = 0; i < N; i++) {
+      out[o + i] += (re[i] / N) * win[i];
+      norm[o + i] += win[i] * win[i];
+    }
+  }
+  const y = new Float32Array(x.length);
+  for (let i = 0; i < x.length; i++) y[i] = out[i + PAD] / Math.max(norm[i + PAD], 1e-8);
+  return y;
+}
+
+// noise gate: 20 ms frames, everything below (speech level - dropDb) is closed, smoothed over ~30 ms
+function gateMono(y, sr, dropDb) {
+  const fr = Math.max(1, Math.round(0.02 * sr));
+  const count = Math.floor(y.length / fr);
+  const db = new Float64Array(count);
+  for (let f = 0; f < count; f++) {
+    let s = 0;
+    const o = f * fr;
+    for (let i = 0; i < fr; i++) s += y[o + i] * y[o + i];
+    db[f] = 10 * Math.log10(s / fr + 1e-12);
+  }
+  const sorted = Float64Array.from(db).sort();
+  const p90 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.9))] || -60;
+  const thr = p90 - dropDb;
+  const gain = new Float64Array(y.length).fill(1);
+  for (let f = 0; f < count; f++) if (db[f] <= thr) gain.fill(0, f * fr, (f + 1) * fr);
+  const w = Math.max(1, Math.round(0.03 * sr));
+  const pre = new Float64Array(y.length + 1);
+  for (let i = 0; i < y.length; i++) pre[i + 1] = pre[i] + gain[i];
+  const out = new Float32Array(y.length);
+  for (let i = 0; i < y.length; i++) {
+    const a = Math.max(0, i - (w >> 1));
+    const b = Math.min(y.length, i + (w >> 1) + 1);
+    out[i] = y[i] * ((pre[b] - pre[a]) / (b - a));
+  }
+  return out;
 }
 
 function driveCurve(amount) {
@@ -6342,35 +6665,50 @@ function driveCurve(amount) {
   return curve;
 }
 
-// the rough voice: lower pitch, grit, a tremolo wobble and a darker top end; k = strength 0.1..1
+// the rough voice: pitch down, warmer low end, darker top, compression, grit and a light tremolo; k = 0.1..1
 async function roughRender(src, level) {
   const k = Math.min(1, Math.max(0.1, level));
-  const rate = 1 - 0.32 * k;
+  const rate = 1 - 0.36 * k;
   const len = Math.ceil(src.length / rate);
   const off = new OfflineAudioContext(1, len, src.sampleRate);
   const node = off.createBufferSource();
   node.buffer = src;
   node.playbackRate.value = rate;
-  const hp = off.createBiquadFilter();
-  hp.type = 'highpass';
-  hp.frequency.value = 140;
+  const rumble = off.createBiquadFilter();
+  rumble.type = 'highpass';
+  rumble.frequency.value = 90;
+  const warm = off.createBiquadFilter();
+  warm.type = 'lowshelf';
+  warm.frequency.value = 180;
+  warm.gain.value = 2 + 4 * k;
   const shaper = off.createWaveShaper();
-  shaper.curve = driveCurve(1 + 22 * k);
+  shaper.curve = driveCurve(1 + 16 * k);
   shaper.oversample = '4x';
+  const dark = off.createBiquadFilter();
+  dark.type = 'highshelf';
+  dark.frequency.value = 3500;
+  dark.gain.value = -(6 + 6 * k);
   const lp = off.createBiquadFilter();
   lp.type = 'lowpass';
-  lp.frequency.value = 4200 - 2600 * k;
+  lp.frequency.value = 3800 - 1800 * k;
+  const comp = off.createDynamicsCompressor();
+  comp.threshold.value = -26;
+  comp.knee.value = 12;
+  comp.ratio.value = 5;
+  comp.attack.value = 0.005;
+  comp.release.value = 0.2;
   const trem = off.createGain();
-  trem.gain.value = 1 - 0.35 * k;
+  trem.gain.value = 1 - 0.2 * k;
   const lfo = off.createOscillator();
-  lfo.frequency.value = 28 + 40 * k;
+  lfo.frequency.value = 26 + 30 * k;
   const lfoDepth = off.createGain();
-  lfoDepth.gain.value = 0.35 * k;
+  lfoDepth.gain.value = 0.2 * k;
   lfo.connect(lfoDepth);
   lfoDepth.connect(trem.gain);
   const out = off.createGain();
   out.gain.value = 0.9;
-  node.connect(hp); hp.connect(shaper); shaper.connect(lp); lp.connect(trem); trem.connect(out); out.connect(off.destination);
+  node.connect(rumble); rumble.connect(warm); warm.connect(shaper); shaper.connect(dark);
+  dark.connect(lp); lp.connect(comp); comp.connect(trem); trem.connect(out); out.connect(off.destination);
   lfo.start(0);
   node.start(0);
   const rendered = await off.startRendering();
@@ -6421,9 +6759,7 @@ async function uploadVoice(chatId, wav) {
   });
   let data = {};
   try { data = await res.json(); } catch {}
-  if (!res.ok) {
-    throw new Error(typeof data.detail === 'string' ? data.detail : 'Не удалось отправить голосовое');
-  }
+  if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Не удалось отправить голосовое');
   return data;
 }
 
@@ -6442,21 +6778,26 @@ async function sendMessage(ev) {
   const input = $('#messageText');
   const text = input.value.trim();
   const att = state.attachment;
-  if (!chat || (!text && !att)) return;
+  const voice = !!(VOICE.pending && chat && VOICE.pending.chatId === chat.id);
+  if (!chat || (!text && !att && !voice)) return;
   const btn = ev.submitter || ev.target.querySelector('button[type="submit"]');
   if (btn) btn.disabled = true;
   try {
-    const body = {text};
-    if (att) {
-      body.image = att.dataUrl.slice(att.dataUrl.indexOf(',') + 1);
-      body.mime_type = 'image/jpeg';
-      body.filename = 'photo.jpg';
+    if (voice) {
+      await sendVoicePending();
+    } else {
+      const body = {text};
+      if (att) {
+        body.image = att.dataUrl.slice(att.dataUrl.indexOf(',') + 1);
+        body.mime_type = 'image/jpeg';
+        body.filename = 'photo.jpg';
+      }
+      await api(`/telegram/chats/${encodeURIComponent(chat.id)}/send`, {method: 'POST', body});
+      input.value = '';
+      state.attachment = null;
+      renderAttachChip();
+      autoGrow({target: input});
     }
-    await api(`/telegram/chats/${encodeURIComponent(chat.id)}/send`, {method: 'POST', body});
-    input.value = '';
-    state.attachment = null;
-    renderAttachChip();
-    autoGrow({target: input});
     SFX.sent();
     haptic('soft');
     launchSend(btn);
@@ -6471,6 +6812,7 @@ async function sendMessage(ev) {
     input.focus();
   }
 }
+
 
 function blobToDataURL(blob) {
   return new Promise((resolve, reject) => {
