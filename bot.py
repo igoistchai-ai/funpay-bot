@@ -2111,6 +2111,60 @@ async def telegram_send_message(chat_id: str, payload: TelegramSendBody, session
     return {"ok": True, "id": message.id, "text": message.message or text}
 
 
+MAX_VOICE_BYTES = 12 * 1024 * 1024
+
+
+def _wav_to_ogg_opus(wav: bytes) -> bytes | None:
+    """Telegram shows a voice bubble only for OGG/Opus. Returns None when ffmpeg is not installed."""
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+             "-c:a", "libopus", "-b:a", "48k", "-ac", "1", "-f", "ogg", "pipe:1"],
+            input=wav, capture_output=True, timeout=40, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    return proc.stdout
+
+
+@app.post("/api/telegram/chats/{chat_id}/voice")
+async def telegram_send_voice(chat_id: str, request: Request, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
+    import io
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=422, detail="Запись пустая.")
+    if len(data) > MAX_VOICE_BYTES:
+        raise HTTPException(status_code=413, detail="Голосовое больше 12 МБ.")
+    if data[:4] != b"RIFF":
+        raise HTTPException(status_code=415, detail="Нужна запись в формате WAV.")
+    ogg = _wav_to_ogg_opus(data)
+    client = await _tg_client_for(session.owner)
+    try:
+        entity = await client.get_entity(int(chat_id))
+        if ogg is not None:
+            buffer = io.BytesIO(ogg)
+            buffer.name = "voice.ogg"
+            message = await client.send_file(entity, buffer, voice_note=True)
+        else:
+            buffer = io.BytesIO(data)
+            buffer.name = "voice.wav"
+            message = await client.send_file(entity, buffer)
+    except Exception as exc:
+        log.warning("Telegram voice send failed (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Не удалось отправить голосовое в Telegram.") from exc
+    CHATS_CACHE.pop(session.owner, None)
+    _sse_publish(session.owner, {"type": "message", "chat_id": str(chat_id), "message": _tg_message_item(message, "Вы", chat_id)})
+    return {"ok": True, "id": message.id, "ogg": ogg is not None}
+
+
 @app.put("/api/telegram/chats/{chat_id}/ai")
 async def telegram_chat_ai(chat_id: str, payload: ChatAISettingsBody, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
     if payload.mode not in AI_MODES:
@@ -3743,7 +3797,7 @@ button.media{padding:0;border:0;font:inherit;color:inherit;cursor:zoom-in}
 .variant:hover,.variant:focus-visible{background:rgba(255,179,107,.12);border-color:rgba(255,179,107,.36)}
 .variant:active{transform:scale(.985)}
 .meta{font-size:11px;color:var(--faint);padding:0 4px}
-.composer{display:flex;align-items:flex-end;gap:8px;margin:0 10px calc(10px + env(safe-area-inset-bottom,0px));padding:7px 7px 7px 16px;border-radius:26px;flex:none}
+.composer{position:relative;display:flex;align-items:flex-end;gap:8px;margin:0 10px calc(10px + env(safe-area-inset-bottom,0px));padding:7px 7px 7px 16px;border-radius:26px;flex:none}
 .composer textarea{background:transparent;border:0;padding:9px 0;min-height:24px;max-height:140px;box-shadow:none}
 .composer textarea:focus{box-shadow:none}
 .send{
@@ -3753,6 +3807,21 @@ button.media{padding:0;border:0;font:inherit;color:inherit;cursor:zoom-in}
 }
 .send:active{transform:scale(.88)}
 .send:disabled{opacity:.5}
+/* ---------- voice: record, pick the voice, send ---------- */
+.voice-btn,.voice-pick{width:40px;height:40px;border-radius:50%;flex:none;display:grid;place-items:center;color:var(--ink);background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);transition:transform .2s var(--spring),background .2s var(--ease),color .2s var(--ease)}
+.voice-btn:active,.voice-pick:active{transform:scale(.9)}
+.voice-btn.rec{background:rgba(255,80,80,.18);color:#ff8b8b;border-color:rgba(255,80,80,.42);animation:voicePulse 1.1s ease-in-out infinite}
+.voice-btn.busy{opacity:.55;pointer-events:none}
+.voice-pick.on{color:var(--accent);background:rgba(255,179,107,.12);border-color:rgba(255,179,107,.3)}
+@keyframes voicePulse{0%,100%{box-shadow:0 0 0 0 rgba(255,80,80,.35)}50%{box-shadow:0 0 0 8px rgba(255,80,80,0)}}
+.voice-timer{font-size:12px;color:var(--faint);align-self:center;padding:0 2px;min-width:36px;font-variant-numeric:tabular-nums}
+.voice-pop{position:absolute;bottom:calc(100% + 10px);right:6px;width:236px;padding:12px;border-radius:18px;z-index:30;display:none}
+.voice-pop.open{display:block}
+.voice-opt{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;padding:9px 10px;border-radius:12px;background:transparent;border:1px solid transparent;color:var(--ink);font-size:14px;text-align:left}
+.voice-opt.on{background:rgba(255,179,107,.12);border-color:rgba(255,179,107,.3)}
+.voice-opt small{color:var(--faint);font-size:11px}
+.voice-range{width:100%;margin-top:10px}
+.voice-range-row{display:flex;justify-content:space-between;font-size:11px;color:var(--faint);margin-top:4px}
 
 /* ---------- empty + loading states ---------- */
 .empty{margin:auto;max-width:320px;padding:28px 18px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:10px}
@@ -4191,6 +4260,9 @@ const ICON = {
   trash:   '<path d="M4.5 7h15"/><path d="M9.5 7V5.2c0-.7.5-1.2 1.2-1.2h2.6c.7 0 1.2.5 1.2 1.2V7"/><path d="M6.5 7l.9 11.2c.1 1 .9 1.8 1.9 1.8h5.4c1 0 1.8-.8 1.9-1.8L17.5 7"/><path d="M10 11v5.5M14 11v5.5"/>',
   plus:    '<path d="M12 5v14M5 12h14"/>',
   link:    '<path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1"/><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/>',
+  mic:     '<rect x="9" y="3.5" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/>',
+  stop:    '<rect x="6.5" y="6.5" width="11" height="11" rx="2.5" fill="currentColor" stroke="none"/>',
+  wave:    '<path d="M3.5 12h2M7.5 8.5v7M11.5 5v14M15.5 8.5v7M19.5 10.5v3"/>',
 };
 const icon = name => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICON[name] || ''}</svg>`;
 const hydrateIcons = () => $$('[data-icon]').forEach(el => { el.innerHTML = icon(el.dataset.icon); });
@@ -5849,6 +5921,15 @@ function renderChatPane() {
       <button class="icon-btn" type="button" id="attachBtn" aria-label="Прикрепить фото" title="Прикрепить фото">${icon('image')}</button>
       <input type="file" id="attachFile" accept="image/*" hidden>
       <textarea id="messageText" rows="1" maxlength="4000" placeholder="Написать сообщение" aria-label="Текст сообщения"></textarea>
+      <span class="voice-timer" id="voiceTimer" hidden>0:00</span>
+      <button class="voice-btn" type="button" id="voiceBtn" aria-label="Записать голосовое" title="Голосовое">${icon('mic')}</button>
+      <button class="voice-pick" type="button" id="voicePick" aria-label="Выбор голоса" title="Выбор голоса">${icon('wave')}</button>
+      <div class="glass voice-pop" id="voicePop" role="dialog" aria-label="Выбор голоса">
+        <button type="button" class="voice-opt" data-voice="normal"><span>Нормальный</span><small>как есть</small></button>
+        <button type="button" class="voice-opt" data-voice="rough"><span>Грубый</span><small>анонимный</small></button>
+        <input type="range" class="voice-range" id="voiceRange" min="0.1" max="1" step="0.1" aria-label="Сила грубого голоса">
+        <div class="voice-range-row"><span>0.1</span><span id="voiceLevel">0.5</span><span>1</span></div>
+      </div>
       <button class="send" type="submit" aria-label="Отправить">${icon('send')}</button>
     </form>`;
   const form = $('#sendForm');
@@ -5857,6 +5938,7 @@ function renderChatPane() {
   $('#chatMode').addEventListener('change', e => saveAI(state.chatAI.enabled, e.target.value));
   $('#draftBtn').addEventListener('click', makeDraft);
   form.addEventListener('submit', sendMessage);
+  wireVoice();
   $('#attachBtn').addEventListener('click', () => $('#attachFile').click());
   $('#attachFile').addEventListener('change', e => setAttachment(e.target.files?.[0]));
   if (state.attachmentChat !== c.id) { state.attachment = null; state.attachmentChat = c.id; }
@@ -6112,6 +6194,237 @@ function showVariants(list, language) {
     hideVariants();
   });
   form.before(box);
+}
+
+/* ---------- voice messages: record, change the voice, send ---------- */
+const VOICE = {
+  mode: localStorage.getItem('nezzx_voice_mode') || 'normal',
+  level: Number(localStorage.getItem('nezzx_voice_level')) || 0.5,
+  rec: null, stream: null, chunks: [], timer: null, startedAt: 0, chatId: null, sendAfter: true,
+};
+
+function paintVoicePick() {
+  const pick = $('#voicePick');
+  if (!pick) return;
+  pick.classList.toggle('on', VOICE.mode === 'rough');
+  $$('.voice-opt').forEach(b => b.classList.toggle('on', b.dataset.voice === VOICE.mode));
+  const range = $('#voiceRange');
+  range.value = VOICE.level;
+  range.disabled = VOICE.mode !== 'rough';
+  $('#voiceLevel').textContent = VOICE.level.toFixed(1);
+}
+
+function setVoiceMode(mode) {
+  VOICE.mode = mode;
+  localStorage.setItem('nezzx_voice_mode', mode);
+  paintVoicePick();
+}
+
+function setVoiceLevel(v) {
+  const n = Math.min(1, Math.max(0.1, Math.round(Number(v) * 10) / 10));
+  VOICE.level = n;
+  localStorage.setItem('nezzx_voice_level', String(n));
+  paintVoicePick();
+}
+
+function wireVoice() {
+  const btn = $('#voiceBtn');
+  const pick = $('#voicePick');
+  const pop = $('#voicePop');
+  if (!btn || !pick || !pop) return;
+  paintVoicePick();
+  btn.addEventListener('click', toggleVoiceRec);
+  pick.addEventListener('click', e => { e.stopPropagation(); pop.classList.toggle('open'); });
+  pop.addEventListener('click', e => e.stopPropagation());
+  $$('.voice-opt').forEach(b => b.addEventListener('click', () => {
+    setVoiceMode(b.dataset.voice);
+    if (VOICE.mode === 'rough') pop.classList.add('open');
+  }));
+  $('#voiceRange').addEventListener('input', e => setVoiceLevel(e.target.value));
+  if (!window.__voicePopBound) {
+    window.__voicePopBound = true;
+    document.addEventListener('click', () => { const p = $('#voicePop'); if (p) p.classList.remove('open'); });
+  }
+}
+
+function tickVoiceTimer() {
+  const s = Math.floor((Date.now() - VOICE.startedAt) / 1000);
+  const t = $('#voiceTimer');
+  if (t) t.textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+async function toggleVoiceRec() {
+  if (VOICE.rec) { stopVoiceRec(true); return; }
+  const chat = state.selected;
+  if (!chat) return;
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    toast('Этот браузер не умеет записывать звук', 'bad');
+    return;
+  }
+  try {
+    VOICE.stream = await navigator.mediaDevices.getUserMedia({audio: true});
+  } catch {
+    toast('Нет доступа к микрофону. Разрешите его в браузере', 'bad');
+    return;
+  }
+  VOICE.chatId = chat.id;
+  VOICE.chunks = [];
+  VOICE.sendAfter = true;
+  const rec = new MediaRecorder(VOICE.stream);
+  rec.ondataavailable = e => { if (e.data && e.data.size) VOICE.chunks.push(e.data); };
+  rec.onstop = () => finishVoiceRec();
+  rec.start(250);
+  VOICE.rec = rec;
+  VOICE.startedAt = Date.now();
+  const btn = $('#voiceBtn');
+  btn.classList.add('rec');
+  btn.innerHTML = icon('stop');
+  $('#voiceTimer').hidden = false;
+  tickVoiceTimer();
+  VOICE.timer = setInterval(tickVoiceTimer, 250);
+  haptic('soft');
+}
+
+function stopVoiceRec(send) {
+  if (!VOICE.rec) return;
+  VOICE.sendAfter = send;
+  VOICE.rec.stop();
+}
+
+async function finishVoiceRec() {
+  const send = VOICE.sendAfter !== false;
+  clearInterval(VOICE.timer);
+  VOICE.timer = null;
+  const chunks = VOICE.chunks;
+  const chatId = VOICE.chatId;
+  const seconds = Math.max(1, Math.round((Date.now() - VOICE.startedAt) / 1000));
+  if (VOICE.stream) VOICE.stream.getTracks().forEach(t => t.stop());
+  VOICE.rec = null; VOICE.stream = null; VOICE.chunks = []; VOICE.sendAfter = true;
+  const btn = $('#voiceBtn');
+  if (btn) { btn.classList.remove('rec'); btn.innerHTML = icon('mic'); }
+  const t = $('#voiceTimer');
+  if (t) t.hidden = true;
+  if (!send || !chunks.length) return;
+  if (btn) btn.classList.add('busy');
+  try {
+    const raw = new Blob(chunks, {type: chunks[0].type || 'audio/webm'});
+    const wav = await voiceToWav(raw, VOICE.mode, VOICE.level);
+    await uploadVoice(chatId, wav);
+    SFX.sent();
+    haptic('soft');
+    await loadMessages(false);
+    await loadChats();
+  } catch (e) {
+    SFX.error();
+    haptic('error');
+    toast(e.message || 'Не удалось отправить голосовое', 'bad');
+  } finally {
+    if (btn) btn.classList.remove('busy');
+  }
+}
+
+async function voiceToWav(blob, mode, level) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx();
+  const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
+  if (ctx.close) ctx.close();
+  const rendered = mode === 'rough' ? await roughRender(decoded, level) : decoded;
+  return encodeWav(rendered);
+}
+
+function driveCurve(amount) {
+  const n = 1024;
+  const curve = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = (i * 2) / n - 1;
+    curve[i] = Math.tanh(amount * x) / Math.tanh(amount);
+  }
+  return curve;
+}
+
+// the rough voice: lower pitch, grit, a tremolo wobble and a darker top end; k = strength 0.1..1
+async function roughRender(src, level) {
+  const k = Math.min(1, Math.max(0.1, level));
+  const rate = 1 - 0.32 * k;
+  const len = Math.ceil(src.length / rate);
+  const off = new OfflineAudioContext(1, len, src.sampleRate);
+  const node = off.createBufferSource();
+  node.buffer = src;
+  node.playbackRate.value = rate;
+  const hp = off.createBiquadFilter();
+  hp.type = 'highpass';
+  hp.frequency.value = 140;
+  const shaper = off.createWaveShaper();
+  shaper.curve = driveCurve(1 + 22 * k);
+  shaper.oversample = '4x';
+  const lp = off.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = 4200 - 2600 * k;
+  const trem = off.createGain();
+  trem.gain.value = 1 - 0.35 * k;
+  const lfo = off.createOscillator();
+  lfo.frequency.value = 28 + 40 * k;
+  const lfoDepth = off.createGain();
+  lfoDepth.gain.value = 0.35 * k;
+  lfo.connect(lfoDepth);
+  lfoDepth.connect(trem.gain);
+  const out = off.createGain();
+  out.gain.value = 0.9;
+  node.connect(hp); hp.connect(shaper); shaper.connect(lp); lp.connect(trem); trem.connect(out); out.connect(off.destination);
+  lfo.start(0);
+  node.start(0);
+  const rendered = await off.startRendering();
+  return normalizeBuffer(rendered, 0.92);
+}
+
+function normalizeBuffer(buf, peak) {
+  const data = buf.getChannelData(0);
+  let max = 0;
+  for (let i = 0; i < data.length; i++) { const a = Math.abs(data[i]); if (a > max) max = a; }
+  if (max > 0) {
+    const g = peak / max;
+    for (let i = 0; i < data.length; i++) data[i] *= g;
+  }
+  return buf;
+}
+
+// 16-bit mono WAV: the browser sends this, the server turns it into OGG/Opus
+function encodeWav(buf) {
+  const ch = buf.numberOfChannels;
+  const n = buf.length;
+  const rate = buf.sampleRate;
+  const mono = new Float32Array(n);
+  for (let c = 0; c < ch; c++) {
+    const d = buf.getChannelData(c);
+    for (let i = 0; i < n; i++) mono[i] += d[i] / ch;
+  }
+  const bytes = new ArrayBuffer(44 + n * 2);
+  const view = new DataView(bytes);
+  const put = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+  put(0, 'RIFF'); view.setUint32(4, 36 + n * 2, true); put(8, 'WAVE');
+  put(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  put(36, 'data'); view.setUint32(40, n * 2, true);
+  let off = 44;
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, mono[i]));
+    view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    off += 2;
+  }
+  return new Blob([bytes], {type: 'audio/wav'});
+}
+
+async function uploadVoice(chatId, wav) {
+  if (!chatId) throw new Error('Чат не выбран');
+  const res = await fetch(`/api/telegram/chats/${encodeURIComponent(chatId)}/voice`, {
+    method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'audio/wav'}, body: wav,
+  });
+  let data = {};
+  try { data = await res.json(); } catch {}
+  if (!res.ok) {
+    throw new Error(typeof data.detail === 'string' ? data.detail : 'Не удалось отправить голосовое');
+  }
+  return data;
 }
 
 // the send button flies off once, so the message visibly leaves the composer
