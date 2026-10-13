@@ -1,3 +1,4 @@
+
 """NEZZX AI Telegram Conv — single-file FastAPI dashboard + Telegram bot.
 
 Deploy as one file (bot.py) on Render. See the deployment notes that ship with it.
@@ -6372,8 +6373,10 @@ function renderChatPane() {
       <input id="dealNftUrl" type="url" placeholder="https://t.me/nft/..." style="width:100%;box-sizing:border-box;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--surface);color:var(--text)">
       <label style="display:block;font-size:12px;color:var(--muted);margin:7px 0 5px">Сумма звёзд</label>
       <input id="dealStars" type="number" min="1" max="1000000" step="1" placeholder="1200" style="width:100%;box-sizing:border-box;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--surface);color:var(--text)">
-      <button class="btn primary" id="dealCreateBtn" type="button" style="width:100%;margin-top:10px">📨 Создать сделку</button>
-      <small style="display:block;color:var(--muted);margin-top:7px">В выбранный личный чат уйдёт обычное сообщение. Ответы: «Принять» или «Отказать». Платёж не проверяется автоматически.</small>
+      <label style="display:block;font-size:12px;color:var(--muted);margin:7px 0 5px">Реальная ссылка на оплату</label>
+      <input id="dealPayUrl" type="url" inputmode="url" placeholder="https://сервис-оплаты/..." style="width:100%;box-sizing:border-box;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--surface);color:var(--text)">
+      <button class="btn primary" id="dealCreateBtn" type="button" style="width:100%;margin-top:10px">Создать сделку</button>
+      <small style="display:block;color:var(--muted);margin-top:7px">Укажите действующую ссылку платёжного сервиса. Сайт не создаёт фиктивную оплату.</small>
     </section>
     <form class="composer glass" id="sendForm">
       <button class="icon-btn" type="button" id="attachBtn" aria-label="Прикрепить фото" title="Прикрепить фото">${icon('image')}</button>
@@ -7117,22 +7120,43 @@ function launchSend(btn) {
 async function sendDeal() {
   const chat = state.selected;
   const btn = $('#dealCreateBtn');
-  const nftUrl = ($('#dealNftUrl')?.value || '').trim();
+  let nftUrl = ($('#dealNftUrl')?.value || '').trim();
+  let paymentUrl = ($('#dealPayUrl')?.value || '').trim();
   const starsRaw = ($('#dealStars')?.value || '').trim();
   const stars = Number(starsRaw);
   if (!chat) return;
-  if (!/^https?:\/\//i.test(nftUrl)) { toast('Укажите корректную ссылку на NFT'); $('#dealNftUrl').focus(); return; }
+  // Accept common Telegram NFT links pasted without a scheme, e.g. t.me/nft/...
+  if (/^(?:www\.)?(?:t\.me|telegram\.me)\//i.test(nftUrl)) nftUrl = 'https://' + nftUrl.replace(/^www\./i, '');
+  if (!/^https?:\/\//i.test(nftUrl)) { toast('Вставьте ссылку вида t.me/nft/...'); $('#dealNftUrl').focus(); return; }
+  try {
+    const parsed = new URL(nftUrl);
+    if (!['t.me', 'www.t.me', 'telegram.me', 'www.telegram.me'].includes(parsed.hostname.toLowerCase()) || !parsed.pathname.startsWith('/nft/')) {
+      toast('Нужна ссылка Telegram NFT вида t.me/nft/...'); $('#dealNftUrl').focus(); return;
+    }
+    nftUrl = parsed.href;
+    $('#dealNftUrl').value = nftUrl;
+  } catch {
+    toast('Проверьте ссылку на NFT'); $('#dealNftUrl').focus(); return;
+  }
   if (!Number.isInteger(stars) || stars < 1 || stars > 1000000) { toast('Укажите сумму звёзд от 1 до 1 000 000'); $('#dealStars').focus(); return; }
+  if (!paymentUrl) { toast('Добавьте реальную ссылку на оплату'); $('#dealPayUrl').focus(); return; }
+  try {
+    const parsedPayment = new URL(paymentUrl);
+    if (parsedPayment.protocol !== 'https:') throw new Error('https required');
+    paymentUrl = parsedPayment.href;
+  } catch {
+    toast('Введите действующую ссылку оплаты, начинающуюся с https://'); $('#dealPayUrl').focus(); return;
+  }
   btn.disabled = true;
   try {
-    const buyer = state.profile?.username ? '@' + state.profile.username : 'покупатель';
-    const seller = chat.username ? '@' + chat.username : (chat.name || 'продавец');
-    const terms = `Ссылка на NFT: ${nftUrl}\n\nПокупатель: ${buyer}\nПродавец: ${seller}\nСумма: ${stars} ⭐\n\nДля ответа напишите одним сообщением: «Принять» или «Отказать».\nПосле принятия напишите «Оплатил» только после фактического перевода. Это слово не является подтверждением получения оплаты.`;
+    const myNick = state.profile?.username ? '@' + state.profile.username : 'укажите свой ник';
+    const terms = `Оплата NFT\nМой ник: ${myNick}\nОплатите: ${stars} ⭐\nСсылка на оплату: ${paymentUrl}\n_____________\nNFT: ${nftUrl}\n_____________\nОтветьте: «Принять» или «Отказать».\nСлово «Оплатил» само по себе не подтверждает получение денег.`;
     await api(`/telegram/chats/${encodeURIComponent(chat.id)}/send`, {method: 'POST', body: {deal_terms: terms}});
     $('#dealPanel').hidden = true;
     $('#dealPanel').style.display = 'none';
     $('#dealNftUrl').value = '';
     $('#dealStars').value = '';
+    $('#dealPayUrl').value = '';
     SFX.sent();
     haptic('soft');
     await loadMessages(false);
