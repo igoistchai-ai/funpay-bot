@@ -248,6 +248,8 @@ def init_db() -> None:
             verified_at INTEGER,
             verified_by INTEGER
         )""")
+        if "owner" not in _columns(conn, "deal_payments"):
+            conn.execute("ALTER TABLE deal_payments ADD COLUMN owner TEXT NOT NULL DEFAULT ''")
         conn.execute("""CREATE TABLE IF NOT EXISTS web_sessions (
             token_hash TEXT PRIMARY KEY,
             owner TEXT NOT NULL,
@@ -1537,6 +1539,89 @@ async def _ai_reply_after_pause(owner: str, client: Any, chat_id: str, token: in
         log.warning("AI reply failed (%s)", type(exc).__name__)
 
 
+async def _process_deal_chat_message(owner: str, client: Any, event: Any) -> bool:
+    """Handle plain-text deal commands in the exact personal chat where the offer was sent.
+
+    This never treats the word 'Оплатил' as proof of a payment. It only records that the
+    sender reported payment and explicitly asks both parties to verify the real transfer.
+    Returns True when a recognized deal command was handled.
+    """
+    if not getattr(event, "is_private", False) or not getattr(event, "message", None):
+        return False
+    raw = (getattr(event, "raw_text", "") or "").strip()
+    normalized = re.sub(r"[.!?…\s]+$", "", raw.casefold()).strip()
+    chat_value = getattr(event, "chat_id", None)
+    if chat_value is None:
+        return False
+    chat_id = str(abs(int(chat_value)))
+    outgoing = bool(getattr(event.message, "out", False))
+
+    if not outgoing and normalized in {"принять", "принимаю", "согласен", "согласна"}:
+        with db() as conn:
+            deal = conn.execute(
+                "SELECT * FROM deal_payments WHERE owner=? AND CAST(target_chat_id AS TEXT)=? AND status='sent' ORDER BY created_at DESC LIMIT 1",
+                (owner, chat_id),
+            ).fetchone()
+            if not deal:
+                return False
+            changed = conn.execute(
+                "UPDATE deal_payments SET status='accepted', claimed_at=? WHERE id=? AND status='sent'",
+                (now_ts(), deal["id"]),
+            ).rowcount
+        if changed:
+            await client.send_message(
+                event.chat_id,
+                "✅ Продавец принял предложение. Покупатель может написать «Оплатил» только после фактического перевода. "
+                "Это сообщение не подтверждает получение денег — перед передачей NFT/подарка проверьте платёж отдельно.",
+            )
+            CHATS_CACHE.pop(owner, None)
+            return True
+        return False
+
+    if not outgoing and normalized in {"отказать", "отказываюсь", "не принимаю", "отклонить"}:
+        with db() as conn:
+            deal = conn.execute(
+                "SELECT * FROM deal_payments WHERE owner=? AND CAST(target_chat_id AS TEXT)=? AND status='sent' ORDER BY created_at DESC LIMIT 1",
+                (owner, chat_id),
+            ).fetchone()
+            if not deal:
+                return False
+            changed = conn.execute(
+                "UPDATE deal_payments SET status='rejected', claimed_at=? WHERE id=? AND status='sent'",
+                (now_ts(), deal["id"]),
+            ).rowcount
+        if changed:
+            await client.send_message(event.chat_id, "❌ Сделка отклонена. Новое предложение можно отправить из панели сайта.")
+            CHATS_CACHE.pop(owner, None)
+            return True
+        return False
+
+    if outgoing and normalized in {"оплатил", "оплатил!", "оплата отправлена"}:
+        with db() as conn:
+            deal = conn.execute(
+                "SELECT * FROM deal_payments WHERE owner=? AND CAST(target_chat_id AS TEXT)=? AND status='accepted' ORDER BY created_at DESC LIMIT 1",
+                (owner, chat_id),
+            ).fetchone()
+            if not deal:
+                return False
+            changed = conn.execute(
+                "UPDATE deal_payments SET status='payment_reported', claimed_at=? WHERE id=? AND status='accepted'",
+                (now_ts(), deal["id"]),
+            ).rowcount
+        if changed:
+            await client.send_message(event.chat_id, "🔎 Проверяю статус сообщения и безопасность сделки…")
+            await asyncio.sleep(0.8)
+            await client.send_message(
+                event.chat_id,
+                "🟡 Сообщение «Оплатил» получено. Автоматическая проверка платежа не подключена, поэтому оплата пока НЕ подтверждена. "
+                "Проверьте фактическое поступление самостоятельно и не отправляйте NFT/подарок до подтверждения.",
+            )
+            CHATS_CACHE.pop(owner, None)
+            return True
+        return False
+    return False
+
+
 async def _install_ai_listener(owner: str, client: Any) -> None:
     marker = f"{owner}:{id(client)}"
     if marker in TG_LISTENERS:
@@ -1547,6 +1632,9 @@ async def _install_ai_listener(owner: str, client: Any) -> None:
         if not event.is_private or not event.message or not (event.raw_text or "").strip():
             return
         chat_id = str(event.chat_id)
+        command_text = re.sub(r"[.!?…\s]+$", "", (event.raw_text or "").casefold()).strip()
+        if command_text in {"принять", "принимаю", "согласен", "согласна", "отказать", "отказываюсь", "не принимаю", "отклонить"}:
+            return
         if not _ai_settings(owner, chat_id)["enabled"]:
             return
         key = f"{owner}:{chat_id}"
@@ -1558,6 +1646,10 @@ async def _install_ai_listener(owner: str, client: Any) -> None:
         task.add_done_callback(AI_TASKS.discard)
 
     async def on_live(event: Any) -> None:
+        try:
+            await _process_deal_chat_message(owner, client, event)
+        except Exception as exc:
+            log.warning("Deal command handler failed (%s)", type(exc).__name__)
         try:
             await _push_telegram_message(owner, event)
         except Exception:
@@ -2138,12 +2230,11 @@ def _build_deal_card(terms: str) -> tuple[str, list]:
     add(" Предложение", bold=True)
     add("\n\nОписание:\n" + terms + "\n\n")
     add("✅", "confirm")
-    add(" Подтверждение: ожидается\n")
+    add(" Статус: ожидает ответа\n")
     add("🛡️", "shield")
-    add(" Безопасная сделка: проверяйте условия самостоятельно.\n\n")
+    add(" Ответьте одним сообщением: «Принять» или «Отказать».\n\n")
     add("⚠️", "warn")
-    add(" Внимание! Не доверяйте незнакомым участникам и проверяйте оплату самостоятельно. "
-        "Telegram не гарантирует сделки через этого бота.")
+    add(" Важно: слово «Оплатил» не подтверждает поступление денег. Проверяйте реальный платёж отдельно и не отправляйте NFT/подарок до подтверждения.")
     return text, entities
 
 
@@ -2174,45 +2265,26 @@ async def telegram_send_message(chat_id: str, payload: TelegramSendBody, session
     try:
         target_id = int(chat_id)
         entity = await client.get_entity(target_id)
-        message = None
-        # Inline keyboards can only be attached to messages sent by the bot. For a private
-        # recipient who has started the bot, send the deal card from the bot so callbacks
-        # can be validated and the card can be edited later. Telethon fallback has no buttons.
-        if payload.deal_terms is not None and image_bytes is None and TG_BOT is not None and target_id > 0:
-            try:
-                from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
-                bot_entities = []
-                for ent in (deal_entities or []):
-                    if getattr(ent, "__class__", type("", (), {})).__name__ == "MessageEntityCustomEmoji":
-                        bot_entities.append(MessageEntity(type="custom_emoji", offset=ent.offset, length=ent.length,
-                                                          custom_emoji_id=str(ent.document_id)))
-                    elif getattr(ent, "__class__", type("", (), {})).__name__ == "MessageEntityBold":
-                        bot_entities.append(MessageEntity(type="bold", offset=ent.offset, length=ent.length))
-                deal_id = secrets.token_urlsafe(9)
-                amount_match = re.search(r"(?i)(?<!\d)(\d{1,6})\s*(?:⭐|stars?\b|зв[её]зд(?:а|ы)?\b)", payload.deal_terms)
-                stars_amount = int(amount_match.group(1)) if amount_match else None
-                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Я оплатил", callback_data=f"deal:claim:{deal_id}")]])
-                bot_message = await TG_BOT.send_message(chat_id=target_id, text=text, entities=bot_entities,
-                                                        reply_markup=keyboard)
-                with db() as conn:
-                    conn.execute("""INSERT INTO deal_payments
-                        (id,buyer_id,target_chat_id,message_id,terms,stars_amount,status,created_at)
-                        VALUES(?,?,?,?,?,?,?,?)""",
-                        (deal_id, target_id, target_id, bot_message.message_id, payload.deal_terms.strip(),
-                         stars_amount, "sent", now_ts()))
-                # Represent the Bot API message consistently in the dashboard response.
-                message = bot_message
-                response_text = bot_message.text or text
-            except Exception as bot_exc:
-                log.info("Bot could not post deal card in chat %s (%s); falling back to Telethon", target_id, type(bot_exc).__name__)
-        if message is None:
-            if image_bytes is not None:
-                buffer = io.BytesIO(image_bytes)
-                buffer.name = (payload.filename or "photo.jpg")[:120]
-                message = await client.send_file(entity, buffer, caption=text or None)
-            else:
-                message = await client.send_message(entity, text, formatting_entities=deal_entities)
-            response_text = getattr(message, "message", None) or getattr(message, "text", None) or text
+        if image_bytes is not None:
+            buffer = io.BytesIO(image_bytes)
+            buffer.name = (payload.filename or "photo.jpg")[:120]
+            message = await client.send_file(entity, buffer, caption=text or None)
+        else:
+            message = await client.send_message(entity, text, formatting_entities=deal_entities)
+        response_text = getattr(message, "message", None) or getattr(message, "text", None) or text
+        if payload.deal_terms is not None:
+            deal_id = secrets.token_urlsafe(9)
+            amount_match = re.search(
+                r"(?i)(?<!\d)(\d{1,6})\s*(?:⭐|stars?\b|зв[её]зд(?:а|ы)?\b)",
+                payload.deal_terms,
+            )
+            stars_amount = int(amount_match.group(1)) if amount_match else None
+            with db() as conn:
+                conn.execute("""INSERT INTO deal_payments
+                    (id,buyer_id,target_chat_id,message_id,terms,stars_amount,status,created_at,owner)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (deal_id, target_id, target_id, int(message.id), payload.deal_terms.strip(),
+                     stars_amount, "sent", now_ts(), session.owner))
     except Exception as exc:
         log.warning("Telegram send failed (%s)", type(exc).__name__)
         raise HTTPException(status_code=502, detail="Не удалось отправить сообщение в Telegram.") from exc
@@ -3460,36 +3532,38 @@ async def _start_telegram(app_: FastAPI) -> Any:
             return
 
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-        if action == "claim":
-            # Only the exact private-chat recipient can claim, and only once.
+        if action in {"accept", "reject", "demo_pay"}:
+            # These controls are available only to the recipient in the private bot chat.
             if user.id != int(deal["buyer_id"]):
-                await query.answer("Эта кнопка предназначена другому покупателю.", show_alert=True)
+                await query.answer("Эта кнопка предназначена участнику этой сделки.", show_alert=True)
                 return
             if deal["status"] != "sent":
-                await query.answer("Заявка уже принята; повторное нажатие проигнорировано.", show_alert=True)
+                await query.answer("Сделка уже обработана; повторное нажатие проигнорировано.", show_alert=True)
                 return
+            status_map = {"accept": "accepted", "reject": "rejected", "demo_pay": "demo_paid"}
+            next_status = status_map[action]
             with db() as conn:
-                changed = conn.execute("UPDATE deal_payments SET status='pending', claimed_at=? WHERE id=? AND status='sent'",
-                                       (now_ts(), deal_id)).rowcount
+                changed = conn.execute(
+                    "UPDATE deal_payments SET status=?, claimed_at=? WHERE id=? AND status='sent'",
+                    (next_status, now_ts(), deal_id),
+                ).rowcount
             if not changed:
-                await query.answer("Заявка уже обработана.", show_alert=True)
+                await query.answer("Сделка уже обработана.", show_alert=True)
                 return
-            await query.answer("Заявка отправлена на проверку.")
-            pending_text = (query.message.text or "") + "\n\n🕓 Покупатель заявил об оплате — ожидается проверка.\n"
-            await query.edit_message_text(pending_text, entities=getattr(query.message, "entities", None), reply_markup=None)
-            # Only the configured admin receives the verification control.
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_TELEGRAM_ID,
-                    text=(f"🛡️ Проверка оплаты по сделке {deal_id}\n"
-                          f"Покупатель: {user.full_name} (@{user.username or 'без username'})\n"
-                          f"Telegram ID: {user.id}\n"
-                          f"Сумма из условий: {deal['stars_amount'] if deal['stars_amount'] is not None else 'не распознана'} ⭐\n"
-                          "Проверьте реальный платёж Stars вне этого сообщения перед подтверждением."),
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Подтвердить после проверки", callback_data=f"deal:verify:{deal_id}")]])
-                )
-            except Exception as exc:
-                log.warning("Could not notify deal verifier (%s)", type(exc).__name__)
+            if action == "accept":
+                await query.answer("Предложение принято.")
+                status_text = "\n\n✅ Предложение принято."
+            elif action == "reject":
+                await query.answer("Предложение отклонено.")
+                status_text = "\n\n❌ Предложение отклонено."
+            else:
+                await query.answer("Демо-режим: реальный платёж не выполнялся.", show_alert=True)
+                status_text = "\n\n🧪 ДЕМО: отмечено только сообщение об оплате. Реальный платёж не выполнялся и не подтверждён."
+            await query.edit_message_text(
+                (query.message.text or "") + status_text,
+                entities=getattr(query.message, "entities", None),
+                reply_markup=None,
+            )
             return
 
         if action == "verify":
@@ -4368,6 +4442,83 @@ html[data-player="on"] .toast{bottom:calc(env(safe-area-inset-bottom,0px) + 180p
 html.calm *,html.calm *::before,html.calm *::after{
   animation-duration:.01ms!important;animation-delay:0ms!important;
   animation-iteration-count:1!important;transition-duration:.01ms!important;
+}
+
+
+
+/* ---------- NEZZX neutral graphite theme + compact mobile controls ---------- */
+:root{
+  color-scheme:dark;
+  --bg:#171717;
+  --ink:#ededed;
+  --muted:rgba(237,237,237,.68);
+  --faint:rgba(237,237,237,.44);
+  --accent:#b8b8b8;
+  --accent-hi:#dedede;
+  --accent-ink:#171717;
+  --ai:#d0d0d0;
+  --ok:#d7d7d7;
+  --bad:#bfbfbf;
+  --glass:rgba(35,35,35,.72);
+  --glass-strong:rgba(29,29,29,.94);
+  --glass-soft:rgba(255,255,255,.045);
+  --line:rgba(255,255,255,.15);
+  --line-soft:rgba(255,255,255,.075);
+  --field:rgba(18,18,18,.7);
+}
+html,body{background:#171717!important;color:#ededed}
+body{background-image:radial-gradient(ellipse at top,rgba(255,255,255,.055),transparent 56%),linear-gradient(180deg,#191919,#101010 80%)!important}
+.glass,.card,.panel,.modal,.chat-tools,.messages,.composer,.chat-row,.side-card,.settings-card,
+#dealPanel,.empty-state,.auth-card,.toast,.popover,.menu-popover{
+  border-color:rgba(255,255,255,.13)!important;
+}
+.btn.primary,.send,.deal-btn,.tab.active,.rail-btn.active,.nav-btn.active,.pill.active,.switch.on,
+button.primary,[aria-current="page"]{
+  background:linear-gradient(180deg,#d0d0d0,#a4a4a4)!important;
+  color:#171717!important;
+  border-color:#c4c4c4!important;
+  box-shadow:0 5px 16px rgba(0,0,0,.22)!important;
+}
+.btn:not(.primary),.icon-btn,.voice-btn,.voice-pick,.vc-play,.vc-del,.tab,.rail-btn,.nav-btn,
+button:not(.primary):not(.send):not(.deal-btn){
+  border-color:rgba(255,255,255,.13);
+}
+input,textarea,select,.select,#dealNftUrl,#dealStars{
+  color:#f0f0f0!important;background:#242424!important;border-color:#505050!important;
+}
+input::placeholder,textarea::placeholder{color:#969696!important}
+#dealPanel{background:rgba(35,35,35,.96)!important;border-radius:16px!important;padding:12px!important;gap:5px!important}
+#dealPanel b{font-size:14px!important;font-weight:650!important;color:#efefef!important}
+#dealPanel label{font-size:11px!important;margin:5px 0 3px!important;color:#bdbdbd!important}
+#dealPanel input{min-height:38px!important;padding:9px 11px!important;border-radius:10px!important;font-size:14px!important}
+#dealPanel small{font-size:11px!important;line-height:1.45!important}
+#dealCreateBtn{min-height:38px!important;margin-top:7px!important;border-radius:10px!important;font-size:13px!important;padding:8px 12px!important}
+@media(max-width:760px){
+  :root{--r-xl:20px;--r-lg:16px;--r-md:12px}
+  body{font-size:13px!important}
+  .btn,button.btn,.btn.primary,.btn.sm{min-height:34px!important;padding:7px 10px!important;font-size:12px!important;border-radius:10px!important;gap:6px!important}
+  .icon-btn,.voice-btn,.voice-pick,.send,.deal-btn,.vc-play,.vc-del{width:34px!important;height:34px!important;min-width:34px!important;min-height:34px!important;padding:7px!important;border-radius:11px!important}
+  .send,.deal-btn{font-size:11px!important}
+  .composer{gap:5px!important;padding:7px!important;border-radius:15px!important}
+  #messageText{font-size:13px!important;line-height:1.4!important;min-height:30px!important;padding:6px!important}
+  .chat-tools{gap:6px!important;padding:7px!important}
+  .chat-tools .tools-text b{font-size:12px!important}
+  .chat-tools .tools-text span{font-size:10px!important}
+  .chat-tools .select{max-width:105px!important;min-height:32px!important;padding:5px 7px!important;font-size:11px!important}
+  .messages{padding:7px!important}
+  .chat-row{padding:9px!important;min-height:55px!important}
+  .chat-title,.chat-name{font-size:12px!important}
+  .chat-preview,.chat-subtitle{font-size:11px!important}
+  #dealPanel{margin:7px 0!important}
+  .modal,.dialog,.popover{max-width:calc(100vw - 20px)!important}
+  .tab,.rail-btn,.nav-btn{min-height:33px!important;padding:6px 9px!important;font-size:11px!important}
+}
+@media(max-width:420px){
+  #dealPanel{padding:10px!important}
+  #dealPanel input{min-height:36px!important;font-size:13px!important}
+  #dealCreateBtn{min-height:36px!important}
+  .composer{padding:6px!important}
+  .icon-btn,.voice-btn,.voice-pick,.send,.deal-btn,.vc-play,.vc-del{width:31px!important;height:31px!important;min-width:31px!important;min-height:31px!important;padding:6px!important}
 }
 
 </style>
@@ -6215,6 +6366,15 @@ function renderChatPane() {
       <span class="vc-time" id="vcTime">0:00</span>
       <button class="vc-del" type="button" id="vcDel" aria-label="Удалить запись" title="Удалить запись">${icon('trash')}</button>
     </div>
+    <section id="dealPanel" class="glass" hidden style="margin:10px 0;padding:14px;border:1px solid var(--line);border-radius:18px;display:none;gap:10px">
+      <b style="display:block;margin-bottom:8px">✨ Создание NFT-сделки</b>
+      <label style="display:block;font-size:12px;color:var(--muted);margin:7px 0 5px">Ссылка на NFT</label>
+      <input id="dealNftUrl" type="url" placeholder="https://t.me/nft/..." style="width:100%;box-sizing:border-box;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--surface);color:var(--text)">
+      <label style="display:block;font-size:12px;color:var(--muted);margin:7px 0 5px">Сумма звёзд</label>
+      <input id="dealStars" type="number" min="1" max="1000000" step="1" placeholder="1200" style="width:100%;box-sizing:border-box;padding:12px;border-radius:12px;border:1px solid var(--line);background:var(--surface);color:var(--text)">
+      <button class="btn primary" id="dealCreateBtn" type="button" style="width:100%;margin-top:10px">📨 Создать сделку</button>
+      <small style="display:block;color:var(--muted);margin-top:7px">В выбранный личный чат уйдёт обычное сообщение. Ответы: «Принять» или «Отказать». Платёж не проверяется автоматически.</small>
+    </section>
     <form class="composer glass" id="sendForm">
       <button class="icon-btn" type="button" id="attachBtn" aria-label="Прикрепить фото" title="Прикрепить фото">${icon('image')}</button>
       <input type="file" id="attachFile" accept="image/*" hidden>
@@ -6237,7 +6397,8 @@ function renderChatPane() {
   $('#chatMode').addEventListener('change', e => saveAI(state.chatAI.enabled, e.target.value));
   $('#draftBtn').addEventListener('click', makeDraft);
   form.addEventListener('submit', sendMessage);
-  $('#dealBtn').addEventListener('click', sendDeal);
+  $('#dealBtn').addEventListener('click', () => { const p = $('#dealPanel'); p.hidden = false; p.style.display = 'grid'; $('#dealNftUrl').focus(); });
+  $('#dealCreateBtn').addEventListener('click', sendDeal);
   wireVoice();
   $('#attachBtn').addEventListener('click', () => $('#attachFile').click());
   $('#attachFile').addEventListener('change', e => setAttachment(e.target.files?.[0]));
@@ -6955,16 +7116,23 @@ function launchSend(btn) {
 
 async function sendDeal() {
   const chat = state.selected;
-  const input = $('#messageText');
-  const btn = $('#dealBtn');
-  const terms = input.value.trim();
+  const btn = $('#dealCreateBtn');
+  const nftUrl = ($('#dealNftUrl')?.value || '').trim();
+  const starsRaw = ($('#dealStars')?.value || '').trim();
+  const stars = Number(starsRaw);
   if (!chat) return;
-  if (!terms) { toast('Напишите условия сделки в поле ввода'); input.focus(); return; }
+  if (!/^https?:\/\//i.test(nftUrl)) { toast('Укажите корректную ссылку на NFT'); $('#dealNftUrl').focus(); return; }
+  if (!Number.isInteger(stars) || stars < 1 || stars > 1000000) { toast('Укажите сумму звёзд от 1 до 1 000 000'); $('#dealStars').focus(); return; }
   btn.disabled = true;
   try {
+    const buyer = state.profile?.username ? '@' + state.profile.username : 'покупатель';
+    const seller = chat.username ? '@' + chat.username : (chat.name || 'продавец');
+    const terms = `Ссылка на NFT: ${nftUrl}\n\nПокупатель: ${buyer}\nПродавец: ${seller}\nСумма: ${stars} ⭐\n\nДля ответа напишите одним сообщением: «Принять» или «Отказать».\nПосле принятия напишите «Оплатил» только после фактического перевода. Это слово не является подтверждением получения оплаты.`;
     await api(`/telegram/chats/${encodeURIComponent(chat.id)}/send`, {method: 'POST', body: {deal_terms: terms}});
-    input.value = '';
-    autoGrow({target: input});
+    $('#dealPanel').hidden = true;
+    $('#dealPanel').style.display = 'none';
+    $('#dealNftUrl').value = '';
+    $('#dealStars').value = '';
     SFX.sent();
     haptic('soft');
     await loadMessages(false);
