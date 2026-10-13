@@ -235,6 +235,19 @@ def init_db() -> None:
         )""")
         if "image_link" not in _columns(conn, "sent_chat_messages"):
             conn.execute("ALTER TABLE sent_chat_messages ADD COLUMN image_link TEXT")
+        conn.execute("""CREATE TABLE IF NOT EXISTS deal_payments (
+            id TEXT PRIMARY KEY,
+            buyer_id INTEGER NOT NULL,
+            target_chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            terms TEXT NOT NULL,
+            stars_amount INTEGER,
+            status TEXT NOT NULL DEFAULT 'sent',
+            created_at INTEGER NOT NULL,
+            claimed_at INTEGER,
+            verified_at INTEGER,
+            verified_by INTEGER
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS web_sessions (
             token_hash TEXT PRIMARY KEY,
             owner TEXT NOT NULL,
@@ -1407,6 +1420,7 @@ class TelegramSendBody(BaseModel):
     image: str | None = Field(default=None, max_length=12_000_000)
     mime_type: str = Field(default="image/jpeg", max_length=100)
     filename: str = Field(default="photo.jpg", max_length=180)
+    deal_terms: str | None = Field(default=None, max_length=3000)
 
 class ChatAISettingsBody(BaseModel):
     enabled: bool = False
@@ -2095,6 +2109,44 @@ async def telegram_messages(chat_id: str, limit: int = 80, session: SessionInfo 
     return {"items": items, "count": len(items), "ai": _ai_settings(session.owner, chat_id)}
 
 
+# Premium custom emoji from the NEZZX deal bot (same IDs as the bot card)
+DEAL_EMOJI = {
+    "offer": "5330237710655306682",
+    "confirm": "5206607081334906820",
+    "shield": "5251203410396458957",
+    "warn": "5251340119205501791",
+}
+
+
+def _build_deal_card(terms: str) -> tuple[str, list]:
+    """Full offer card as plain text + entities (premium emoji, bold title). Offsets are UTF-16."""
+    from telethon.tl.types import MessageEntityBold, MessageEntityCustomEmoji
+    text = ""
+    entities: list = []
+
+    def add(chunk: str, emoji: str | None = None, bold: bool = False) -> None:
+        nonlocal text
+        offset = len(text.encode("utf-16-le")) // 2
+        length = len(chunk.encode("utf-16-le")) // 2
+        text += chunk
+        if emoji:
+            entities.append(MessageEntityCustomEmoji(offset, length, int(DEAL_EMOJI[emoji])))
+        if bold:
+            entities.append(MessageEntityBold(offset, length))
+
+    add("📨", "offer")
+    add(" Предложение", bold=True)
+    add("\n\nОписание:\n" + terms + "\n\n")
+    add("✅", "confirm")
+    add(" Подтверждение: ожидается\n")
+    add("🛡️", "shield")
+    add(" Безопасная сделка: проверяйте условия самостоятельно.\n\n")
+    add("⚠️", "warn")
+    add(" Внимание! Не доверяйте незнакомым участникам и проверяйте оплату самостоятельно. "
+        "Telegram не гарантирует сделки через этого бота.")
+    return text, entities
+
+
 @app.post("/api/telegram/chats/{chat_id}/send")
 async def telegram_send_message(chat_id: str, payload: TelegramSendBody, session: SessionInfo = Depends(get_session)) -> dict[str, Any]:
     import io
@@ -2110,23 +2162,69 @@ async def telegram_send_message(chat_id: str, payload: TelegramSendBody, session
             raise HTTPException(status_code=422, detail="Файл изображения повреждён или имеет неверный формат.") from exc
         if len(image_bytes) > 10 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="Фото больше 10 МБ.")
+    deal_entities = None
+    if payload.deal_terms is not None:
+        terms = payload.deal_terms.strip()
+        if not terms:
+            raise HTTPException(status_code=422, detail="Напишите условия сделки.")
+        text, deal_entities = _build_deal_card(terms)
     if not text and image_bytes is None:
         raise HTTPException(status_code=422, detail="Сообщение пустое.")
     client = await _tg_client_for(session.owner)
     try:
-        entity = await client.get_entity(int(chat_id))
-        if image_bytes is not None:
-            buffer = io.BytesIO(image_bytes)
-            buffer.name = (payload.filename or "photo.jpg")[:120]
-            message = await client.send_file(entity, buffer, caption=text or None)
-        else:
-            message = await client.send_message(entity, text)
+        target_id = int(chat_id)
+        entity = await client.get_entity(target_id)
+        message = None
+        # Inline keyboards can only be attached to messages sent by the bot. For a private
+        # recipient who has started the bot, send the deal card from the bot so callbacks
+        # can be validated and the card can be edited later. Telethon fallback has no buttons.
+        if payload.deal_terms is not None and image_bytes is None and TG_BOT is not None and target_id > 0:
+            try:
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
+                bot_entities = []
+                for ent in (deal_entities or []):
+                    if getattr(ent, "__class__", type("", (), {})).__name__ == "MessageEntityCustomEmoji":
+                        bot_entities.append(MessageEntity(type="custom_emoji", offset=ent.offset, length=ent.length,
+                                                          custom_emoji_id=str(ent.document_id)))
+                    elif getattr(ent, "__class__", type("", (), {})).__name__ == "MessageEntityBold":
+                        bot_entities.append(MessageEntity(type="bold", offset=ent.offset, length=ent.length))
+                deal_id = secrets.token_urlsafe(9)
+                amount_match = re.search(r"(?i)(?<!\d)(\d{1,6})\s*(?:⭐|stars?\b|зв[её]зд(?:а|ы)?\b)", payload.deal_terms)
+                stars_amount = int(amount_match.group(1)) if amount_match else None
+                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Я оплатил", callback_data=f"deal:claim:{deal_id}")]])
+                bot_message = await TG_BOT.send_message(chat_id=target_id, text=text, entities=bot_entities,
+                                                        reply_markup=keyboard)
+                with db() as conn:
+                    conn.execute("""INSERT INTO deal_payments
+                        (id,buyer_id,target_chat_id,message_id,terms,stars_amount,status,created_at)
+                        VALUES(?,?,?,?,?,?,?,?)""",
+                        (deal_id, target_id, target_id, bot_message.message_id, payload.deal_terms.strip(),
+                         stars_amount, "sent", now_ts()))
+                # Represent the Bot API message consistently in the dashboard response.
+                message = bot_message
+                response_text = bot_message.text or text
+            except Exception as bot_exc:
+                log.info("Bot could not post deal card in chat %s (%s); falling back to Telethon", target_id, type(bot_exc).__name__)
+        if message is None:
+            if image_bytes is not None:
+                buffer = io.BytesIO(image_bytes)
+                buffer.name = (payload.filename or "photo.jpg")[:120]
+                message = await client.send_file(entity, buffer, caption=text or None)
+            else:
+                message = await client.send_message(entity, text, formatting_entities=deal_entities)
+            response_text = getattr(message, "message", None) or getattr(message, "text", None) or text
     except Exception as exc:
         log.warning("Telegram send failed (%s)", type(exc).__name__)
         raise HTTPException(status_code=502, detail="Не удалось отправить сообщение в Telegram.") from exc
     CHATS_CACHE.pop(session.owner, None)
-    _sse_publish(session.owner, {"type": "message", "chat_id": str(chat_id), "message": _tg_message_item(message, "Вы", chat_id)})
-    return {"ok": True, "id": message.id, "text": message.message or text}
+    # Bot API and Telethon message objects differ; only publish fields supported by the dashboard.
+    if hasattr(message, "message"):
+        rendered_message = _tg_message_item(message, "Вы", chat_id)
+    else:
+        rendered_message = {"id": str(message.message_id), "text": response_text, "date": utc_now(),
+                            "out": True, "sender": "Вы", "chat_id": str(chat_id), "media": None}
+    _sse_publish(session.owner, {"type": "message", "chat_id": str(chat_id), "message": rendered_message})
+    return {"ok": True, "id": getattr(message, "id", getattr(message, "message_id", None)), "text": response_text}
 
 
 MAX_VOICE_BYTES = 12 * 1024 * 1024
@@ -3344,8 +3442,88 @@ async def _start_telegram(app_: FastAPI) -> Any:
                 parse_mode="HTML",
             )
 
+    async def deal_callback(update: Any, context: Any) -> None:
+        query = update.callback_query
+        user = update.effective_user
+        if not query or not user:
+            return
+        parts = (query.data or "").split(":")
+        if len(parts) != 3 or parts[0] != "deal":
+            await query.answer("Некорректная кнопка.", show_alert=True)
+            return
+        action, deal_id = parts[1], parts[2]
+        init_db()
+        with db() as conn:
+            deal = conn.execute("SELECT * FROM deal_payments WHERE id=?", (deal_id,)).fetchone()
+        if not deal:
+            await query.answer("Сделка не найдена или устарела.", show_alert=True)
+            return
+
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        if action == "claim":
+            # Only the exact private-chat recipient can claim, and only once.
+            if user.id != int(deal["buyer_id"]):
+                await query.answer("Эта кнопка предназначена другому покупателю.", show_alert=True)
+                return
+            if deal["status"] != "sent":
+                await query.answer("Заявка уже принята; повторное нажатие проигнорировано.", show_alert=True)
+                return
+            with db() as conn:
+                changed = conn.execute("UPDATE deal_payments SET status='pending', claimed_at=? WHERE id=? AND status='sent'",
+                                       (now_ts(), deal_id)).rowcount
+            if not changed:
+                await query.answer("Заявка уже обработана.", show_alert=True)
+                return
+            await query.answer("Заявка отправлена на проверку.")
+            pending_text = (query.message.text or "") + "\n\n🕓 Покупатель заявил об оплате — ожидается проверка.\n"
+            await query.edit_message_text(pending_text, entities=getattr(query.message, "entities", None), reply_markup=None)
+            # Only the configured admin receives the verification control.
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_TELEGRAM_ID,
+                    text=(f"🛡️ Проверка оплаты по сделке {deal_id}\n"
+                          f"Покупатель: {user.full_name} (@{user.username or 'без username'})\n"
+                          f"Telegram ID: {user.id}\n"
+                          f"Сумма из условий: {deal['stars_amount'] if deal['stars_amount'] is not None else 'не распознана'} ⭐\n"
+                          "Проверьте реальный платёж Stars вне этого сообщения перед подтверждением."),
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Подтвердить после проверки", callback_data=f"deal:verify:{deal_id}")]])
+                )
+            except Exception as exc:
+                log.warning("Could not notify deal verifier (%s)", type(exc).__name__)
+            return
+
+        if action == "verify":
+            if user.id != ADMIN_TELEGRAM_ID:
+                await query.answer("Только администратор может подтвердить оплату.", show_alert=True)
+                return
+            if deal["status"] != "pending":
+                await query.answer("Эта заявка уже обработана или не ожидает проверки.", show_alert=True)
+                return
+            with db() as conn:
+                changed = conn.execute("UPDATE deal_payments SET status='paid', verified_at=?, verified_by=? WHERE id=? AND status='pending'",
+                                       (now_ts(), user.id, deal_id)).rowcount
+            if not changed:
+                await query.answer("Статус уже изменён.", show_alert=True)
+                return
+            await query.answer("Подтверждение сохранено.")
+            original_text = (query.message.text or "").replace("Проверьте реальный платёж Stars вне этого сообщения перед подтверждением.",
+                                                                  "Платёж проверен администратором.")
+            await query.edit_message_text(original_text + "\n\n✅ Статус обновлён: администратор подтвердил оплату после проверки.", reply_markup=None)
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=int(deal["target_chat_id"]), message_id=int(deal["message_id"]),
+                    text=(f"{_build_deal_card(deal['terms'])[0]}\n\n"
+                          "✅ Оплата получена и подтверждена администратором после проверки Telegram Stars."),
+                    reply_markup=None
+                )
+            except Exception as exc:
+                log.warning("Could not update deal card after verification (%s)", type(exc).__name__)
+            return
+        await query.answer("Неизвестное действие.", show_alert=True)
+
     tg_app.add_handler(CommandHandler("start", start_command))
     tg_app.add_handler(CallbackQueryHandler(license_callback, pattern=r"^license:"))
+    tg_app.add_handler(CallbackQueryHandler(deal_callback, pattern=r"^deal:"))
     tg_app.add_handler(PreCheckoutQueryHandler(pre_checkout))
     tg_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     await tg_app.initialize()
@@ -3861,6 +4039,7 @@ button.media{padding:0;border:0;font:inherit;color:inherit;cursor:zoom-in}
 .composer{position:relative;display:flex;align-items:flex-end;gap:8px;margin:0 10px calc(10px + env(safe-area-inset-bottom,0px));padding:7px 7px 7px 16px;border-radius:26px;flex:none}
 .composer textarea{background:transparent;border:0;padding:9px 0;min-height:24px;max-height:140px;box-shadow:none}
 .composer textarea:focus{box-shadow:none}
+.deal-btn{flex:none;border:0;border-radius:18px;padding:9px 12px;font-size:13px;font-weight:600;white-space:nowrap;cursor:pointer;color:inherit;background:rgba(120,140,255,.22)}
 .send{
   width:44px;height:44px;border-radius:50%;flex:none;display:grid;place-items:center;
   background:linear-gradient(160deg,var(--accent-hi),var(--accent));color:var(--accent-ink);
@@ -6049,6 +6228,7 @@ function renderChatPane() {
         <input type="range" class="voice-range" id="voiceRange" min="0.1" max="1" step="0.1" aria-label="Сила грубого голоса">
         <div class="voice-range-row"><span>0.1</span><span id="voiceLevel">0.5</span><span>1</span></div>
       </div>
+      <button class="deal-btn" type="button" id="dealBtn" title="Отправить сделку" aria-label="Отправить сделку">Сделка</button>
       <button class="send" type="submit" aria-label="Отправить">${icon('send')}</button>
     </form>`;
   const form = $('#sendForm');
@@ -6057,6 +6237,7 @@ function renderChatPane() {
   $('#chatMode').addEventListener('change', e => saveAI(state.chatAI.enabled, e.target.value));
   $('#draftBtn').addEventListener('click', makeDraft);
   form.addEventListener('submit', sendMessage);
+  $('#dealBtn').addEventListener('click', sendDeal);
   wireVoice();
   $('#attachBtn').addEventListener('click', () => $('#attachFile').click());
   $('#attachFile').addEventListener('change', e => setAttachment(e.target.files?.[0]));
@@ -6770,6 +6951,31 @@ function launchSend(btn) {
   void btn.offsetWidth;
   btn.classList.add('launch');
   setTimeout(() => btn.classList.remove('launch'), 520);
+}
+
+async function sendDeal() {
+  const chat = state.selected;
+  const input = $('#messageText');
+  const btn = $('#dealBtn');
+  const terms = input.value.trim();
+  if (!chat) return;
+  if (!terms) { toast('Напишите условия сделки в поле ввода'); input.focus(); return; }
+  btn.disabled = true;
+  try {
+    await api(`/telegram/chats/${encodeURIComponent(chat.id)}/send`, {method: 'POST', body: {deal_terms: terms}});
+    input.value = '';
+    autoGrow({target: input});
+    SFX.sent();
+    haptic('soft');
+    await loadMessages(false);
+    await loadChats();
+  } catch (e) {
+    SFX.error();
+    haptic('error');
+    toast(e.message, 'bad');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function sendMessage(ev) {
